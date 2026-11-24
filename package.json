@@ -1,0 +1,57 @@
+{
+  "name": "dsh-wsl-sandbox",
+  "version": "0.1.0",
+  "description": "Codex-grade WSL 2 execution backend & OS sandbox for DeepSeek Harness (DSH) with zero-token Bash/PowerShell approval, laptop-friendly Agent-guided Codex toolchains, and zero host plugin conflicts (dsh-purge safe).",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "main": "./dist/packages/dsh-plugin/src/index.js",
+  "exports": {
+    ".": "./dist/packages/dsh-plugin/src/index.js",
+    "./web-ui": "./dist/packages/dsh-plugin/src/web-ui-entry.js",
+    "./core": "./dist/packages/core/src/index.js",
+    "./runner": "./dist/packages/wsl-runner/src/main.js",
+    "./doctor": "./dist/packages/bootstrap/src/doctor.js"
+  },
+  "bin": {
+    "dsh-wsl-doctor": "./dist/packages/bootstrap/src/doctor.js",
+    "dsh-wsl-runner": "./dist/packages/wsl-runner/src/main.js"
+  },
+  "dsh": {
+    "bundle": "./cordis.patch.yml",
+    "minVersion": "0.2.1-rc.5"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "packages/bootstrap/provision-wsl.sh",
+    "packages/bootstrap/prompts",
+    "packages/bootstrap/install-dsh-plugin.ps1",
+    "tests/windows-wsl-verify",
+    ".agents/skills",
+    "AGENTS.md",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs && node --test tests/unit/*.test.ts tests/plugin-coexistence/*.test.ts tests/linux-sandbox/*.test.ts",
+    "test:unit": "node --test tests/unit/*.test.ts",
+    "test:coexistence": "node --test tests/plugin-coexistence/*.test.ts",
+    "test:linux-sandbox": "node --test tests/linux-sandbox/*.test.ts",
+    "doctor": "node packages/bootstrap/src/doctor.ts",
+    "doctor:json": "node packages/bootstrap/src/doctor.ts --json"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "wsl2",
+    "sandbox",
+    "bubblewrap",
+    "seccomp",
+    "windows"
+  ]
+}

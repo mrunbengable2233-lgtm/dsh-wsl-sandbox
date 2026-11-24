@@ -1,0 +1,35 @@
+# dsh-wsl-sandbox Cordis bundle patch
+#
+# Coexistence invariants (Q12=B + Q4=A + Q14=A):
+# - NEVER disables or overwrites DSH stock rows: system-prompt, fs-local,
+#   subprocess-local, sandbox-local, pwsh-local, or any agent preset.
+# - NEVER conflicts with host-installed plugins such as dsh-purge.
+# - All entries live under the exclusive `dsh-wsl-sandbox-*` namespace.
+
+- insert:
+    - id: dsh-wsl-sandbox
+      name: 'dsh-wsl-sandbox'
+      config:
+        enabled: true
+        defaultDistro: 'dsh-sandbox'
+        sandboxMode: 'workspace-write'
+        approvalPolicyMode: 'balanced'
+        approvalTimeoutMs: 60000
+        networkMode: 'allowlist-proxy'
+        upstreamProxy: ''
+        cacheMode: 'workspace-persistent'
+        maskEnvSecrets: true
+        injectSystemPromptSection: true
+        enableHostPwshGuard: true
+        advanced:
+          shares: []
+          deviceNodes: []
+          localLabCidrs: []
+          localLabPorts: []
+          customAllowedDomains: []
+
+    - id: dsh-wsl-sandbox-web-ui
+      name: 'dsh-wsl-sandbox/web-ui'
+      config:
+        routePrefix: '/wsl-sandbox/api'
+        zIndexCap: 850
