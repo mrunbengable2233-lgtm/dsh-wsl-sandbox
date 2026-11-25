@@ -24,7 +24,7 @@ export function buildWslRoutingPromptSection(config: WslSandboxConfig): string {
     '## WSL 2 Sandbox Execution Policy (dsh-wsl-sandbox)',
     `- Active WSL 2 sandbox: distro \`${config.distro}\`, workspace \`${config.workspaceRoot}\`, mode \`${config.sandboxMode}\`, network \`${config.networkMode}\`.`,
     '- **WSL-first routing**: Prefer `wsl_bash`, `wsl_read`, `wsl_write`, `wsl_edit`, `wsl_glob`, `wsl_grep`, and `wsl_terminal` for all coding, git, build, test, Python/Node/Go/Rust, Linux CLI, ESP-IDF/firmware compilation, and Kali/Linux tooling tasks.',
-    '- **Host Windows tools (`pwsh` / `powershell` / `cmd`)**: Reserve strictly for Windows-only host hardware/OS operations (e.g., `usbipd list`, `usbipd attach`, Windows COM port queries, Windows-native drivers/apps). NEVER invoke `wsl.exe` or `bash.exe` from host `pwsh` to bypass the sandbox.',
+    '- **Host Windows tools (`pwsh` / `powershell` / `cmd`)**: Reserve strictly for Windows-only host hardware/OS queries (e.g., `usbipd list`, `usbipd attach`, Windows COM port queries). NEVER invoke `wsl.exe` or `bash.exe` from host `pwsh`, NEVER wrap or transpile `cmd` / `cmd /c` (`mkdir ... && move ...`, `xcopy`, `robocopy`, `mklink`) inside `pwsh`, and NEVER touch `\\\\wsl.localhost\\` or `\\\\wsl$\\` UNC paths from Windows.',
     `- Authorized single-directory shares: ${sharesSummary}.`,
     `- Authorized physical device nodes: ${devicesSummary}. Note: any physical device operation (USBIP bind/attach/detach, serial/JTAG flashing) ALWAYS requires explicit single-shot human approval.`,
     '- Never attempt to read `.env*` secret files unless the user explicitly unmasked the project, and never modify `.git/hooks`, `.git/config`, or `.wslconfig`.',
@@ -39,9 +39,9 @@ export function buildAgentsMdWslBlock(config?: Partial<Pick<WslSandboxConfig, 'd
     '## WSL 2 Sandbox Tool Routing (Managed by dsh-wsl-sandbox)',
     '',
     `- Default Linux sandbox distro: \`${distro}\` (workspace: \`${workspaceRoot}\`).`,
-    '- **Always prefer `wsl_*` tools** (`wsl_bash`, `wsl_read`, `wsl_write`, `wsl_edit`, `wsl_glob`, `wsl_grep`, `wsl_terminal`) for repository work, builds, tests, git operations, ESP32/firmware compilation, and Linux/Kali workflows.',
-    '- **Use Windows host tools (`pwsh`) only for Windows-side hardware/OS actions** such as `usbipd list` / `usbipd attach --wsl` (USBIP passthrough for ESP32/USB adapters), COM port checks, or Windows-only GUI/driver utilities.',
-    '- Do **not** invoke `wsl.exe` or `bash.exe` through host `pwsh` to bypass `wsl_bash` kernel isolation.',
+    '- **Always prefer `wsl_*` tools** (`wsl_bash`, `wsl_read`, `wsl_write`, `wsl_edit`, `wsl_glob`, `wsl_grep`, `wsl_terminal`) for repository work, directory creation, file moves, builds, tests, git operations, ESP32/firmware compilation, and Linux/Kali workflows.',
+    '- **Use Windows host tools (`pwsh`) only for Windows-side hardware/OS actions** such as `usbipd list` / `usbipd attach --wsl` (USBIP passthrough for ESP32/USB adapters), COM port checks, or Windows-only driver utilities.',
+    '- Do **not** invoke `wsl.exe`/`bash.exe` through host `pwsh`, do **not** transpile or nest `cmd` / `cmd /c` (`mkdir` + `move` / `xcopy` / `robocopy` / `mklink`) inside `pwsh`, and never write to `\\\\wsl.localhost\\` or `\\\\wsl$\\` UNC shares.',
     '- Physical device actions (USBIP attach/bind, serial flashing via `esptool`/`openocd`/`minicom`) always require single-shot human approval.',
     '- To move files between Windows and WSL without mounting `/mnt`, drag/copy via the **Windows Explorer -> Linux** sidebar, or grant a temporary single-directory `/shares/<alias>` under Advanced settings.',
     AGENTS_MD_END_MARKER,
@@ -57,16 +57,34 @@ export function registerWslPromptSection(
   getConfig: () => WslSandboxConfig,
 ): (() => void) | undefined {
   if (!ctx.systemPrompt) return undefined;
-  const dispose = ctx.systemPrompt.register({
-    id: SYSTEM_PROMPT_SECTION_ID,
-    order: SYSTEM_PROMPT_SECTION_ORDER,
-    content: () => {
-      const cfg = getConfig();
-      if (!cfg.enabled || !cfg.enablePromptInjection) return '';
-      return buildWslRoutingPromptSection(cfg);
-    },
-  });
-  return typeof dispose === 'function' ? dispose : undefined;
+  const render = (): string => {
+    const cfg = getConfig();
+    if (!cfg.enabled || !cfg.enablePromptInjection) return '';
+    return buildWslRoutingPromptSection(cfg);
+  };
+
+  // Real `@deepseek-ai/dsh-system-prompt` (>=0.2.1 / 0.2.2) API
+  if (typeof ctx.systemPrompt.section === 'function') {
+    const dispose = ctx.systemPrompt.section({
+      name: SYSTEM_PROMPT_SECTION_ID,
+      order: SYSTEM_PROMPT_SECTION_ORDER,
+      interpolate: false,
+      text: () => render(),
+    });
+    return typeof dispose === 'function' ? dispose : undefined;
+  }
+
+  // Fallback for standalone test harnesses
+  if (typeof ctx.systemPrompt.register === 'function') {
+    const dispose = ctx.systemPrompt.register({
+      id: SYSTEM_PROMPT_SECTION_ID,
+      order: SYSTEM_PROMPT_SECTION_ORDER,
+      content: () => render(),
+    });
+    return typeof dispose === 'function' ? () => void dispose() : undefined;
+  }
+
+  return undefined;
 }
 
 /**

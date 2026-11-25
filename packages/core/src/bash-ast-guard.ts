@@ -40,12 +40,13 @@ export const BANNED_PREFIX_SUGGESTIONS: readonly (readonly string[])[] = [
   ['python', '-c'], ['python3', '-c'],
   ['perl', '-e'], ['ruby', '-e'], ['php', '-r'],
   ['Rscript'], ['julia'], ['julia', '-e'],
-  // Windows / PowerShell trampolines & destructive aliases
-  ['cmd'], ['cmd', '/c'], ['cmd', '/k'],
-  ['cmd.exe'], ['cmd.exe', '/c'], ['cmd.exe', '/k'],
+  // Windows / PowerShell trampolines & destructive/mutation aliases
+  ['cmd'], ['cmd', '/c'], ['cmd', '/k'], ['cmd', '/r'],
+  ['cmd.exe'], ['cmd.exe', '/c'], ['cmd.exe', '/k'], ['cmd.exe', '/r'],
   ['pwsh'], ['pwsh.exe'], ['powershell'], ['powershell.exe'],
-  ['wsl'], ['wsl.exe'], ['iex'], ['invoke-expression'], ['start-process'],
+  ['wsl'], ['wsl.exe'], ['iex'], ['invoke-expression'], ['start-process'], ['saps'],
   ['remove-item'], ['del'], ['erase'], ['rd'],
+  ['move'], ['move-item'], ['mv'], ['mi'], ['mklink'], ['robocopy'], ['xcopy'],
 ];
 
 const SHELL_BINARIES = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'fish', 'busybox']);
@@ -608,9 +609,35 @@ export function evaluateBashCommand(command: string, ctx: BashGuardContext): Gua
     // Reached unwrapped command
     unwrappedCommands.push([...tokens]);
 
-    // L0: Block invoking Windows host interop binaries from inside WSL sandbox
+    // L0: Block invoking Windows host interop binaries from inside WSL sandbox (Single-Shell Purity)
     if (WSL_INTEROP_BINARIES.has(cmd.toLowerCase())) {
-      escalate('deny', 'critical', `Invoking Windows host interop executable from WSL sandbox is forbidden: ${cmd}`);
+      escalate('deny', 'critical', `Single-shell purity violation: invoking Windows host executable (${cmd}) inside wsl_bash is forbidden`);
+    }
+
+    // L0: Pre-Execution POSIX Bash Dialect Alignment — block accidentally pasted PowerShell cmdlets or CMD syntax inside wsl_bash
+    if (/^(?:get-childitem|move-item|remove-item|new-item|copy-item|set-content|get-content|invoke-webrequest|invoke-restmethod|invoke-expression|start-process)$/i.test(cmd)) {
+      escalate(
+        'deny',
+        'critical',
+        `Shell dialect mismatch inside wsl_bash: PowerShell cmdlet '${cmd}' cannot run in POSIX Bash. Rewrite using native Bash commands (ls, mv, rm, mkdir, cp, curl).`,
+      );
+    }
+    if (
+      (cmd === 'rd' || cmd === 'rmdir' || cmd === 'del' || cmd === 'erase') &&
+      args.some((a) => /^\/[sqf]$/i.test(a))
+    ) {
+      escalate(
+        'deny',
+        'critical',
+        `Shell dialect mismatch inside wsl_bash: Windows CMD slash-flags (${cmd} ${args.join(' ')}) detected in POSIX Bash. Use 'rm -rf <target>'.`,
+      );
+    }
+    if (args.some((a) => /^\$env:[A-Za-z_]/i.test(a) || /^%[A-Za-z_][A-Za-z0-9_]*%$/.test(a))) {
+      escalate(
+        'deny',
+        'critical',
+        `Shell dialect mismatch inside wsl_bash: Windows '$env:VAR' / '%VAR%' syntax detected in POSIX Bash. Use '$VAR'.`,
+      );
     }
 
     // L0: Scan ALL command arguments for protected WSL escape paths (/mnt/*, /run/WSL, /etc/wsl.conf, /etc/fstab)

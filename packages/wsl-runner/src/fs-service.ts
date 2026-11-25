@@ -199,7 +199,15 @@ export class ConfinedFsService {
     offset?: number;
     limit?: number;
     maskEnvSecrets?: boolean;
-  }): { content: string; truncated: boolean; totalBytes: number; maskedEnv: boolean } {
+  }): {
+    content: string;
+    truncated: boolean;
+    totalBytes: number;
+    totalLines: number;
+    startLine: number;
+    endLine: number;
+    maskedEnv: boolean;
+  } {
     const res = resolveConfinedFsPath(params.binding, params.path, true);
     const maskedEnv = !res.insideShare && isMaskedEnvRead(
       params.binding.workspaceRoot,
@@ -211,19 +219,80 @@ export class ConfinedFsService {
         content: '',
         truncated: false,
         totalBytes: 0,
+        totalLines: 0,
+        startLine: 1,
+        endLine: 0,
         maskedEnv: true,
       };
     }
 
     const raw = fs.readFileSync(res.realPath, 'utf8');
     const totalBytes = Buffer.byteLength(raw, 'utf8');
-    const offset = Math.max(0, params.offset ?? 0);
-    const limit = params.limit ?? 256 * 1024;
-    const slice = raw.slice(offset, offset + limit);
+    if (raw.length === 0) {
+      return {
+        content: '',
+        truncated: false,
+        totalBytes: 0,
+        totalLines: 0,
+        startLine: 1,
+        endLine: 0,
+        maskedEnv: false,
+      };
+    }
+
+    const allLines = raw.split(/\r?\n/);
+    // Drop trailing empty element produced by final newline for accurate line count while preserving newline behavior
+    const hasTrailingNewline = raw.endsWith('\n');
+    const logicalLines = hasTrailingNewline ? allLines.slice(0, -1) : allLines;
+    const totalLines = logicalLines.length;
+
+    const startLine = Math.max(1, Math.floor(params.offset ?? 1));
+    const maxLines = Math.max(1, Math.min(20_000, Math.floor(params.limit ?? 2000)));
+    const MAX_BYTES = 256 * 1024;
+
+    if (startLine > totalLines) {
+      return {
+        content: '',
+        truncated: false,
+        totalBytes,
+        totalLines,
+        startLine,
+        endLine: startLine - 1,
+        maskedEnv: false,
+      };
+    }
+
+    const startIdx = startLine - 1;
+    const picked: string[] = [];
+    let usedBytes = 0;
+    let byteCapped = false;
+
+    for (let i = startIdx; i < totalLines && picked.length < maxLines; i++) {
+      const line = logicalLines[i]!;
+      const lineBytes = Buffer.byteLength(line, 'utf8') + 1;
+      if (picked.length > 0 && usedBytes + lineBytes > MAX_BYTES) {
+        byteCapped = true;
+        break;
+      }
+      if (picked.length === 0 && lineBytes > MAX_BYTES) {
+        picked.push(Buffer.from(line, 'utf8').subarray(0, MAX_BYTES).toString('utf8'));
+        byteCapped = true;
+        break;
+      }
+      picked.push(line);
+      usedBytes += lineBytes;
+    }
+
+    const endLine = startLine + picked.length - 1;
+    const moreLinesRemain = endLine < totalLines;
+    const suffix = hasTrailingNewline && !moreLinesRemain && !byteCapped ? '\n' : '';
     return {
-      content: slice,
-      truncated: offset + limit < raw.length,
+      content: picked.join('\n') + suffix,
+      truncated: moreLinesRemain || byteCapped,
       totalBytes,
+      totalLines,
+      startLine,
+      endLine,
       maskedEnv: false,
     };
   }

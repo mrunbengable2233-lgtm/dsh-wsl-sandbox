@@ -213,6 +213,116 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       return { killedCount };
     }
 
+    case 'env.doctor': {
+      const { runDoctor } = await import('../../bootstrap/src/doctor.ts');
+      return runDoctor({
+        upstreamProxy: typeof p.upstreamProxy === 'string' && p.upstreamProxy ? p.upstreamProxy : undefined,
+        strictWsl2: Boolean(p.strictWsl2),
+      });
+    }
+
+    case 'cache.clear': {
+      const cacheBase = path.join(os.homedir(), '.cache', 'dsh-wsl-sandbox');
+      let clearedEntries = 0;
+      if (fs.existsSync(cacheBase)) {
+        const st = fs.lstatSync(cacheBase);
+        if (!st.isSymbolicLink() && st.isDirectory()) {
+          for (const entry of fs.readdirSync(cacheBase)) {
+            const full = path.join(cacheBase, entry);
+            fs.rmSync(full, { recursive: true, force: true });
+            clearedEntries += 1;
+          }
+        }
+      }
+      return { ok: true, cacheBase, clearedEntries };
+    }
+
+    case 'wsl.backupConfigs': {
+      const backupDir = path.join(os.homedir(), '.config', 'dsh-wsl-sandbox', 'backups');
+      fs.mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      const savedFiles: string[] = [];
+      let wslConfContent: string | null = null;
+      let fstabContent: string | null = null;
+      let drvfsMountsContent: string | null = null;
+
+      if (fs.existsSync('/etc/wsl.conf')) {
+        wslConfContent = fs.readFileSync('/etc/wsl.conf', 'utf8');
+        const origPath = path.join(backupDir, 'wsl.conf.orig');
+        if (!fs.existsSync(origPath) && !fs.existsSync(`${origPath}.absent`)) {
+          fs.writeFileSync(origPath, wslConfContent, { mode: 0o600 });
+          savedFiles.push(origPath);
+        }
+        const snapPath = path.join(backupDir, `wsl.conf.${ts}.bak`);
+        fs.writeFileSync(snapPath, wslConfContent, { mode: 0o600 });
+        savedFiles.push(snapPath);
+      } else {
+        const absentPath = path.join(backupDir, 'wsl.conf.orig.absent');
+        if (!fs.existsSync(absentPath) && !fs.existsSync(path.join(backupDir, 'wsl.conf.orig'))) {
+          fs.writeFileSync(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`, { mode: 0o600 });
+          savedFiles.push(absentPath);
+        }
+      }
+
+      if (fs.existsSync('/etc/fstab')) {
+        fstabContent = fs.readFileSync('/etc/fstab', 'utf8');
+        const origFstab = path.join(backupDir, 'fstab.orig');
+        if (!fs.existsSync(origFstab)) {
+          fs.writeFileSync(origFstab, fstabContent, { mode: 0o600 });
+          savedFiles.push(origFstab);
+        }
+        const snapFstab = path.join(backupDir, `fstab.${ts}.bak`);
+        fs.writeFileSync(snapFstab, fstabContent, { mode: 0o600 });
+        savedFiles.push(snapFstab);
+      }
+
+      if (fs.existsSync('/proc/mounts')) {
+        try {
+          drvfsMountsContent = fs
+            .readFileSync('/proc/mounts', 'utf8')
+            .split('\n')
+            .filter((line) => /drvfs|9p|\/mnt\//.test(line))
+            .join('\n');
+          const snapMounts = path.join(backupDir, `drvfs-mounts.${ts}.txt`);
+          fs.writeFileSync(snapMounts, drvfsMountsContent + '\n', { mode: 0o600 });
+          savedFiles.push(snapMounts);
+        } catch {
+          // ignore unreadable /proc/mounts
+        }
+      }
+
+      return {
+        ok: true,
+        wslInternalBackupDir: backupDir,
+        wslSavedFiles: savedFiles,
+        wslConfContent,
+        fstabContent,
+        drvfsMountsContent,
+        sandboxTmpfsMntLocked: true,
+      };
+    }
+
+    case 'wsl.listBackups': {
+      const backupDir = path.join(os.homedir(), '.config', 'dsh-wsl-sandbox', 'backups');
+      const entries = fs.existsSync(backupDir) ? fs.readdirSync(backupDir).sort() : [];
+      let automountDisabledInWslConf = false;
+      if (fs.existsSync('/etc/wsl.conf')) {
+        try {
+          const raw = fs.readFileSync('/etc/wsl.conf', 'utf8');
+          automountDisabledInWslConf = /\[automount\][\s\S]*?enabled\s*=\s*false/i.test(raw);
+        } catch {
+          // ignore
+        }
+      }
+      return {
+        ok: true,
+        backupDir,
+        entries,
+        sandboxTmpfsMntLocked: true,
+        automountDisabledInWslConf,
+      };
+    }
+
     default:
       throw Object.assign(new Error(`Unknown RPC method: ${req.method}`), { code: 'INVALID_ACTION' });
   }

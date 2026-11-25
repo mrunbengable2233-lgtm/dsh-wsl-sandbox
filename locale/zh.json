@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "WSL 2 沙箱后端",
+    "description": "Codex 级 WSL 2 Linux 内核隔离执行后端（bwrap + seccomp + UDS 代理），内置单壳方言防呆门禁、零 Token 独立人工审批与物理硬件单次锁。",
+    "detail": "README.md"
+  }
+}

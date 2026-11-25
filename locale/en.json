@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "WSL 2 Sandbox",
+    "description": "Codex-grade WSL 2 Linux kernel sandbox backend (bwrap + seccomp + UDS proxy) with single-shell dialect guard, zero-token human approval, and physical hardware single-shot lock.",
+    "detail": "README.md"
+  }
+}

@@ -1,6 +1,6 @@
 import { ApprovalBridge } from './approval-bridge.ts';
 import { ConfigStore, type WslSandboxConfig } from './config-store.ts';
-import type { DshCordisContext } from './cordis-types.ts';
+import { type DshCordisContext, getOptionalService } from './cordis-types.ts';
 import { registerWslPromptSection } from './prompt-injector.ts';
 import { registerHostPwshGuardHook } from './pwsh-hook.ts';
 import { registerWslSandboxTools, WslSandboxSessionManager } from './tools.ts';
@@ -9,12 +9,12 @@ import { registerWslSandboxWebApi } from './web-api.ts';
 export const name = 'dsh-wsl-sandbox';
 
 /**
- * Cordis optional injections — NEVER provides or overwrites stock DSH services
- * (`system-prompt`, `fs-local`, `subprocess-local`, `sandbox-local`, `pwsh-local`).
+ * Cordis injection list MUST be a string array (`[]`), NEVER an object (`{ optional: [...] }`)!
+ * Optional/surface-specific services (`tools`, `systemPrompt`, `approval`, `webServer`) are
+ * bound both directly (when already present) and reactively via `ctx.inject([...], ...)` so
+ * headless, TUI, Desktop, and Web profiles all boot cleanly without ever parking on missing services.
  */
-export const inject = {
-  optional: ['tools', 'systemPrompt', 'approval', 'http', 'logger'],
-} as const;
+export const inject: string[] = [];
 
 export interface WslSandboxPluginOptions {
   readonly configPath?: string;
@@ -78,11 +78,20 @@ function resolveInitialConfig(options: WslSandboxPluginOptions): Partial<WslSand
   return { ...fromYaml, ...(options.initialConfig ?? {}) };
 }
 
-/**
- * Cordis plugin entry point (`dsh-wsl-sandbox`).
- * Registers additive `wsl_*` tools, non-invasive `ctx.systemPrompt` routing section,
- * host PowerShell/CMD guard hook, `dsh-purge`-compatible approval bridge, and `/wsl-sandbox/api/*` routes.
- */
+function registerSafeEffect(ctx: DshCordisContext, cleanup: () => void | Promise<void>): void {
+  if (typeof ctx.effect !== 'function') return;
+  // Real `@deepseek-ai/cordis` (`@cordisjs/core` v4) invokes `ctx.effect((ctx) => disposer)` immediately
+  // during plugin mount to obtain the disposer! Lightweight mocks in tests may push `fn` directly.
+  // Detect real Cordis fiber presence (`'fiber' in ctx` or `typeof ctx.inject === 'function'`) vs bare mock:
+  if ('fiber' in (ctx as object) || typeof ctx.inject === 'function') {
+    ctx.effect(() => () => {
+      void cleanup();
+    });
+  } else {
+    ctx.effect(cleanup);
+  }
+}
+
 export function apply(
   ctx: DshCordisContext,
   options: WslSandboxPluginOptions = {},
@@ -93,10 +102,11 @@ export function apply(
     initial: resolveInitialConfig(options),
   });
 
+  const logger = getOptionalService(ctx, 'logger');
   const approvalBridge = new ApprovalBridge({
     getPolicyMode: () => configStore.get().approvalPolicyMode,
     ttlMs: configStore.get().approvalTimeoutMs,
-    hostApproval: ctx.approval,
+    hostApproval: getOptionalService(ctx, 'approval'),
     bypassInstantThresholdMs: options.bypassInstantThresholdMs,
   });
 
@@ -105,7 +115,7 @@ export function apply(
     approvalBridge,
     sessionId: options.sessionId,
     allowLinuxDevMode: options.allowLinuxDevMode,
-    onStderr: (line) => ctx.logger?.warn(`[dsh-wsl-runner] ${line}`),
+    onStderr: (line) => logger?.warn(`[dsh-wsl-runner] ${line}`),
   });
 
   const disposers: Array<() => void | Promise<void>> = [];
@@ -113,18 +123,69 @@ export function apply(
   const waterfallDispose = approvalBridge.attachCordisWaterfall(ctx);
   if (waterfallDispose) disposers.push(waterfallDispose);
 
-  const promptDispose = registerWslPromptSection(ctx, () => configStore.get());
-  if (promptDispose) disposers.push(promptDispose);
+  const isRealCordis = typeof ctx.inject === 'function';
 
-  const pwshDispose = registerHostPwshGuardHook(ctx, {
-    getConfig: () => configStore.get(),
-    getBinding: () => sessionManager.ensureBound(),
-    approvalBridge,
-  });
-  if (pwshDispose) disposers.push(pwshDispose);
+  // 1. Tools + Host Shell Guard
+  if (isRealCordis) {
+    ctx.inject!(['tools'], (toolCtx) => {
+      const toolDisposers = registerWslSandboxTools(toolCtx, sessionManager, configStore, approvalBridge);
+      const pwshDispose = registerHostPwshGuardHook(toolCtx, {
+        getConfig: () => configStore.get(),
+        getBinding: () => sessionManager.ensureBound(),
+        approvalBridge,
+      });
+      registerSafeEffect(toolCtx, () => {
+        for (const fn of toolDisposers.splice(0)) fn();
+        pwshDispose?.();
+      });
+    });
+  } else {
+    const pwshDispose = registerHostPwshGuardHook(ctx, {
+      getConfig: () => configStore.get(),
+      getBinding: () => sessionManager.ensureBound(),
+      approvalBridge,
+    });
+    if (pwshDispose) disposers.push(pwshDispose);
+    disposers.push(...registerWslSandboxTools(ctx, sessionManager, configStore, approvalBridge));
+  }
 
-  disposers.push(...registerWslSandboxTools(ctx, sessionManager, configStore, approvalBridge));
-  disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge }));
+  // 2. SystemPrompt Routing Section (order: 4200, interpolate: false)
+  if (isRealCordis) {
+    ctx.inject!(['systemPrompt'], (spCtx) => {
+      const promptDispose = registerWslPromptSection(spCtx, () => configStore.get());
+      registerSafeEffect(spCtx, () => promptDispose?.());
+    });
+  } else {
+    const promptDispose = registerWslPromptSection(ctx, () => configStore.get());
+    if (promptDispose) disposers.push(promptDispose);
+  }
+
+  // 3. Optional Host Approval Service (`@deepseek-ai/dsh-user-approval`)
+  if (isRealCordis) {
+    ctx.inject!(['approval'], (apCtx) => {
+      approvalBridge.setHostApproval(apCtx.approval);
+      registerSafeEffect(apCtx, () => approvalBridge.setHostApproval(undefined));
+    });
+  }
+
+  // 4. Web UI & Control API (`ctx.webServer` on real DSH Web, `ctx.http` on standalone harnesses)
+  if (isRealCordis) {
+    ctx.inject!(['webServer'], (webCtx) => {
+      const webDisposers = registerWslSandboxWebApi(webCtx, {
+        configStore,
+        sessionManager,
+        approvalBridge,
+      });
+      registerSafeEffect(webCtx, () => {
+        for (const fn of webDisposers.splice(0)) fn();
+      });
+    });
+    if (getOptionalService(ctx, 'http')) {
+      disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge }));
+    }
+  } else {
+    disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge }));
+  }
 
   const dispose = async (): Promise<void> => {
     for (const fn of disposers.splice(0)) {
@@ -133,8 +194,8 @@ export function apply(
     await sessionManager.dispose();
   };
 
-  ctx.effect?.(dispose);
-  ctx.logger?.info(
+  registerSafeEffect(ctx, dispose);
+  logger?.info(
     `[dsh-wsl-sandbox] loaded (distro=${configStore.get().distro}, approval=${configStore.get().approvalPolicyMode}, network=${configStore.get().networkMode})`,
   );
 

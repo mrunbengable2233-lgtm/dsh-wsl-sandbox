@@ -256,6 +256,9 @@ export function buildBwrapArgs(input: BwrapBuildInput): BwrapBuildResult {
 
   // 5. Controlled UDS proxy socket mount inside private `/run/dsh-proxy`
   if (input.networkMode === 'allowlist-proxy' && input.proxySocketHostPath) {
+    if (!exists(input.proxySocketHostPath)) {
+      failSandbox('SANDBOX_PREPARATION_FAILED', `UDS proxy socket not found: ${input.proxySocketHostPath}`);
+    }
     args.push('--tmpfs', '/run/dsh-proxy');
     args.push('--bind', input.proxySocketHostPath, '/run/dsh-proxy/proxy.sock');
   }

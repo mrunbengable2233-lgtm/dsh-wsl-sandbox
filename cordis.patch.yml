@@ -1,24 +1,23 @@
 # dsh-wsl-sandbox Cordis bundle patch
 #
-# Coexistence invariants (Q12=B + Q4=A + Q14=A):
-# - NEVER disables or overwrites DSH stock rows: system-prompt, fs-local,
-#   subprocess-local, sandbox-local, pwsh-local, or any agent preset.
-# - NEVER conflicts with host-installed plugins such as dsh-purge.
-# - All entries live under the exclusive `dsh-wsl-sandbox-*` namespace.
+# Coexistence invariants (verified against official @deepseek-ai/dsh@0.2.2-rc.5 + Top 27 Marketplace plugins):
+# - NEVER disables or overwrites DSH stock rows (`system-prompt`, `fs-local`, `subprocess-local`,
+#   `sandbox-local`, `tool-pwsh`, `tool-bash`, or `preset-*`).
+# - Single package-root entry (`name: 'dsh-wsl-sandbox'`) so both the Node Host half (`exports["."]`)
+#   and Browser GUI half (`exports["./client"]` -> `client.js`) are discovered cleanly by `ClientModuleRegistry`.
 
 - insert:
     - id: dsh-wsl-sandbox
       name: 'dsh-wsl-sandbox'
       config:
         enabled: true
-        defaultDistro: 'dsh-sandbox'
+        defaultDistro: 'Ubuntu-24.04'
         sandboxMode: 'workspace-write'
         approvalPolicyMode: 'balanced'
         approvalTimeoutMs: 60000
         networkMode: 'allowlist-proxy'
         upstreamProxy: ''
         cacheMode: 'workspace-persistent'
-        maskEnvSecrets: true
         injectSystemPromptSection: true
         enableHostPwshGuard: true
         advanced:
@@ -27,9 +26,3 @@
           localLabCidrs: []
           localLabPorts: []
           customAllowedDomains: []
-
-    - id: dsh-wsl-sandbox-web-ui
-      name: 'dsh-wsl-sandbox/web-ui'
-      config:
-        routePrefix: '/wsl-sandbox/api'
-        zIndexCap: 850

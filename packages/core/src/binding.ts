@@ -152,31 +152,116 @@ export function validateWorkspaceRoot(linuxPath: string, username?: string): str
   return linuxPath;
 }
 
-export function validateShareEntry(share: AuthorizedShare): AuthorizedShare {
-  if (!isValidIdentifier(share.id) || !VALID_SHARE_ALIAS_RE.test(share.alias)) {
-    failSandbox('POLICY_BLOCK', `Invalid share id or alias: ${share.id} / ${share.alias}`);
+const FORBIDDEN_WINDOWS_MOUNT_PATTERNS = [
+  /^\/mnt\/[a-z]$/i,
+  /^\/mnt\/[a-z]\/windows(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/program files(?: \(x86\))?(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/programdata(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/system volume information(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/\$recycle\.bin(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/recovery(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/users\/[^/]+$/i,
+];
+
+/**
+ * Converts a Windows folder path (e.g. `D:\Datasets\ESP32` or `"C:/Users/Alice/Downloads/spec"`)
+ * or a Linux path into a canonical normalized POSIX path without trailing slash.
+ * Rejects UNC paths and bare drive roots (`C:\`, `D:\`) at validation time.
+ */
+export function normalizeSharePathInput(rawInput: string): string {
+  if (typeof rawInput !== 'string') {
+    failSandbox('POLICY_BLOCK', 'Share path must be a string');
   }
-  if (!isSafeAbsoluteLinuxPath(share.sourceLinuxPath)) {
+  let trimmed = rawInput.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  if (!trimmed || trimmed.includes('\0')) {
+    failSandbox('POLICY_BLOCK', 'Share path cannot be empty or contain NUL bytes');
+  }
+  if (trimmed.startsWith('\\\\')) {
+    failSandbox(
+      'POLICY_BLOCK',
+      `Windows UNC share paths are not supported directly (${trimmed}); use a local drive subfolder (e.g. D:\\Folder) or native Linux path.`,
+    );
+  }
+
+  const winDriveMatch = trimmed.match(/^([A-Za-z]):(?:[\\/](.*))?$/);
+  if (winDriveMatch) {
+    const drive = winDriveMatch[1]!.toLowerCase();
+    const rest = (winDriveMatch[2] ?? '').replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!rest) {
+      failSandbox(
+        'POLICY_BLOCK',
+        `Refusing to mount entire Windows drive root (${drive.toUpperCase()}:\\ -> /mnt/${drive}); specify a concrete subdirectory such as ${drive.toUpperCase()}:\\Projects\\MyFolder`,
+      );
+    }
+    const candidate = posix.normalize(`/mnt/${drive}/${rest}`);
+    const trimmedCandidate =
+      candidate.length > 1 && candidate.endsWith('/') ? candidate.slice(0, -1) : candidate;
+    if (!trimmedCandidate.startsWith(`/mnt/${drive}/`)) {
+      failSandbox('POLICY_BLOCK', `Share path traversal outside /mnt/${drive}/ is forbidden: ${rawInput}`);
+    }
+    return trimmedCandidate;
+  }
+
+  const slashTrimmed = trimmed.length > 1 && trimmed.endsWith('/') ? trimmed.replace(/\/+$/, '') : trimmed;
+  return slashTrimmed || '/';
+}
+
+/**
+ * Derives a safe `/shares/<alias>` identifier from a folder basename when user leaves alias blank.
+ */
+export function deriveShareAlias(normalizedLinuxPath: string): string {
+  const base = posix.basename(normalizedLinuxPath);
+  const cleaned = base
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/^[^A-Za-z0-9]+/, '')
+    .replace(/-+/g, '-')
+    .slice(0, 48);
+  return cleaned && VALID_SHARE_ALIAS_RE.test(cleaned) ? cleaned : `share-${Date.now().toString(36).slice(-4)}`;
+}
+
+export function validateShareEntry(share: AuthorizedShare): AuthorizedShare {
+  const normalizedSource = normalizeSharePathInput(share.sourceLinuxPath);
+  const effectiveId =
+    typeof share.id === 'string' && share.id.trim() === ''
+      ? `sh-${Date.now().toString(36)}`
+      : share.id;
+  const effectiveAlias =
+    typeof share.alias === 'string' && share.alias.trim() === ''
+      ? deriveShareAlias(normalizedSource)
+      : share.alias;
+
+  if (!isValidIdentifier(effectiveId) || !VALID_SHARE_ALIAS_RE.test(effectiveAlias)) {
+    failSandbox('POLICY_BLOCK', `Invalid share id or alias: ${String(effectiveId)} / ${String(effectiveAlias)}`);
+  }
+  if (!isSafeAbsoluteLinuxPath(normalizedSource)) {
     failSandbox('POLICY_BLOCK', `Invalid share source path: ${share.sourceLinuxPath}`);
   }
   if (
-    FORBIDDEN_WORKSPACE_ROOTS.has(share.sourceLinuxPath) ||
-    /^\/mnt\/[a-zA-Z]$/.test(share.sourceLinuxPath) ||
-    share.sourceLinuxPath.startsWith('/mnt/wslg/distro') ||
-    share.sourceLinuxPath.startsWith('/run/WSL') ||
-    share.sourceLinuxPath.startsWith('/etc') ||
-    share.sourceLinuxPath.startsWith('/proc') ||
-    share.sourceLinuxPath.startsWith('/sys')
+    FORBIDDEN_WORKSPACE_ROOTS.has(normalizedSource) ||
+    FORBIDDEN_WINDOWS_MOUNT_PATTERNS.some((re) => re.test(normalizedSource)) ||
+    normalizedSource.startsWith('/mnt/wslg/distro') ||
+    normalizedSource.startsWith('/mnt/wsl/') ||
+    normalizedSource.startsWith('/run/WSL') ||
+    normalizedSource.startsWith('/etc') ||
+    normalizedSource.startsWith('/proc') ||
+    normalizedSource.startsWith('/sys') ||
+    normalizedSource.startsWith('/dev')
   ) {
-    failSandbox('POLICY_BLOCK', `Refusing to share full drive or protected path: ${share.sourceLinuxPath}`);
+    failSandbox('POLICY_BLOCK', `Refusing to share full drive, user profile root, or protected OS path: ${normalizedSource}`);
   }
   if (share.mode !== 'ro' && share.mode !== 'rw') {
     failSandbox('POLICY_BLOCK', `Invalid share mode: ${String(share.mode)}`);
   }
   return Object.freeze({
-    id: share.id,
-    alias: share.alias,
-    sourceLinuxPath: share.sourceLinuxPath,
+    id: effectiveId,
+    alias: effectiveAlias,
+    sourceLinuxPath: normalizedSource,
     mode: share.mode,
     oneShot: Boolean(share.oneShot),
   });

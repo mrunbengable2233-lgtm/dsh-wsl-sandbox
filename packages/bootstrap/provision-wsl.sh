@@ -16,6 +16,9 @@ MIRROR="global"
 PROXY=""
 STEP="all"
 DRY_RUN="false"
+ACTION="provision"
+CUSTOM_BACKUP_DIR=""
+OPEN_BACKUP_EXPLORER="false"
 
 usage() {
   cat <<'EOF'
@@ -25,6 +28,11 @@ Usage: provision-wsl.sh [options]
   --proxy   <url>                     Optional HTTP/SOCKS5 upstream proxy (e.g. http://127.0.0.1:7890)
   --step    all|base|cli|node|python|go-rust|extra
                                       Run one idempotent step or all steps (default: all)
+  --backup-configs                    Back up original /etc/wsl.conf, /etc/fstab & mounts
+  --backup-dir <path>                 Custom backup directory (Linux path or Windows path like D:\Backups\WSL)
+  --open-backup-dir                   Open the backup directory in native Windows Explorer
+  --disable-automount                 Back up /etc/wsl.conf and set [automount] enabled = false (requires 'wsl.exe --shutdown')
+  --restore-configs                   Restore original /etc/wsl.conf & APT sources from backup directory
   --dry-run                           Print planned commands without modifying the system
   -h, --help                          Show this help
 EOF
@@ -36,6 +44,11 @@ while [[ $# -gt 0 ]]; do
     --mirror)  MIRROR="${2:?Missing value for --mirror}"; shift 2 ;;
     --proxy)   PROXY="${2:?Missing value for --proxy}"; shift 2 ;;
     --step)    STEP="${2:?Missing value for --step}"; shift 2 ;;
+    --backup-configs)    ACTION="backup"; shift ;;
+    --backup-dir)        CUSTOM_BACKUP_DIR="${2:?Missing value for --backup-dir}"; shift 2 ;;
+    --open-backup-dir)   OPEN_BACKUP_EXPLORER="true"; shift ;;
+    --disable-automount) ACTION="disable-automount"; shift ;;
+    --restore-configs)   ACTION="restore"; shift ;;
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[ERROR] Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -58,9 +71,147 @@ case "$STEP" in
 esac
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  echo "[ERROR] Do not run provision-wsl.sh as root (UID 0). Run as your non-root WSL user (sudo will be invoked only for apt)." >&2
+  echo "[ERROR] Do not run provision-wsl.sh as root (UID 0). Run as your non-root WSL user (sudo will be invoked only when needed)." >&2
   exit 1
 fi
+
+BACKUP_DIR="$HOME/.config/dsh-wsl-sandbox/backups"
+if [[ -n "$CUSTOM_BACKUP_DIR" ]]; then
+  if [[ "$CUSTOM_BACKUP_DIR" =~ ^([A-Za-z]):[\\/](.*)$ ]]; then
+    DRV="$(echo "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+    REST="$(echo "${BASH_REMATCH[2]}" | tr '\\' '/')"
+    BACKUP_DIR="/mnt/${DRV}/${REST%/}"
+  else
+    BACKUP_DIR="$CUSTOM_BACKUP_DIR"
+  fi
+fi
+
+backup_original_wsl_configs() {
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] mkdir -p $BACKUP_DIR && snapshot /etc/wsl.conf, /etc/fstab, /proc/mounts"
+    return 0
+  fi
+  mkdir -p "$BACKUP_DIR"
+  chmod 700 "$BACKUP_DIR"
+
+  if [[ -f /etc/wsl.conf ]]; then
+    if [[ ! -f "$BACKUP_DIR/wsl.conf.orig" && ! -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
+      cp /etc/wsl.conf "$BACKUP_DIR/wsl.conf.orig"
+      echo "[backup] Saved pristine original /etc/wsl.conf -> $BACKUP_DIR/wsl.conf.orig"
+    fi
+    cp /etc/wsl.conf "$BACKUP_DIR/wsl.conf.${ts}.bak"
+  else
+    if [[ ! -f "$BACKUP_DIR/wsl.conf.orig" && ! -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
+      printf '# /etc/wsl.conf did not exist prior to dsh-wsl-sandbox setup (%s)\n' "$ts" > "$BACKUP_DIR/wsl.conf.orig.absent"
+      echo "[backup] Recorded pristine state (no /etc/wsl.conf) -> $BACKUP_DIR/wsl.conf.orig.absent"
+    fi
+  fi
+
+  if [[ -f /etc/fstab ]]; then
+    [[ ! -f "$BACKUP_DIR/fstab.orig" ]] && cp /etc/fstab "$BACKUP_DIR/fstab.orig"
+    cp /etc/fstab "$BACKUP_DIR/fstab.${ts}.bak"
+  fi
+
+  if [[ -r /proc/mounts ]]; then
+    grep -E 'drvfs|9p|/mnt/' /proc/mounts > "$BACKUP_DIR/drvfs-mounts.${ts}.txt" 2>/dev/null || true
+    [[ ! -f "$BACKUP_DIR/drvfs-mounts.orig.txt" ]] && cp "$BACKUP_DIR/drvfs-mounts.${ts}.txt" "$BACKUP_DIR/drvfs-mounts.orig.txt" 2>/dev/null || true
+  fi
+}
+
+disable_wsl_automount() {
+  backup_original_wsl_configs
+  echo "=== [wsl.conf] Disabling OS-level Windows full-drive automount ([automount] enabled = false) ==="
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] Write [automount] enabled = false to /etc/wsl.conf"
+    return 0
+  fi
+  local tmp_conf
+  tmp_conf="$(mktemp)"
+  if [[ -f /etc/wsl.conf ]]; then
+    awk '
+      BEGIN { in_auto=0; wrote_auto=0 }
+      /^\[automount\]/ {
+        print "[automount]"
+        print "enabled = false"
+        print "mountFsTab = false"
+        in_auto=1; wrote_auto=1; next
+      }
+      /^\[/ { in_auto=0 }
+      in_auto && /^[[:space:]]*(enabled|mountFsTab)[[:space:]]*=/ { next }
+      { print }
+      END {
+        if (!wrote_auto) {
+          print ""
+          print "[automount]"
+          print "enabled = false"
+          print "mountFsTab = false"
+        }
+      }
+    ' /etc/wsl.conf > "$tmp_conf"
+  else
+    cat > "$tmp_conf" <<'EOF'
+[boot]
+systemd = true
+
+[automount]
+enabled = false
+mountFsTab = false
+EOF
+  fi
+  sudo cp "$tmp_conf" /etc/wsl.conf
+  sudo chmod 644 /etc/wsl.conf
+  rm -f "$tmp_conf"
+  echo "[ok] Updated /etc/wsl.conf ([automount] enabled = false). Original backed up under $BACKUP_DIR."
+  echo "[next] Run 'wsl.exe --shutdown' in Windows PowerShell to apply at WSL VM boot."
+}
+
+restore_original_wsl_configs() {
+  echo "=== [restore] Restoring original WSL configuration from $BACKUP_DIR ==="
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] Restore /etc/wsl.conf and APT sources from $BACKUP_DIR"
+    return 0
+  fi
+  if [[ -f "$BACKUP_DIR/wsl.conf.orig" ]]; then
+    sudo cp "$BACKUP_DIR/wsl.conf.orig" /etc/wsl.conf
+    sudo chmod 644 /etc/wsl.conf
+    echo "[ok] Restored /etc/wsl.conf from $BACKUP_DIR/wsl.conf.orig"
+  elif [[ -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
+    sudo rm -f /etc/wsl.conf
+    echo "[ok] Removed /etc/wsl.conf (system originally had no /etc/wsl.conf)"
+  else
+    echo "[warn] No backup marker found in $BACKUP_DIR; /etc/wsl.conf left untouched."
+  fi
+
+  if [[ -f /etc/apt/sources.list.d/ubuntu.sources.bak ]]; then
+    sudo cp /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubuntu.sources
+    echo "[ok] Restored /etc/apt/sources.list.d/ubuntu.sources"
+  elif [[ -f /etc/apt/sources.list.bak ]]; then
+    sudo cp /etc/apt/sources.list.bak /etc/apt/sources.list
+    echo "[ok] Restored /etc/apt/sources.list"
+  fi
+  echo "[next] Run 'wsl.exe --shutdown' in Windows PowerShell if /etc/wsl.conf was changed."
+}
+
+if [[ "$ACTION" == "backup" ]]; then
+  backup_original_wsl_configs
+  echo "[ok] Original WSL configuration snapshot saved under: $BACKUP_DIR"
+  ls -la "$BACKUP_DIR" || true
+  if [[ "$OPEN_BACKUP_EXPLORER" == "true" ]] && command -v wslpath >/dev/null 2>&1 && command -v explorer.exe >/dev/null 2>&1; then
+    explorer.exe "$(wslpath -w "$BACKUP_DIR")" || true
+  fi
+  exit 0
+elif [[ "$ACTION" == "disable-automount" ]]; then
+  disable_wsl_automount
+  exit 0
+elif [[ "$ACTION" == "restore" ]]; then
+  restore_original_wsl_configs
+  exit 0
+fi
+
+# Always snapshot original WSL configs non-destructively before provisioning
+backup_original_wsl_configs
 
 ARCH="$(uname -m)"
 case "$ARCH" in

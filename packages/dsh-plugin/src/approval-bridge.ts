@@ -52,6 +52,10 @@ export interface BridgeRequestOptions {
   readonly requireIndependentFallback?: boolean;
   /** If true, this command is strictly in-workspace and non-hardware (eligible for `trust-workspace` auto-pass). */
   readonly eligibleForTrustWorkspace?: boolean;
+  readonly agent?: unknown;
+  readonly toolName?: string;
+  readonly callId?: string;
+  readonly callerSignal?: AbortSignal;
 }
 
 /**
@@ -62,7 +66,7 @@ export interface BridgeRequestOptions {
 export class ApprovalBridge {
   private readonly controller: ApprovalController;
   private readonly getPolicyMode: () => ApprovalPolicyMode;
-  private readonly hostApproval?: DshApprovalService;
+  private hostApproval?: DshApprovalService;
   private readonly bypassInstantThresholdMs: number;
   private readonly onPendingAdded?: (item: PendingQueueItem) => void;
   private readonly onPendingResolved?: (requestId: string, decision: ApprovalDecisionKind | 'aborted') => void;
@@ -84,6 +88,10 @@ export class ApprovalBridge {
     });
   }
 
+  setHostApproval(service: DshApprovalService | undefined): void {
+    this.hostApproval = service;
+  }
+
   /**
    * Register a polite `approval/request` waterfall listener on Cordis context:
    * passes every non-`dsh-wsl-sandbox` request untouched via `return next()`.
@@ -92,11 +100,11 @@ export class ApprovalBridge {
     if (!ctx.waterfall) return undefined;
     const dispose = ctx.waterfall<{ source?: string }, unknown>('approval/request', async (req, next) => {
       if (req?.source !== 'dsh-wsl-sandbox') {
-        return next();
+        return typeof next === 'function' ? next() : undefined;
       }
-      return next();
+      return typeof next === 'function' ? next() : undefined;
     });
-    return typeof dispose === 'function' ? dispose : undefined;
+    return typeof dispose === 'function' ? () => void dispose() : undefined;
   }
 
   setBinding(binding: SessionBinding): void {
@@ -118,6 +126,14 @@ export class ApprovalBridge {
 
   getAuditLog(): readonly ApprovalAuditRecord[] {
     return this.controller.getAuditLog();
+  }
+
+  getSessionRules(): readonly string[][] {
+    return this.controller.getSessionRules();
+  }
+
+  clearSessionRules(): void {
+    this.controller.clearSessionRules();
   }
 
   decidePending(
@@ -154,8 +170,6 @@ export class ApprovalBridge {
         action.kind === 'network-access' ||
         action.kind === 'host-pwsh-command');
 
-    // In `trust-workspace` mode, strictly in-workspace non-hardware commands can skip prompts,
-    // while physical devices, out-of-workspace, escalations, unknown domains, and host pwsh still ask!
     if (
       mode === 'trust-workspace' &&
       opts?.eligibleForTrustWorkspace &&
@@ -186,10 +200,13 @@ export class ApprovalBridge {
     this.requestMeta.set(metaKey, {
       requireIndependentFallback: isHighRiskBypassProtected,
       eligibleForTrustWorkspace: opts?.eligibleForTrustWorkspace,
+      agent: opts?.agent,
+      toolName: opts?.toolName,
+      callId: opts?.callId,
     });
 
     try {
-      return await this.controller.authorize(action);
+      return await this.controller.authorize(action, opts?.callerSignal);
     } finally {
       this.requestMeta.delete(metaKey);
     }
@@ -209,16 +226,13 @@ export class ApprovalBridge {
         envelope.action.kind === 'network-access',
     );
 
-    // `strict` mode ALWAYS uses our independent approval queue directly.
     if (mode === 'strict' || !this.hostApproval) {
       return this.enqueueIndependent(envelope, false);
     }
 
-    // `balanced` (or `trust-workspace` for high-risk actions): try host `ctx.approval` first,
-    // but detect synthetic bypass (such as `dsh-purge` `hooksDenyBypass: true`).
     const startedMs = performance.now();
     try {
-      const hostRes = await this.hostApproval.request({
+      const hostResRaw = await this.hostApproval.request({
         source: 'dsh-wsl-sandbox',
         requestId: envelope.requestId,
         kind: envelope.action.kind,
@@ -227,9 +241,37 @@ export class ApprovalBridge {
         reasons: envelope.action.reasons,
         touchesPhysicalDevice: envelope.action.touchesPhysicalDevice,
         allowSessionRule: envelope.allowSessionRuleOption,
+        ...(meta?.agent !== undefined ? { agent: meta.agent } : {}),
+        toolName: meta?.toolName ?? `wsl_sandbox:${envelope.action.kind}`,
+        ...(meta?.callId !== undefined ? { callId: meta.callId } : {}),
+        reason: `${envelope.action.summary}${envelope.action.command ? ` — ${envelope.action.command}` : ''}`,
+        signal: envelope.signal,
       });
 
       const elapsedMs = performance.now() - startedMs;
+
+      // Real `@deepseek-ai/dsh-user-approval` returns string outcomes
+      if (typeof hostResRaw === 'string') {
+        if (hostResRaw === 'unavailable') {
+          return this.enqueueIndependent(envelope, true);
+        }
+        const decisionFromStr: ApprovalDecisionKind =
+          hostResRaw === 'allowed-once' ? 'allow-once' : 'deny';
+        if (
+          decisionFromStr === 'allow-once' &&
+          elapsedMs < this.bypassInstantThresholdMs &&
+          requiresFallback
+        ) {
+          return this.enqueueIndependent(envelope, true);
+        }
+        return {
+          requestId: envelope.requestId,
+          actionHash: envelope.actionHash,
+          decision: decisionFromStr,
+        };
+      }
+
+      const hostRes = hostResRaw;
       const isSyntheticBypass =
         Boolean(hostRes.bypassed || hostRes.hooksDenyBypass) ||
         (hostRes.source === 'dsh-purge' && !hostRes.humanVerified) ||
@@ -241,7 +283,6 @@ export class ApprovalBridge {
         return this.enqueueIndependent(envelope, true);
       }
 
-      // Physical-device safeguard: even if host returned `allow-session-rule`, downgrade to `allow-once`
       const normalizedDecision: ApprovalDecisionKind =
         envelope.action.touchesPhysicalDevice && hostRes.decision === 'allow-session-rule'
           ? 'allow-once'
@@ -255,7 +296,6 @@ export class ApprovalBridge {
         sessionPrefix: normalizedDecision === 'allow-session-rule' ? hostRes.sessionPrefix : undefined,
       };
     } catch {
-      // If host approval service errored or wasn't interactive, fail closed into independent queue
       return this.enqueueIndependent(envelope, true);
     }
   }

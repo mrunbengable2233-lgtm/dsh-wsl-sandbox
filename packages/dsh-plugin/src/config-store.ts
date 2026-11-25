@@ -48,6 +48,8 @@ export interface WslSandboxConfig {
   readonly enablePromptInjection: boolean;
   /** Workspaces where the human explicitly unmasked `.env*` reads (default: empty). */
   readonly unmaskedEnvWorkspaces: readonly string[];
+  /** Custom host directory for storing original WSL config backups (`.wslconfig`, `wsl.conf`, `fstab`). */
+  readonly backupDir?: string;
   readonly advanced: AdvancedSandboxConfig;
 }
 
@@ -55,6 +57,7 @@ export type BasicConfigPatch = Partial<
   Pick<
     WslSandboxConfig,
     | 'enabled'
+    | 'transportMode'
     | 'distro'
     | 'username'
     | 'workspaceRoot'
@@ -69,11 +72,13 @@ export type BasicConfigPatch = Partial<
     | 'enablePwshGuard'
     | 'enablePromptInjection'
     | 'unmaskedEnvWorkspaces'
+    | 'backupDir'
   >
 >;
 
 export type ConfigChangeListener = (next: WslSandboxConfig, prev: WslSandboxConfig) => void;
 
+const VALID_TRANSPORT_MODES = new Set<WslSandboxConfig['transportMode']>(['wsl', 'local-linux']);
 const VALID_SANDBOX_MODES = new Set<SandboxMode>(['read-only', 'workspace-write']);
 const VALID_APPROVAL_MODES = new Set<ApprovalPolicyMode>(['balanced', 'strict', 'trust-workspace']);
 const VALID_NETWORK_MODES = new Set<NetworkMode>(['allowlist-proxy', 'offline']);
@@ -82,6 +87,30 @@ const VALID_CACHE_MODES = new Set<CacheMode>(['workspace-persistent', 'ephemeral
 export function getDefaultConfigPath(dshHome?: string): string {
   const base = dshHome ?? process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
   return path.join(base, 'dsh-wsl-sandbox', 'config.json');
+}
+
+export function getDefaultBackupDir(dshHome?: string): string {
+  const base = dshHome ?? process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
+  return path.join(base, 'dsh-wsl-sandbox', 'backups');
+}
+
+export function validateBackupDirPath(rawDir: string | undefined): string | undefined {
+  if (rawDir === undefined) return undefined;
+  let trimmed = rawDir.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length >= 2)
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
+  if (!trimmed) return undefined;
+  if (trimmed.includes('\0')) {
+    failSandbox('POLICY_BLOCK', 'Invalid backupDir containing NUL byte');
+  }
+  if (/^[A-Za-z]:\\?$/.test(trimmed) || trimmed === '/' || /^([A-Za-z]:\\Windows(\\|$)|\/(etc|proc|sys|dev|boot)(\/|$))/i.test(trimmed)) {
+    failSandbox('POLICY_BLOCK', `Refusing to use drive root or OS system directory as backupDir: ${trimmed}`);
+  }
+  return trimmed;
 }
 
 export function createDefaultConfig(overrides?: Partial<WslSandboxConfig>): WslSandboxConfig {
@@ -103,6 +132,7 @@ export function createDefaultConfig(overrides?: Partial<WslSandboxConfig>): WslS
     enablePwshGuard: true,
     enablePromptInjection: true,
     unmaskedEnvWorkspaces: [],
+    backupDir: getDefaultBackupDir(),
     advanced: {
       shares: [],
       deviceNodes: [],
@@ -153,6 +183,9 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
   }
   validateWorkspaceRoot(raw.workspaceRoot, raw.username);
 
+  if (!VALID_TRANSPORT_MODES.has(raw.transportMode)) {
+    failSandbox('INVALID_SETUP', `Invalid transportMode: ${String(raw.transportMode)}`);
+  }
   if (!VALID_SANDBOX_MODES.has(raw.sandboxMode)) {
     failSandbox('INVALID_SETUP', `Invalid sandboxMode: ${String(raw.sandboxMode)}`);
   }
@@ -189,10 +222,12 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
   });
 
   const customAllowedDomains = (raw.advanced?.customAllowedDomains ?? []).map(validateDomain);
+  const backupDir = validateBackupDirPath(raw.backupDir) ?? getDefaultBackupDir();
 
   return {
     ...raw,
     upstreamProxy,
+    backupDir,
     unmaskedEnvWorkspaces: [...new Set(raw.unmaskedEnvWorkspaces ?? [])],
     advanced: {
       shares,
@@ -296,6 +331,7 @@ export class ConfigStore {
     return this.commit({
       ...this.config,
       enabled: patch.enabled ?? this.config.enabled,
+      transportMode: patch.transportMode ?? this.config.transportMode,
       distro: patch.distro ?? this.config.distro,
       username: patch.username !== undefined ? patch.username : this.config.username,
       workspaceRoot: patch.workspaceRoot ?? this.config.workspaceRoot,
@@ -310,6 +346,7 @@ export class ConfigStore {
       enablePwshGuard: patch.enablePwshGuard ?? this.config.enablePwshGuard,
       enablePromptInjection: patch.enablePromptInjection ?? this.config.enablePromptInjection,
       unmaskedEnvWorkspaces: patch.unmaskedEnvWorkspaces ?? this.config.unmaskedEnvWorkspaces,
+      backupDir: patch.backupDir !== undefined ? patch.backupDir : this.config.backupDir,
     });
   }
 

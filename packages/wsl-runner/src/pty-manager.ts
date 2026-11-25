@@ -53,10 +53,9 @@ export class ConfinedTerminalManager {
 
     const rawCmd = params.command ?? '';
     const wrapped = [
+      `__dsh_emit_cwd() { local __rc=$?; printf '\\n${CWD_MARKER}%s\\n' "$(pwd -P)"; exit $__rc; }`,
+      'trap __dsh_emit_cwd EXIT',
       rawCmd,
-      '__dsh_rc=$?',
-      `printf '\\n${CWD_MARKER}%s\\n' "$(pwd -P)"`,
-      'exit $__dsh_rc',
     ].join('\n');
 
     const result = await this.procManager.exec({
