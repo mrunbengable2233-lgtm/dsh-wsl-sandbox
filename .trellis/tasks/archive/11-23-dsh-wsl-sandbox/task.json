@@ -1,0 +1,10 @@
+{
+  "name": "11-23-dsh-wsl-sandbox",
+  "title": "DSH WSL 2 Sandbox Backend",
+  "description": "Codex-grade WSL 2 backend sandbox with zero-token command approval, preinstalled dev environment, and zero conflict with host DSH plugins (e.g. dsh-purge)",
+  "status": "archived",
+  "parent": null,
+  "subtasks": [],
+  "createdAt": "2026-11-23T12:36:26.620304+00:00",
+  "archivedAt": "2026-11-24T10:58:20.125692+00:00"
+}
