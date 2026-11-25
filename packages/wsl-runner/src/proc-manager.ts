@@ -1,0 +1,424 @@
+import { type ChildProcess, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {
+  buildBwrapArgs,
+  type CollectedStream,
+  compileSeccompBpf,
+  failSandbox,
+  type ProcExecParams,
+  type ProcExecResult,
+  sanitizeSandboxEnv,
+} from '../../core/src/index.ts';
+
+const DEFAULT_TIMEOUT_MS = 120_000;
+const DEFAULT_GRACE_MS = 2_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024;
+const MAX_SPILL_BYTES = 10 * 1024 * 1024;
+
+const DENIAL_SIGNATURES = [
+  'read-only file system',
+  'erofs',
+  'permission denied',
+  'operation not permitted',
+  'network is unreachable',
+  'dsh wsl sandbox proxy blocked',
+] as const;
+
+const RUNNER_FAILURE_SIGNATURES = [
+  'bwrap:',
+  'setting up uid map',
+  'creating new namespace failed',
+  'execvp',
+] as const;
+
+interface ActiveProc {
+  readonly execId: string;
+  readonly generation: number;
+  readonly child: ChildProcess;
+  readonly killGroup: () => Promise<void>;
+}
+
+class BoundedStreamCollector {
+  private readonly maxBytes: number;
+  private readonly spillDir: string;
+  private readonly name: string;
+  private chunks: Buffer[] = [];
+  private keptBytes = 0;
+  private totalBytes = 0;
+  private truncated = false;
+  private spillPath: string | undefined;
+  private spillFd: number | undefined;
+  private spillBytes = 0;
+  private spillAborted = false;
+
+  constructor(maxBytes: number, spillDir: string, name: string) {
+    this.maxBytes = Math.max(1024, maxBytes);
+    this.spillDir = spillDir;
+    this.name = name;
+  }
+
+  push(chunk: Buffer): void {
+    this.totalBytes += chunk.length;
+
+    if (!this.truncated && this.keptBytes + chunk.length <= this.maxBytes) {
+      this.chunks.push(chunk);
+      this.keptBytes += chunk.length;
+      return;
+    }
+
+    // Overflow -> begin spill file with previously buffered bytes + new bytes
+    if (!this.truncated) {
+      this.truncated = true;
+      try {
+        fs.mkdirSync(this.spillDir, { recursive: true, mode: 0o700 });
+        this.spillPath = path.join(this.spillDir, `${this.name}-${randomUUID()}.log`);
+        this.spillFd = fs.openSync(this.spillPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+        for (const prev of this.chunks) {
+          this.writeSpill(prev);
+        }
+      } catch {
+        this.spillAborted = true;
+        this.spillPath = undefined;
+      }
+    }
+
+    this.writeSpill(chunk);
+
+    // Keep tail up to maxBytes in memory
+    const combined = Buffer.concat([...this.chunks, chunk]);
+    if (combined.length > this.maxBytes) {
+      const tail = combined.subarray(combined.length - this.maxBytes);
+      this.chunks = [tail];
+      this.keptBytes = tail.length;
+    } else {
+      this.chunks = [combined];
+      this.keptBytes = combined.length;
+    }
+  }
+
+  private writeSpill(buf: Buffer): void {
+    if (this.spillAborted || this.spillFd === undefined) return;
+    if (this.spillBytes + buf.length > MAX_SPILL_BYTES) {
+      try { fs.closeSync(this.spillFd); } catch { /* ignore */ }
+      this.spillFd = undefined;
+      if (this.spillPath) fs.rmSync(this.spillPath, { force: true });
+      this.spillPath = undefined;
+      this.spillAborted = true;
+      return;
+    }
+    try {
+      fs.writeSync(this.spillFd, buf);
+      this.spillBytes += buf.length;
+    } catch {
+      this.spillAborted = true;
+    }
+  }
+
+  finish(): CollectedStream {
+    if (this.spillFd !== undefined) {
+      try { fs.closeSync(this.spillFd); } catch { /* ignore */ }
+      this.spillFd = undefined;
+    }
+    return {
+      text: Buffer.concat(this.chunks).toString('utf8'),
+      truncated: this.truncated,
+      totalBytes: this.totalBytes,
+      spillPath: this.truncated && !this.spillAborted ? this.spillPath : undefined,
+    };
+  }
+}
+
+/**
+ * Inside `--unshare-net`, bridges a sandbox-private loopback port (127.0.0.1:<port>)
+ * to the mounted Unix Domain Socket `/run/dsh-proxy/proxy.sock` so standard CLI tools
+ * (`curl`, `npm`, `pnpm`, `uv`, `pip`, `git`, `cargo`, `go`) use `HTTP_PROXY`/`HTTPS_PROXY`
+ * seamlessly while direct outbound IP access stays kernel-blocked.
+ */
+function wrapCommandWithUdsLoopbackBridge(innerCommand: string): string {
+  // Uses socat when available (fast C binary), otherwise falls back to inline Node TCP<->UDS bridge.
+  return [
+    '__dsh_proxy_port=$((38000 + ($$ % 10000)))',
+    '__dsh_bridge_pid=""',
+    'if command -v socat >/dev/null 2>&1; then',
+    '  socat "TCP-LISTEN:${__dsh_proxy_port},bind=127.0.0.1,fork,reuseaddr" "UNIX-CONNECT:/run/dsh-proxy/proxy.sock" >/dev/null 2>&1 &',
+    '  __dsh_bridge_pid=$!',
+    'else',
+    '  node -e "const n=require(\'node:net\');n.createServer(c=>{const u=n.connect(\'/run/dsh-proxy/proxy.sock\');c.pipe(u);u.pipe(c);c.on(\'error\',()=>u.destroy());u.on(\'error\',()=>c.destroy());}).listen(Number(process.argv[1]),\'127.0.0.1\');" "$__dsh_proxy_port" >/dev/null 2>&1 &',
+    '  __dsh_bridge_pid=$!',
+    'fi',
+    'trap \'[ -n "$__dsh_bridge_pid" ] && kill "$__dsh_bridge_pid" 2>/dev/null || true\' EXIT',
+    'export HTTP_PROXY="http://127.0.0.1:${__dsh_proxy_port}"',
+    'export HTTPS_PROXY="http://127.0.0.1:${__dsh_proxy_port}"',
+    'export http_proxy="http://127.0.0.1:${__dsh_proxy_port}"',
+    'export https_proxy="http://127.0.0.1:${__dsh_proxy_port}"',
+    'sleep 0.05',
+    innerCommand,
+  ].join('\n');
+}
+
+function classifyStderr(
+  exitCode: number | null,
+  stderrText: string,
+): { runnerFailed: boolean; denied: boolean; denialMatches: string[] } {
+  if (exitCode === 0) {
+    return { runnerFailed: false, denied: false, denialMatches: [] };
+  }
+  const lower = stderrText.toLowerCase();
+  const lines = lower.split('\n').map((l) => l.trim()).filter(Boolean);
+  const runnerFailed = lines.some((line) =>
+    RUNNER_FAILURE_SIGNATURES.some((sig) => line.includes(sig)),
+  );
+  const denialMatches = DENIAL_SIGNATURES.filter((sig) => lower.includes(sig));
+  return {
+    runnerFailed,
+    denied: !runnerFailed && denialMatches.length > 0,
+    denialMatches: [...denialMatches],
+  };
+}
+
+export class ConfinedProcManager {
+  private readonly active = new Map<string, ActiveProc>();
+  private readonly placeholderRefs = new Map<string, number>();
+  private readonly runtimeDir: string;
+  private readonly emptyMaskFile: string;
+  private readonly spillDir: string;
+
+  constructor(baseTempDir?: string) {
+    this.runtimeDir = baseTempDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wsl-runner-'));
+    fs.mkdirSync(this.runtimeDir, { recursive: true, mode: 0o700 });
+    this.emptyMaskFile = path.join(this.runtimeDir, 'empty-mask');
+    fs.writeFileSync(this.emptyMaskFile, '', { mode: 0o444 });
+    this.spillDir = path.join(this.runtimeDir, 'spills');
+  }
+
+  private acquirePlaceholders(paths: readonly string[]): string[] {
+    const acquired: string[] = [];
+    for (const p of paths) {
+      this.placeholderRefs.set(p, (this.placeholderRefs.get(p) ?? 0) + 1);
+      acquired.push(p);
+    }
+    return acquired;
+  }
+
+  private releasePlaceholders(paths: readonly string[]): void {
+    for (const p of paths) {
+      const next = (this.placeholderRefs.get(p) ?? 1) - 1;
+      if (next <= 0) {
+        this.placeholderRefs.delete(p);
+        try {
+          const st = fs.lstatSync(p);
+          if (st.isFile() && st.size === 0) {
+            fs.unlinkSync(p);
+          }
+        } catch {
+          // Already absent or non-empty
+        }
+      } else {
+        this.placeholderRefs.set(p, next);
+      }
+    }
+  }
+
+  getActiveCount(): number {
+    return this.active.size;
+  }
+
+  async kill(execId: string): Promise<boolean> {
+    const entry = this.active.get(execId);
+    if (!entry) return false;
+    await entry.killGroup();
+    return true;
+  }
+
+  async invalidateGeneration(minValidGeneration: number): Promise<number> {
+    const victims = Array.from(this.active.values()).filter((p) => p.generation < minValidGeneration);
+    await Promise.all(victims.map((v) => v.killGroup()));
+    return victims.length;
+  }
+
+  async disposeAll(): Promise<void> {
+    const all = Array.from(this.active.values());
+    await Promise.all(all.map((p) => p.killGroup()));
+    fs.rmSync(this.runtimeDir, { recursive: true, force: true });
+  }
+
+  async exec(params: ProcExecParams): Promise<ProcExecResult> {
+    const execId = params.execId ?? randomUUID();
+    const timeoutMs = Math.min(600_000, Math.max(100, params.timeoutMs ?? DEFAULT_TIMEOUT_MS));
+    const graceMs = Math.min(10_000, Math.max(100, params.graceMs ?? DEFAULT_GRACE_MS));
+    const maxOutputBytes = params.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+
+    const useBridge = params.networkMode === 'allowlist-proxy' && Boolean(params.proxySocketHostPath);
+
+    let targetArgv: string[];
+    if (params.argv && params.argv.length > 0 && !useBridge) {
+      targetArgv = [...params.argv];
+    } else if (params.command !== undefined) {
+      const script = useBridge ? wrapCommandWithUdsLoopbackBridge(params.command) : params.command;
+      targetArgv = ['/bin/bash', '-c', script];
+    } else if (params.argv && params.argv.length > 0 && useBridge) {
+      const quoted = params.argv.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
+      targetArgv = ['/bin/bash', '-c', wrapCommandWithUdsLoopbackBridge(quoted)];
+    } else {
+      failSandbox('INVALID_ACTION', 'proc.exec requires either command or argv');
+    }
+
+    const sanitizedEnv = sanitizeSandboxEnv({
+      baseEnv: process.env,
+      extraEnv: params.env,
+      dshEnv: params.dshEnv,
+      homeDir: `/home/${params.binding.username}`,
+      cacheRootDir: params.cacheDir,
+      mirrorCn: params.mirrorCn,
+    });
+
+    if (params.cacheDir && params.mode === 'workspace-write') {
+      fs.mkdirSync(params.cacheDir, { recursive: true, mode: 0o700 });
+    }
+
+    // Compile architecture-specific seccomp-bpf and open fd for `bwrap --seccomp 3`
+    const bpfPath = path.join(this.runtimeDir, `seccomp-${execId}.bpf`);
+    const bpfBuf = compileSeccompBpf({
+      arch: params.binding.arch,
+      // Offline mode blocks AF_INET/AF_INET6 at seccomp layer too; allowlist-proxy relies on
+      // --unshare-net isolation + AF_VSOCK/AF_PACKET block so sandbox-local 127.0.0.1 bridge works.
+      blockNetworkSockets: params.networkMode === 'offline',
+    });
+    fs.writeFileSync(bpfPath, bpfBuf, { mode: 0o600 });
+    const bpfFd = fs.openSync(bpfPath, 'r');
+
+    let bwrapBuild;
+    try {
+      bwrapBuild = buildBwrapArgs({
+        argv: targetArgv,
+        cwd: params.cwd,
+        workspaceRoot: params.binding.workspaceRoot,
+        mode: params.mode,
+        networkMode: params.networkMode,
+        supportsDisableUserns: params.binding.supportsDisableUserns,
+        seccompFd: 3,
+        env: sanitizedEnv,
+        rlimits: params.rlimits,
+        usePrlimit: true,
+        shares: params.binding.authorizedShares,
+        devices: params.binding.authorizedDevices,
+        cacheDir: params.cacheDir,
+        maskEnvSecrets: params.maskEnvSecrets !== false,
+        emptyMaskFilePath: this.emptyMaskFile,
+        proxySocketHostPath: params.proxySocketHostPath,
+      });
+    } catch (err) {
+      try { fs.closeSync(bpfFd); } catch { /* ignore */ }
+      fs.rmSync(bpfPath, { force: true });
+      throw err;
+    }
+
+    const acquiredPlaceholders = this.acquirePlaceholders(bwrapBuild.createdPlaceholders);
+
+    const child = spawn('bwrap', bwrapBuild.bwrapArgs, {
+      detached: true,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe', bpfFd],
+    });
+
+    // Parent no longer needs bpfFd or temp file once child inherited fd 3
+    try { fs.closeSync(bpfFd); } catch { /* ignore */ }
+    fs.rmSync(bpfPath, { force: true });
+
+    if (params.stdin !== undefined && child.stdin) {
+      child.stdin.write(params.stdin);
+      child.stdin.end();
+    } else if (child.stdin) {
+      child.stdin.end();
+    }
+
+    const stdoutCollector = new BoundedStreamCollector(maxOutputBytes, this.spillDir, `out-${execId}`);
+    const stderrCollector = new BoundedStreamCollector(maxOutputBytes, this.spillDir, `err-${execId}`);
+    child.stdout?.on('data', (chunk: Buffer) => stdoutCollector.push(chunk));
+    child.stderr?.on('data', (chunk: Buffer) => stderrCollector.push(chunk));
+
+    let timedOut = false;
+    let aborted = false;
+    let exited = false;
+    let killing = false;
+
+    const waitClose = new Promise<{ exitCode: number | null; signal: string | null }>((resolve, reject) => {
+      child.once('error', (err) => {
+        exited = true;
+        reject(err);
+      });
+      child.once('close', (code, signal) => {
+        exited = true;
+        resolve({ exitCode: code, signal: signal ?? null });
+      });
+    });
+
+    const killGroup = async (fromTimeout = false): Promise<void> => {
+      if (exited || killing) return;
+      killing = true;
+      if (!fromTimeout && !timedOut) aborted = true;
+      const pid = child.pid;
+      if (pid) {
+        try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
+        const forceTimer = setTimeout(() => {
+          if (!exited) {
+            try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+          }
+        }, graceMs);
+        forceTimer.unref();
+        await waitClose.catch(() => undefined);
+        clearTimeout(forceTimer);
+      }
+    };
+
+    this.active.set(execId, {
+      execId,
+      generation: params.binding.generation,
+      child,
+      killGroup: () => killGroup(false),
+    });
+
+    const timer = setTimeout(() => {
+      if (!exited) {
+        timedOut = true;
+        void killGroup(true);
+      }
+    }, timeoutMs);
+
+    try {
+      const outcome = await waitClose;
+      const stdout = stdoutCollector.finish();
+      const stderr = stderrCollector.finish();
+      const classification = classifyStderr(outcome.exitCode, stderr.text);
+
+      return {
+        exitCode: outcome.exitCode,
+        signal: outcome.signal,
+        timedOut,
+        aborted,
+        timeoutMs,
+        stdout,
+        stderr,
+        sandbox: {
+          mode: params.mode,
+          denied: classification.denied,
+          enforcement: bwrapBuild.enforcement,
+          runnerFailed: classification.runnerFailed,
+          denialMatches: classification.denialMatches,
+        },
+      };
+    } catch (err) {
+      failSandbox(
+        'SANDBOX_UNAVAILABLE',
+        `Failed to spawn bwrap sandbox: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      clearTimeout(timer);
+      this.active.delete(execId);
+      this.releasePlaceholders(acquiredPlaceholders);
+    }
+  }
+}
