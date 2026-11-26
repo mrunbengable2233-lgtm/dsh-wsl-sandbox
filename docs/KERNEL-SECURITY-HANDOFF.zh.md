@@ -156,6 +156,16 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 - **防 `hooksDenyBypass` 自动放行穿透**：当宿主安装了 `dsh-purge` 并开启权限补丁时，`ctx.approval.request()` 会在 `< 15ms` 内无人工交互直接合成返回放行。`ApprovalBridge` 检测到非人工瞬时合成放行且请求属于高危/越界/未知域名/物理硬件与驱动变更时，**自动将其拦截转入本插件独立人工审批队列 (`/wsl-sandbox/api/approvals`)**。
 - **物理硬件与 Windows 驱动硬编码降级锁**：凡触及以下任意对象或工具——`/dev/bus/usb/NNN/NNN`、`/dev/hidraw*`、`/dev/cdc-wdm*`、`/dev/video*`、`/dev/ttyUSB*`、`/dev/ttyACM*`，`usbipd bind|unbind|attach|detach`，手机 Bootloader/线刷工具（`fastboot` 非只读子命令、`adb reboot|sideload|install|push|root|remount|shell`、`odin`/`heimdall`/`qdl`/`edl`/`mtk`），Windows 驱动与网卡变更工具（`pnputil /add-driver|/delete-driver|/install|/enable-device|/disable-device`、`devcon`、`zadig`、`Enable/Disable/Set-NetAdapter*`、`Enable/Disable/Remove-PnpDevice`），以及串口/JTAG 烧录器（`esptool`/`openocd`/`avrdude`/`dfu-util`）——均强制锁死为人工单次审批（`allowSessionRuleOption = false`），绝不允许缓存会话前缀；同时放行只读查询（`usbipd list`、`Get-PnpDevice`、`Get-NetAdapter`、`pnputil /enum-drivers`、`adb devices`、`fastboot devices`）。
 
+### 4.5 共用 Node 运行时载体隔离与 SSD 友好型脱敏结构化日志
+代码位置：`packages/core/src/node-runtime.ts` & `packages/core/src/logger.ts`
+- **双侧共用 Node 运行时与跨界 `.exe` 阻断**：
+  - 宿主侧（`resolveSharedHostNodeRuntime`）与 `@deepseek-ai/dsh-subprocess-local` 保持一致：直接共用 DSH 进程自身 `process.execPath`（Electron 环境下注入 `ELECTRON_RUN_AS_NODE=1` 并剥离 `NODE_OPTIONS` / `TSX_*` 注入面），支持 `^22.19.0 || >=24.0.0`。
+  - WSL 2 侧（`WSL_SHARED_NODE_EXEC_SH` / `validateWslNodeExecutable`）在非登录 Shell 中主动清理 `PATH` 里的全部 `/mnt/*` 项，按固定安全优先级发现并复用 `~/.dsh/runtime/bin`、`mise`、`nvm`、`fnm`、`volta` 或 `/usr/bin` 下的原生 Linux ELF Node（`>=22` / 24 Active LTS），无条件拒绝 `/mnt/c/.../node.exe` 以防跨界回弹到 Windows 宿主执行。
+- **零常驻句柄、低写放大、自动脱敏的 NDJSON 日志引擎（`RotatingNdjsonSink` + `StructuredLogger`）**：
+  - **零 NTFS 文件夹锁 + 合并批量落盘**：不在空闲态持有打开的文件描述符；内存缓冲累积达 `2.5s` 或 `64 KiB` 时才执行单次 `openSync -> writeSync -> closeSync` 原子批量落盘，并在 `dispose()` / `process.once('exit')` 同步刷盘。
+  - **护盘限流与单边落盘**：内置 `3s` 重复风暴折叠与 `120 条/10s` 落盘速率上限，单文件 `5 MiB × 3` 滚动（权限 `0700`/`0600` + Windows `icacls /inheritance:r`）；WSL Runner 通过 `stderr` 内存管道回传结构化日志帧至宿主统一归档，默认不在 WSL `ext4.vhdx` 内重复写盘。
+  - **全内存 UI 查询与递归密钥脱敏**：启动时仅做尾部 `64 KiB` seek 预热，运行期 `/wsl-sandbox/api/logs` 查询 100% 由内存环形缓冲区响应（`0` 次磁盘读），并对 `API_KEY`、`TOKEN`、`SECRET`、`Authorization`、`Bearer`、`sk-...`、`ghp_...`、`AKIA...` 及 URL 内嵌口令执行深度递归脱敏。
+
 ---
 
 ## 5. 诚实的威胁模型与残余攻击面声明（供内核驱动专家重点评估）
@@ -184,6 +194,7 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 | 原生 `seccomp-bpf` 字节码 | `packages/core/src/seccomp-bpf.ts` | `OFF_ARCH` / `X32_SYSCALL_BIT` / `OFF_ARG0_HI` 边界校验；`io_uring_*` 与 `AF_VSOCK (40)` 拦截 |
 | 沙箱子进程、多会话隔离与零残留回收 | `packages/wsl-runner/src/proc-manager.ts`<br>`packages/wsl-runner/src/pty-manager.ts`<br>`packages/wsl-runner/src/main.ts` | `bpfFd` 继承后即关即删；`${sessionId}::${terminalId}` 隔离；`/proc/<pid>/stat` PGID 归属校验；子壳 UDS bridge 回收；`spillFd` 幂等关闭；`stdin end/close` + `3s` 硬退出看门狗 |
 | 多发行版 / WSL Manager 发现与零锁传输 | `packages/dsh-plugin/src/wsl-discovery.ts`<br>`packages/dsh-plugin/src/wsl-transport.ts`<br>`scripts/stage-wsl-runner.mjs` | UTF-16LE `wsl.exe -l -v` + 只读 `Lxss` 注册表合并（支持迁移 VHDX）；`isInsideLxssBasePath` 防护；`--cd ~` + 原生 ext4 tar 部署（零 Windows NTFS 锁）；`30s` 心跳 + `shutdown` RPC + `exit` 同步钩子 |
+| 共用 Node 运行时与护盘脱敏日志 | `packages/core/src/node-runtime.ts`<br>`packages/core/src/logger.ts` | `ELECTRON_RUN_AS_NODE=1` 与 `NODE_OPTIONS` 剥离；WSL `/mnt/*` `.exe` 拦截；`2.5s`/`64 KiB` 合并批量落盘（空闲 `0` FD）；`3s` 去重折叠 + `120/10s` 限速；递归密钥脱敏 |
 | 受控文件读写与防软链逃逸 | `packages/wsl-runner/src/fs-service.ts` | `canonicalizeWithinRoot` 祖先链 `realpath`；`atomicWriteNoFollow` 的 `O_NOFOLLOW | O_EXCL` |
 | UDS 代理与防 SSRF / 隧道零泄漏 | `packages/core/src/uds-proxy.ts` | `PRIVATE_IPV4_CIDRS`、`::ffff:` IPv4 映射地址与 `dns.lookup` 全记录核验；`activeSockets` 全追踪与 `stop()` 快速撕毁 |
 | 单壳纯净度、硬件与驱动守卫 | `packages/core/src/pwsh-guard.ts`<br>`packages/core/src/bash-ast-guard.ts` | UTF-16LE `-EncodedCommand` / 反引号 / `^` 反混淆；嵌套 `cmd` / `powershell.exe` / UNC 拦截；手机 `fastboot`/`adb` 与 Windows `pnputil`/`devcon`/`NetAdapter` 单次审批锁 |
@@ -194,11 +205,12 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 
 ## 7. 内核与沙箱实机一键复现实验指令
 
-审核人拿到仓库后，在任意安装有 `bubblewrap`、`socat`、Node 22+ 与 Python 3 的 Linux 或 WSL 2 环境中，可直接运行以下命令验证真实内核拦截、多会话隔离与零残留回收效果：
+审核人拿到仓库后，在任意安装有 `bubblewrap`、`socat`、Node `>=22.19`（或 Node 24 LTS）与 Python 3 的 Linux 或 WSL 2 环境中，可直接运行以下命令验证真实内核拦截、多会话隔离、护盘日志限流与零残留回收效果：
 
 ```bash
-# 1. 运行全量自动化测试套件（52 项测试：含真实 Linux 内核 bwrap + seccomp + 配置遮蔽 + 多会话隔离 + 零残留回收 + UDS 代理 + Top-27 插件兼容）
+# 1. 运行全量自动化测试套件（59 项测试：同时支持 `npm test`、`node test` 与裸 `node --test`）
 npm test
+node test
 
 # 2. 运行按档位分级的内核隔离、配置遮蔽、USB/驱动能力与 Codex 工具链实机探针
 node dist/packages/bootstrap/src/doctor.js --profile standard
@@ -210,4 +222,5 @@ npm run test:linux-sandbox
 # 4. 在 Windows + WSL 2 实机上运行端到端跨界验收脚本（自动探测已安装或 WSL Manager 迁移实例，零 /mnt 依赖）
 pwsh -File ./tests/windows-wsl-verify/verify-wsl2.ps1
 ```
+
 
