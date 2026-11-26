@@ -2,15 +2,16 @@
 .SYNOPSIS
   End-to-end real Windows + WSL 2 verification script for dsh-wsl-sandbox.
   Zero hardcoded distro/path assumptions: auto-discovers installed WSL 2 distros
-  (including WSL Manager imported/moved VHDX instances) and stages the runner into
+  (including WSL Manager imported/moved VHDX instances), reuses DSH's shared Node
+  carrier on Windows if standalone node.exe is absent, and stages the runner into
   native WSL ext4 so it works even with `[automount] enabled = false`.
 
   Verifies:
   1) WSL 2 distro state (non-root, WSL version 2, custom Lxss BasePath support)
-  2) dsh-wsl-doctor --strict-wsl2 --profile <profile> (real bwrap + seccomp io_uring/AF_VSOCK EPERM + escape-surface mask)
+  2) dsh-wsl-doctor --strict-wsl2 --profile <profile> via shared WSL Linux Node
   3) Persistent NDJSON RPC transport over `wsl.exe --cd ~` (`shell: false`) + clean shutdown (zero orphan runner PID)
-  4) Real WSL 2 kernel sandbox enforcement (EROFS outside workspace, ~/.dsh config masking, .env masking, --unshare-net)
-  5) Optional host USBIP (`usbipd`) detection
+  4) Real WSL 2 kernel sandbox enforcement via `scripts/run-tests.mjs --suite linux-sandbox`
+  5) Optional host USBIP (`usbipd`) & driver diagnostics
 
 .EXAMPLE
   .\tests\windows-wsl-verify\verify-wsl2.ps1
@@ -29,19 +30,72 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$DshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $HOME ".dsh" }
+
+function Resolve-SharedHostNode {
+  if ($env:DSH_NODE_PATH -and (Test-Path -LiteralPath $env:DSH_NODE_PATH)) {
+    return [pscustomobject]@{ Exe = $env:DSH_NODE_PATH; ElectronRunAsNode = $false; Label = "DSH_NODE_PATH" }
+  }
+  $pathNode = Get-Command node -ErrorAction SilentlyContinue
+  if ($pathNode -and $pathNode.Source) {
+    return [pscustomobject]@{ Exe = $pathNode.Source; ElectronRunAsNode = $false; Label = "PATH ($($pathNode.Source))" }
+  }
+  foreach ($c in @(
+    (Join-Path $DshHome "runtime\node.exe"),
+    (Join-Path $HOME ".local\share\mise\shims\node.exe"),
+    (Join-Path $HOME ".volta\bin\node.exe"),
+    (Join-Path $env:ProgramFiles "nodejs\node.exe")
+  )) {
+    if ($c -and (Test-Path -LiteralPath $c)) {
+      return [pscustomobject]@{ Exe = $c; ElectronRunAsNode = $false; Label = "Shared Node ($c)" }
+    }
+  }
+  foreach ($g in @(
+    (Join-Path $env:LOCALAPPDATA "Programs\dsh*\*.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\DeepSeek*\*.exe")
+  )) {
+    $foundExe = Get-Item -Path $g -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -notmatch 'unins|update|crash|elevate' } |
+      Select-Object -First 1
+    if ($foundExe) {
+      return [pscustomobject]@{ Exe = $foundExe.FullName; ElectronRunAsNode = $true; Label = "Shared DSH Desktop Carrier" }
+    }
+  }
+  throw "Could not find Node.js or DSH Desktop carrier on Windows host. Set DSH_NODE_PATH or install DSH/Node."
+}
+
+function Invoke-SharedHostNode {
+  param($Runtime, [string[]]$Arguments)
+  $prevElectron = $env:ELECTRON_RUN_AS_NODE
+  $prevNodeOpts = $env:NODE_OPTIONS
+  try {
+    $env:NODE_OPTIONS = $null
+    if ($Runtime.ElectronRunAsNode) { $env:ELECTRON_RUN_AS_NODE = "1" }
+    & $Runtime.Exe @Arguments
+  } finally {
+    $env:ELECTRON_RUN_AS_NODE = $prevElectron
+    $env:NODE_OPTIONS = $prevNodeOpts
+  }
+}
+
+$hostNode = Resolve-SharedHostNode
 
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host " dsh-wsl-sandbox — Real Windows + WSL 2 Verification Suite" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # Step 1: Build dist/ and auto-discover WSL 2 distro if omitted
-Write-Host "`n[1/5] Building TypeScript artifacts & discovering WSL 2 distributions..."
+Write-Host "`n[1/5] Building TypeScript artifacts & discovering WSL 2 distributions (Host Node: $($hostNode.Label))..."
 Push-Location $RepoRoot
 try {
-  & node scripts/build.mjs
+  Invoke-SharedHostNode -Runtime $hostNode -Arguments @("scripts/build.mjs")
   if (-not $Distro -or $Distro.Trim() -eq "") {
-    $discJson = & node --input-type=module -e "import { discoverWslDistros } from './dist/packages/dsh-plugin/src/wsl-discovery.js'; console.log(JSON.stringify(discoverWslDistros()));"
-    $disc = $discJson | ConvertFrom-Json
+    $discJson = Invoke-SharedHostNode -Runtime $hostNode -Arguments @(
+      "--input-type=module",
+      "-e",
+      "import { discoverWslDistros } from './dist/packages/dsh-plugin/src/wsl-discovery.js'; console.log(JSON.stringify(discoverWslDistros()));"
+    )
+    $disc = ($discJson -join "`n") | ConvertFrom-Json
     $wsl2 = @($disc.distros | Where-Object { -not $_.isInternalContainer -and $_.wslVersion -eq 2 })
     if ($wsl2.Count -eq 0) {
       throw "No usable WSL 2 distribution found. Install one (e.g. 'wsl.exe --install -d Ubuntu-26.04') or pass -Distro <name>."
@@ -55,16 +109,17 @@ try {
     }
   }
 
-  $stagedJson = & node scripts/stage-wsl-runner.mjs --distro $Distro --json
-  $staged = $stagedJson | ConvertFrom-Json
+  $stagedJson = Invoke-SharedHostNode -Runtime $hostNode -Arguments @("scripts/stage-wsl-runner.mjs", "--distro", $Distro, "--json")
+  $staged = ($stagedJson -join "`n") | ConvertFrom-Json
 } finally {
   Pop-Location
 }
 Write-Host "Staged native ext4 runner: $($staged.runnerPath) (zero /mnt dependency)"
 
-# Step 2: Run dsh-wsl-doctor inside real WSL 2 kernel
+# Step 2: Run dsh-wsl-doctor inside real WSL 2 kernel via shared Linux Node resolver
 Write-Host "`n[2/5] Running dsh-wsl-doctor --strict-wsl2 inside '$Distro'..."
-$doctorArgs = @("-d", $Distro, "--cd", "~", "--", "node", $staged.doctorPath, "--strict-wsl2")
+$wslNodeBootstrap = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; exec node "$@"'
+$doctorArgs = @("-d", $Distro, "--cd", "~", "--", "sh", "-c", $wslNodeBootstrap, "dsh-wsl-doctor", $staged.doctorPath, "--strict-wsl2")
 if ($Profile) {
   $doctorArgs += @("--profile", $Profile)
 }
@@ -86,13 +141,13 @@ const t = new WslTransport({
   runnerPath: process.argv[2],
 });
 const res = await t.call('ping');
-console.log('[OK] Windows->WSL2 RPC ping:', JSON.stringify(res));
+console.log('[OK] Windows->WSL2 RPC ping (shared WSL Node ' + res.nodeVersion + ' at ' + res.nodeExecPath + '):', JSON.stringify(res));
 await t.dispose();
 console.log('[OK] WslTransport disposed cleanly (child terminated, zero lease leak).');
 "@
 Push-Location $RepoRoot
 try {
-  & node --input-type=module -e $pingScript $Distro $staged.runnerPath
+  Invoke-SharedHostNode -Runtime $hostNode -Arguments @("--input-type=module", "-e", $pingScript, $Distro, $staged.runnerPath)
 } finally {
   Pop-Location
 }
@@ -103,8 +158,9 @@ $linuxRepo = ""
 try {
   $linuxRepo = (& wsl.exe -d $Distro --cd ~ -- wslpath -a ($RepoRoot.Replace('\', '/')) 2>$null).Trim()
 } catch { }
-if ($linuxRepo -and (& wsl.exe -d $Distro --cd ~ -- test -f "$linuxRepo/tests/linux-sandbox/real-kernel-sandbox.test.ts"; $LASTEXITCODE -eq 0)) {
-  & wsl.exe -d $Distro --cd ~ -- bash -lc "cd '$linuxRepo' && node --test tests/linux-sandbox/real-kernel-sandbox.test.ts"
+if ($linuxRepo -and (& wsl.exe -d $Distro --cd ~ -- test -f "$linuxRepo/scripts/run-tests.mjs"; $LASTEXITCODE -eq 0)) {
+  $runTestSh = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; cd "$1" && exec node scripts/run-tests.mjs --suite linux-sandbox'
+  & wsl.exe -d $Distro --cd ~ -- sh -c $runTestSh dsh-test $linuxRepo
   if ($LASTEXITCODE -ne 0) {
     throw "Real kernel sandbox test suite failed inside WSL 2!"
   }

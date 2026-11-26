@@ -291,9 +291,9 @@ if (-not $Profile -or $Profile.Trim() -eq "") {
     $Profile = "standard"
   } else {
     Write-Host "`nChoose Codex-aligned WSL 2 toolchain profile (binary-only, zero Docker, zero kernel build):" -ForegroundColor Cyan
-    Write-Host "  1) core      (~350MB, ~2 min) : sandbox base (bwrap/socat/prlimit) + Codex CLI + C/C++ base + python3 + Node 22"
+    Write-Host "  1) core      (~350MB, ~2 min) : sandbox base (bwrap/socat/prlimit) + Codex CLI + C/C++ base + python3 + shared Node / Node 24 LTS"
     Write-Host "  2) standard  (~1.2GB, default): core + ccache/proto + mise + uv + pytest/ruff/mypy/pyright/black + pnpm/yarn/bun/ts/eslint/prettier + Go + golangci-lint + Rust minimal"
-    Write-Host "  3) universal (~3.5GB)         : standard + clang/bazelisk + mise Node 20/22/24 + poetry/isort + OpenJDK 21/maven/gradle/ruby/php"
+    Write-Host "  3) universal (~3.5GB)         : standard + clang/bazelisk + mise Node 22 & 24 LTS + poetry/isort + OpenJDK 21/maven/gradle/ruby/php"
     $pAns = Read-Host "Select profile [1=core, 2=standard, 3=universal] (Enter = 2 standard)"
     $Profile = switch ($pAns.Trim()) {
       "1" { "core" }
@@ -305,7 +305,77 @@ if (-not $Profile -or $Profile.Trim() -eq "") {
   }
 }
 
-Write-Host "`n=== dsh-wsl-sandbox Windows Installer (Multi-Distro + WSL Manager Safe + Zero NTFS Lock) ===" -ForegroundColor Cyan
+function Resolve-SharedHostNode {
+  # 1. Explicit override
+  if ($env:DSH_NODE_PATH -and (Test-Path -LiteralPath $env:DSH_NODE_PATH)) {
+    return [pscustomobject]@{ Exe = $env:DSH_NODE_PATH; ElectronRunAsNode = $false; Label = "DSH_NODE_PATH ($($env:DSH_NODE_PATH))" }
+  }
+  # 2. System / PATH node.exe
+  $pathNode = Get-Command node -ErrorAction SilentlyContinue
+  if ($pathNode -and $pathNode.Source) {
+    return [pscustomobject]@{ Exe = $pathNode.Source; ElectronRunAsNode = $false; Label = "PATH ($($pathNode.Source))" }
+  }
+  # 3. Shared DSH runtime or common Windows Node version managers (mise, volta, fnm, nvm)
+  $candidates = @(
+    (Join-Path $DshHome "runtime\node.exe"),
+    (Join-Path $HOME ".local\share\mise\shims\node.exe"),
+    (Join-Path $HOME ".volta\bin\node.exe"),
+    (Join-Path $env:ProgramFiles "nodejs\node.exe")
+  )
+  if ($env:APPDATA) {
+    $candidates += (Join-Path $env:APPDATA "nvm\current\node.exe")
+  }
+  foreach ($c in $candidates) {
+    if ($c -and (Test-Path -LiteralPath $c)) {
+      return [pscustomobject]@{ Exe = $c; ElectronRunAsNode = $false; Label = "Shared Node ($c)" }
+    }
+  }
+  # 4. Reuse DSH Desktop Electron carrier via ELECTRON_RUN_AS_NODE=1 (zero standalone Node install required!)
+  $electronGlobs = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\dsh*\*.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\DeepSeek*\*.exe"),
+    (Join-Path $env:ProgramFiles "DeepSeek*\*.exe")
+  )
+  foreach ($g in $electronGlobs) {
+    $foundExe = Get-Item -Path $g -ErrorAction SilentlyContinue |
+      Where-Object { $_.Name -notmatch 'unins|update|crash|elevate' } |
+      Select-Object -First 1
+    if ($foundExe) {
+      return [pscustomobject]@{ Exe = $foundExe.FullName; ElectronRunAsNode = $true; Label = "Shared DSH Desktop Carrier ($($foundExe.FullName), ELECTRON_RUN_AS_NODE=1)" }
+    }
+  }
+  return $null
+}
+
+function Invoke-SharedHostNode {
+  param(
+    [Parameter(Mandatory = $true)]$Runtime,
+    [Parameter(Mandatory = $true)][string[]]$Arguments
+  )
+  $prevElectron = $env:ELECTRON_RUN_AS_NODE
+  $prevNodeOpts = $env:NODE_OPTIONS
+  try {
+    $env:NODE_OPTIONS = $null
+    if ($Runtime.ElectronRunAsNode) {
+      $env:ELECTRON_RUN_AS_NODE = "1"
+    }
+    & $Runtime.Exe @Arguments
+  } finally {
+    $env:ELECTRON_RUN_AS_NODE = $prevElectron
+    $env:NODE_OPTIONS = $prevNodeOpts
+  }
+}
+
+$logDir = Join-Path $cfgDir "logs"
+New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+Set-PrivateOwnerAcl -TargetPath $logDir -IsDirectory
+$installLogLines = New-Object System.Collections.Generic.List[string]
+function Add-InstallLog([string]$msg) {
+  $installLogLines.Add(("{0} {1}" -f (Get-Date -Format "yyyy-MM-ddTHH:mm:ssK"), $msg))
+}
+Add-InstallLog "Starting install-dsh-plugin.ps1 (distro=$Distro, profile=$Profile, mirror=$Mirror)"
+
+Write-Host "`n=== dsh-wsl-sandbox Windows Installer (Shared Node + Multi-Distro + Zero NTFS Lock) ===" -ForegroundColor Cyan
 Write-Host "Plugin repo  : $PluginRepoPath"
 Write-Host "DSH_HOME     : $DshHome"
 Write-Host "Backup dir   : $backupDir (owner-only ACL, read-only snapshots)"
@@ -376,24 +446,109 @@ if (-not $WorkspaceRoot -or $WorkspaceRoot.Trim() -eq "") {
   $WorkspaceRoot = "$linuxHome/workspace"
 }
 Write-Host "[1/5] Probed WSL user: $linuxUser (uid=$linuxUid, home=$linuxHome) -> workspaceRoot=$WorkspaceRoot" -ForegroundColor Green
+Add-InstallLog "Probed WSL user=$linuxUser uid=$linuxUid home=$linuxHome workspace=$WorkspaceRoot"
 
 # Ensure native ext4 workspace directory exists without touching /mnt
 & wsl.exe -d $Distro --cd ~ -- sh -c 'mkdir -p "$1"' -- $WorkspaceRoot | Out-Null
 
-# 2. Verify Node 22+, build dist/, and stage runner + provision-wsl.sh into native WSL ext4
-$nodeVersion = & node -v
-Write-Host "[2/5] Host Node.js: $nodeVersion — building dist/ & staging into native WSL ext4..."
-Push-Location $PluginRepoPath
-try {
-  & node scripts/build.mjs
-  $stagedJson = & node scripts/stage-wsl-runner.mjs --distro $Distro --json
-  $staged = $stagedJson | ConvertFrom-Json
-} finally {
-  Pop-Location
+# 2. Resolve shared Host Node (or prebuilt tar fallback), build dist/ if needed, and stage into native WSL ext4
+$hostNode = Resolve-SharedHostNode
+$prebuiltMain = Join-Path $PluginRepoPath "dist\packages\wsl-runner\src\main.js"
+if ($hostNode) {
+  $nodeVer = (Invoke-SharedHostNode -Runtime $hostNode -Arguments @("-v") | Select-Object -Last 1).Trim()
+  Write-Host "[2/5] Using Host Node runtime: $nodeVer via $($hostNode.Label)"
+  Add-InstallLog "Host Node=$nodeVer via $($hostNode.Label)"
+  Push-Location $PluginRepoPath
+  try {
+    Invoke-SharedHostNode -Runtime $hostNode -Arguments @("scripts/build.mjs")
+    $stagedJson = Invoke-SharedHostNode -Runtime $hostNode -Arguments @("scripts/stage-wsl-runner.mjs", "--distro", $Distro, "--json")
+    $staged = ($stagedJson -join "`n") | ConvertFrom-Json
+  } finally {
+    Pop-Location
+  }
+} elseif (Test-Path -LiteralPath $prebuiltMain) {
+  Write-Host "[2/5] No standalone Windows node.exe needed — staging prebuilt dist/ directly into WSL native ext4..." -ForegroundColor Cyan
+  $tmpTar = Join-Path ([System.IO.Path]::GetTempPath()) ("dsh-wsl-stage-{0}.tar" -f $PID)
+  try {
+    & tar.exe -cf $tmpTar -C $PluginRepoPath dist package.json packages/bootstrap/provision-wsl.sh
+    if ($LASTEXITCODE -ne 0) { throw "tar.exe failed creating staging archive" }
+    $tarBytes = [System.IO.File]::ReadAllBytes($tmpTar)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "wsl.exe"
+    $psi.Arguments = "-d `"$Distro`" --cd ~ -- sh -c `"umask 077 && TARGET=`\`"`$HOME/.local/share/dsh-wsl-sandbox/runner`\`" && rm -rf `\`"`$TARGET`\`" && mkdir -p `\`"`$TARGET`\`" && chmod 700 `\`"`$HOME/.local/share/dsh-wsl-sandbox`\`" `\`"`$TARGET`\`" && tar -xf - -C `\`"`$TARGET`\`" && sed -i 's/\r$//' `\`"`$TARGET/packages/bootstrap/provision-wsl.sh`\`" && chmod 700 `\`"`$TARGET/packages/bootstrap/provision-wsl.sh`\`"`""
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $p.StandardInput.BaseStream.Write($tarBytes, 0, $tarBytes.Length)
+    $p.StandardInput.Close()
+    $p.WaitForExit()
+    if ($p.ExitCode -ne 0) { throw "WSL staging tar extraction failed with exit $($p.ExitCode)" }
+    $stagedRoot = "$linuxHome/.local/share/dsh-wsl-sandbox/runner"
+    $staged = [pscustomobject]@{
+      fileCount = "prebuilt"
+      stagedRoot = $stagedRoot
+      runnerPath = "$stagedRoot/dist/packages/wsl-runner/src/main.js"
+      doctorPath = "$stagedRoot/dist/packages/bootstrap/src/doctor.js"
+      provisionScriptPath = "$stagedRoot/packages/bootstrap/provision-wsl.sh"
+    }
+  } finally {
+    if (Test-Path -LiteralPath $tmpTar) { Remove-Item -Force -LiteralPath $tmpTar -ErrorAction SilentlyContinue }
+  }
+} else {
+  throw "Neither Windows/DSH Node runtime nor prebuilt dist/ was found under $PluginRepoPath."
 }
 Write-Host "      Staged $($staged.fileCount) files into native ext4: $($staged.runnerPath) (zero /mnt lock!)" -ForegroundColor Green
+Add-InstallLog "Staged runnerPath=$($staged.runnerPath)"
 
-# 3. Write or update human-only config.json under $DSH_HOME\dsh-wsl-sandbox\config.json (owner-only ACL)
+# 3. Probe WSL sandbox & shared Linux Node readiness BEFORE enabling config.json (correct startup sequence!)
+$wslReadinessCheck = @'
+[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true
+CLEAN_PATH=""
+OLD_IFS="$IFS"; IFS=":"
+for p in $PATH; do
+  case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac
+done
+IFS="$OLD_IFS"
+export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"
+MISS=""
+for bin in bwrap prlimit socat node; do
+  command -v "$bin" >/dev/null 2>&1 || MISS="${MISS:+$MISS,}$bin"
+done
+printf "%s\n" "${MISS:-READY}"
+'@
+$missingBins = (& wsl.exe -d $Distro --cd ~ -- sh -c $wslReadinessCheck 2>$null | Select-Object -Last 1).Trim()
+
+$doProvision = [bool]$Provision
+if (-not $doProvision -and -not $NonInteractive) {
+  if ($missingBins -ne "READY") {
+    Write-Host "      Detected missing WSL sandbox/runtime binaries ($missingBins) in '$Distro'." -ForegroundColor Yellow
+    $runProv = Read-Host "Provision '$Distro' now with --profile $Profile --mirror $Mirror (shares existing Node or installs Node 24 LTS)? [Y/n]"
+    if (-not $runProv.Trim() -or $runProv.Trim() -imatch '^(y|yes)$') { $doProvision = $true }
+  } else {
+    $runProv = Read-Host "Sandbox primitives & shared Node already ready in '$Distro'. Re-run provision-wsl.sh (--profile $Profile --mirror $Mirror) anyway? [y/N]"
+    if ($runProv.Trim() -imatch '^(y|yes)$') { $doProvision = $true }
+  }
+}
+
+$wslDoctorExecSh = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; exec node "$1" --strict-wsl2 --profile "$2"'
+
+if ($doProvision) {
+  Write-Host "[3/5] Provisioning '$Distro' with profile='$Profile', mirror='$Mirror'..." -ForegroundColor Cyan
+  $provArgs = @("-d", $Distro, "--cd", "~", "--", "bash", $staged.provisionScriptPath, "--profile", $Profile, "--mirror", $Mirror)
+  if ($Proxy) { $provArgs += @("--proxy", $Proxy) }
+  & wsl.exe @provArgs
+  if ($LASTEXITCODE -ne 0) {
+    Add-InstallLog "ERROR: provision-wsl.sh exited with $LASTEXITCODE"
+    throw "provision-wsl.sh exited with code $LASTEXITCODE inside '$Distro'"
+  }
+  $missingBins = "READY"
+  Add-InstallLog "Provisioning completed for profile=$Profile"
+} else {
+  Write-Host "[3/5] Provisioning skipped (readiness=$missingBins). Run anytime without /mnt dependency:" -ForegroundColor Yellow
+  Write-Host "      wsl.exe -d $Distro --cd ~ -- bash `"$($staged.provisionScriptPath)`" --profile $Profile --mirror $Mirror"
+}
+
+# 4. Write or update human-only config.json under $DSH_HOME\dsh-wsl-sandbox\config.json (owner-only ACL) AFTER provisioning check
 $cfgPath = Join-Path $cfgDir "config.json"
 if (-not (Test-Path -LiteralPath $cfgPath)) {
   $cfg = [ordered]@{
@@ -404,6 +559,7 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
     username = $linuxUser
     workspaceRoot = $WorkspaceRoot
     runnerPath = $staged.runnerPath
+    wslNodePath = "auto"
     environmentProfile = $Profile
     sandboxMode = "workspace-write"
     approvalPolicyMode = "balanced"
@@ -411,6 +567,7 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
     upstreamProxy = $Proxy
     mirrorCn = ($Mirror -eq "cn")
     cacheMode = "workspace-persistent"
+    logLevel = "info"
     approvalTimeoutMs = 60000
     enablePwshGuard = $true
     enablePromptInjection = $true
@@ -426,7 +583,8 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
   }
   $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cfgPath -Encoding UTF8
   Set-PrivateOwnerAcl -TargetPath $cfgPath
-  Write-Host "[3/5] Created owner-only config: $cfgPath (profile=$Profile)" -ForegroundColor Green
+  Write-Host "[4/5] Created owner-only config: $cfgPath (profile=$Profile, wslNodePath=auto, logLevel=info)" -ForegroundColor Green
+  Add-InstallLog "Created config.json at $cfgPath"
 } else {
   if ($UpdateConfig -or $Provision) {
     $existing = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -434,60 +592,58 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
     $existing | Add-Member -NotePropertyName username -NotePropertyValue $linuxUser -Force
     $existing | Add-Member -NotePropertyName workspaceRoot -NotePropertyValue $WorkspaceRoot -Force
     $existing | Add-Member -NotePropertyName runnerPath -NotePropertyValue $staged.runnerPath -Force
+    $existing | Add-Member -NotePropertyName wslNodePath -NotePropertyValue "auto" -Force
     $existing | Add-Member -NotePropertyName environmentProfile -NotePropertyValue $Profile -Force
     $existing | Add-Member -NotePropertyName mirrorCn -NotePropertyValue ($Mirror -eq "cn") -Force
+    if (-not $existing.PSObject.Properties["logLevel"]) {
+      $existing | Add-Member -NotePropertyName logLevel -NotePropertyValue "info" -Force
+    }
     if ($Proxy) { $existing | Add-Member -NotePropertyName upstreamProxy -NotePropertyValue $Proxy -Force }
     $existing | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cfgPath -Encoding UTF8
     Set-PrivateOwnerAcl -TargetPath $cfgPath
-    Write-Host "[3/5] Updated existing config with distro=$Distro, profile=$Profile, native ext4 runnerPath." -ForegroundColor Green
+    Write-Host "[4/5] Updated existing config with distro=$Distro, profile=$Profile, native ext4 runnerPath." -ForegroundColor Green
+    Add-InstallLog "Updated config.json at $cfgPath"
   } else {
-    Write-Host "[3/5] Existing config preserved: $cfgPath (pass -UpdateConfig to overwrite distro/profile/runnerPath)" -ForegroundColor Yellow
+    Write-Host "[4/5] Existing config preserved: $cfgPath (pass -UpdateConfig to overwrite distro/profile/runnerPath)" -ForegroundColor Yellow
   }
 }
 
-# 4. Provision WSL 2 toolchain inside chosen distro with selected profile (when -Provision is set or confirmed)
-$doProvision = [bool]$Provision
-if (-not $doProvision -and -not $NonInteractive) {
-  $runProv = Read-Host "Run provision-wsl.sh inside '$Distro' now with --profile $Profile --mirror $Mirror? [y/N]"
-  if ($runProv -match '^(y|yes)$') { $doProvision = $true }
+# 5. Run dsh-wsl-doctor when ready + DSH CLI / Desktop registration hint & optional AGENTS.md upsert
+if ($missingBins -eq "READY") {
+  Write-Host "[5/5] Running dsh-wsl-doctor --profile $Profile inside '$Distro'..." -ForegroundColor Cyan
+  & wsl.exe -d $Distro --cd ~ -- sh -c $wslDoctorExecSh dsh-doctor $staged.doctorPath $Profile
 }
 
-if ($doProvision) {
-  Write-Host "[4/5] Provisioning '$Distro' with profile='$Profile', mirror='$Mirror'..." -ForegroundColor Cyan
-  $provArgs = @("-d", $Distro, "--cd", "~", "--", "bash", $staged.provisionScriptPath, "--profile", $Profile, "--mirror", $Mirror)
-  if ($Proxy) { $provArgs += @("--proxy", $Proxy) }
-  & wsl.exe @provArgs
-  if ($LASTEXITCODE -ne 0) {
-    throw "provision-wsl.sh exited with code $LASTEXITCODE inside '$Distro'"
-  }
-  Write-Host "      Running dsh-wsl-doctor --profile $Profile inside '$Distro'..." -ForegroundColor Cyan
-  & wsl.exe -d $Distro --cd ~ -- bash -lc "node '$($staged.doctorPath)' --strict-wsl2 --profile '$Profile'"
-} else {
-  Write-Host "[4/5] Provisioning skipped for now. Run anytime without /mnt dependency:" -ForegroundColor Yellow
-  Write-Host "      wsl.exe -d $Distro --cd ~ -- bash `"$($staged.provisionScriptPath)`" --profile $Profile --mirror $Mirror"
-}
-
-# 5. DSH CLI / Desktop registration hint & optional AGENTS.md upsert
 $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
 if ($dshCmd) {
-  Write-Host "[5/5] Detected DSH CLI. Register plugin cleanly:" -ForegroundColor Cyan
+  Write-Host "      Detected DSH CLI (plugin shares DSH's Node runtime in-process). Register plugin:" -ForegroundColor Cyan
   Write-Host "      CLI/Web : dsh plugin --profile web add `"$PluginRepoPath`""
   Write-Host "      Desktop : dsh plugin --profile desktop add `"$PluginRepoPath`""
 } else {
-  Write-Host "[5/5] 'dsh' CLI not on PATH (Desktop-only install?)." -ForegroundColor Yellow
-  Write-Host "      Import '$PluginRepoPath' (or dsh-wsl-sandbox-0.1.0.tgz) in DSH Desktop Plugin Settings."
+  Write-Host "      'dsh' CLI not on PATH (Desktop-only install?)." -ForegroundColor Yellow
+  Write-Host "      Import '$PluginRepoPath' (or dsh-wsl-sandbox-0.2.0.tgz) in DSH Desktop Plugin Settings."
 }
 
-if ($UpsertAgentsMd) {
+if ($UpsertAgentsMd -and $hostNode) {
   Write-Host "      Upserting WSL-first routing block into $ProjectAgentsMdDir\AGENTS.md ..."
   $js = "import { upsertAgentsMdWslSection } from './dist/packages/dsh-plugin/src/prompt-injector.js'; console.log(JSON.stringify(upsertAgentsMdWslSection(process.argv[1], { distro: process.argv[2], workspaceRoot: process.argv[3] })));"
   Push-Location $PluginRepoPath
   try {
-    & node --input-type=module -e $js $ProjectAgentsMdDir $Distro $WorkspaceRoot
+    Invoke-SharedHostNode -Runtime $hostNode -Arguments @("--input-type=module", "-e", $js, $ProjectAgentsMdDir, $Distro, $WorkspaceRoot)
   } finally {
     Pop-Location
   }
 }
+
+# Single-write bounded install log (keeps max 5 setup logs, zero ongoing disk churn)
+$installLogFile = Join-Path $logDir "install-$ts.log"
+Add-InstallLog "Installer completed successfully."
+Set-Content -LiteralPath $installLogFile -Value ($installLogLines -join "`r`n") -Encoding UTF8
+Set-PrivateOwnerAcl -TargetPath $installLogFile
+Get-ChildItem -LiteralPath $logDir -Filter "install-*.log" -ErrorAction SilentlyContinue |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -Skip 5 |
+  Remove-Item -Force -ErrorAction SilentlyContinue
 
 Write-Host "`nDone! Original WSL configs backed up (read-only) under: $backupDir" -ForegroundColor Green
 Write-Host "Verify anytime: .\tests\windows-wsl-verify\verify-wsl2.ps1 -Distro $Distro -Profile $Profile"

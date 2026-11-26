@@ -23,6 +23,7 @@ import {
   validateShareEntry,
   validateWorkspaceRoot,
 } from '../../packages/core/src/index.ts';
+import { UDS_SKIP_REASON } from '../test-env.ts';
 
 function makeBinding(overrides?: Partial<SessionBinding>): SessionBinding {
   return {
@@ -442,7 +443,7 @@ describe('core/uds-proxy — SSRF defense, localLabPorts & upstream HTTP proxy c
     assert.equal(isPrivateOrLoopbackIp('140.82.114.4'), false);
   });
 
-  it('allows explicit localLabPorts, blocks unlisted localhost ports & metadata IPs, and chains upstream HTTP proxy', async () => {
+  it('allows explicit localLabPorts, blocks unlisted localhost ports & metadata IPs, and chains upstream HTTP proxy', { skip: UDS_SKIP_REASON }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-proxy-unit-'));
     const sockPath = path.join(tmpDir, 'proxy.sock');
 
@@ -514,7 +515,7 @@ describe('core/uds-proxy — SSRF defense, localLabPorts & upstream HTTP proxy c
     }
   });
 
-  it('tears down live CONNECT tunnels promptly on stop() with zero leaked sockets or leftover socket file', async () => {
+  it('tears down live CONNECT tunnels promptly on stop() with zero leaked sockets or leftover socket file', { skip: UDS_SKIP_REASON }, async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-proxy-leak-'));
     const sockPath = path.join(tmpDir, 'proxy.sock');
     const tcpTarget = net.createServer((sock) => {

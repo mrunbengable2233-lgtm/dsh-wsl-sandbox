@@ -27,20 +27,23 @@ DRY_RUN="false"
 ACTION="provision"
 CUSTOM_BACKUP_DIR=""
 OPEN_BACKUP_EXPLORER="false"
+UPGRADE_NODE="false"
 
 usage() {
   cat <<'EOF'
 Usage: provision-wsl.sh [options]
   --profile core|standard|universal   Toolchain profile (default: standard)
-                                        core      (~350MB): sandbox base + Codex CLI + C/C++ base + system python3 + Node 22
+                                        core      (~350MB): sandbox base + Codex CLI + C/C++ base + system python3
+                                                            + shared Node (>=22) or Node 24 LTS
                                         standard  (~1.2GB): core + ccache/proto + mise + uv + pytest/ruff/mypy/pyright/black
                                                             + pnpm/yarn/bun/ts/eslint/prettier + Go + golangci-lint + Rust minimal
-                                        universal (~3.5GB): standard + clang/bazelisk + mise Node 20/22/24 + poetry/isort
+                                        universal (~3.5GB): standard + clang/bazelisk + mise Node 22 & 24 LTS + poetry/isort
                                                             + OpenJDK 21 + maven + gradle + ruby + php-cli + composer
   --mirror  global|cn                 Use global upstream or China mirrors (default: global)
   --proxy   <url>                     Optional HTTP/SOCKS5 upstream proxy (e.g. http://127.0.0.1:7890)
   --step    all|base|cli|node|python|go|rust|go-rust|extra
                                       Run one idempotent step or all steps (default: all)
+  --upgrade-node                      Upgrade existing Node 22.x in WSL to Node 24 Active LTS (default reuses >=22)
   --backup-configs                    Snapshot original /etc/wsl.conf, /etc/fstab & mounts (read-only 0400)
   --backup-dir <path>                 Custom backup directory (Linux path or Windows path like D:\Backups\WSL)
   --open-backup-dir                   Open the backup directory in native Windows Explorer
@@ -58,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --mirror)  MIRROR="${2:?Missing value for --mirror}"; shift 2 ;;
     --proxy)   PROXY="${2:?Missing value for --proxy}"; shift 2 ;;
     --step)    STEP="${2:?Missing value for --step}"; shift 2 ;;
+    --upgrade-node)      UPGRADE_NODE="true"; shift ;;
     --backup-configs)    ACTION="backup"; shift ;;
     --backup-dir)        CUSTOM_BACKUP_DIR="${2:?Missing value for --backup-dir}"; shift 2 ;;
     --open-backup-dir)   OPEN_BACKUP_EXPLORER="true"; shift ;;
@@ -415,7 +419,7 @@ EOF
 # Managed by dsh-wsl-sandbox provision-wsl.sh (profile=${PROFILE}, mirror=${MIRROR})
 export DSH_WSL_PROFILE="${PROFILE}"
 export DSH_WSL_MIRROR="${MIRROR}"
-export PATH="\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.cargo/bin:\$HOME/.bun/bin:/usr/local/go/bin:\$PATH"
+export PATH="\$HOME/.dsh/runtime/bin:\$HOME/.local/share/dsh/node/bin:\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.nvm/current/bin:\$HOME/.volta/bin:\$HOME/.cargo/bin:\$HOME/.bun/bin:/usr/local/go/bin:\$PATH"
 EOF
 
   if [[ "$MIRROR" == "cn" ]]; then
@@ -438,6 +442,10 @@ EOF
       printf '\n[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh"\n' >> "$rc"
     fi
   done
+  # If ~/.bash_profile already exists, bash -lc reads it instead of ~/.profile — hook it WITHOUT creating it if absent!
+  if [[ -f "$HOME/.bash_profile" ]] && ! grep -Fq '.dsh-wsl-env.sh' "$HOME/.bash_profile"; then
+    printf '\n[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh"\n' >> "$HOME/.bash_profile"
+  fi
 
   # shellcheck disable=SC1090
   . "$env_file"
@@ -476,6 +484,64 @@ configure_pkg_cn_mirror() {
   fi
 }
 
+# Ensures curl, ca-certificates, tar, unzip, xz exist even when a single step (--step node/python/go/rust) runs standalone!
+ensure_step_prereqs() {
+  if [[ "$DRY_RUN" == "true" ]]; then return 0; fi
+  local missing="false"
+  for bin in curl tar unzip xz; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+      missing="true"
+      break
+    fi
+  done
+  if [[ "$missing" == "true" ]]; then
+    pkg_update
+    case "$PKG_MGR" in
+      apt)    pkg_install ca-certificates curl tar unzip xz-utils gnupg ;;
+      dnf)    pkg_install ca-certificates curl tar unzip xz gnupg2 ;;
+      pacman) pkg_install ca-certificates curl tar unzip xz gnupg ;;
+      zypper) pkg_install ca-certificates curl tar unzip xz gpg2 ;;
+      apk)    pkg_install ca-certificates curl tar unzip xz gnupg ;;
+    esac
+  fi
+}
+
+# Discovers any Linux Node.js (>=22) already installed by DSH remote/headless, peer plugins, mise, nvm, fnm, volta, or OS
+find_shared_wsl_node() {
+  local cand
+  local search_dirs=(
+    "$HOME/.dsh/runtime/bin"
+    "$HOME/.local/share/dsh/node/bin"
+    "$HOME/.local/share/mise/shims"
+    "$HOME/.local/bin"
+    "$HOME/.nvm/current/bin"
+    "$HOME/.local/share/fnm/aliases/default/bin"
+    "$HOME/.volta/bin"
+    "/opt/dsh-toolchain/shims"
+    "/opt/dsh-toolchain/bin"
+    "/usr/local/bin"
+    "/usr/bin"
+    "/bin"
+  )
+  for d in "$HOME"/.nvm/versions/node/v*/bin; do
+    [[ -d "$d" ]] && search_dirs+=("$d")
+  done
+  for dir in "${search_dirs[@]}"; do
+    [[ "$dir" == /mnt/* ]] && continue
+    cand="$dir/node"
+    if [[ -x "$cand" && ! -d "$cand" ]]; then
+      local ver major
+      ver="$("$cand" -v 2>/dev/null || true)"
+      major="$(echo "$ver" | sed -E 's/^v([0-9]+).*/\1/')"
+      if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 22 ]]; then
+        printf '%s\t%s\t%s\n' "$cand" "$ver" "$major"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 step_base() {
   echo "=== [step:base][profile=${PROFILE}] Installing mandatory sandbox primitives (bwrap, prlimit, socat) on ${DISTRO_PRETTY} (${PKG_MGR}) ==="
   persist_profile_and_env
@@ -483,19 +549,19 @@ step_base() {
   pkg_update
   case "$PKG_MGR" in
     apt)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar
+      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar unzip xz-utils
       ;;
     dnf)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg2 tar
+      pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg2 tar unzip xz
       ;;
     pacman)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg tar
+      pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg tar unzip xz
       ;;
     zypper)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gpg2 tar
+      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gpg2 tar unzip xz
       ;;
     apk)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar
+      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar unzip xz
       ;;
   esac
 }
@@ -593,38 +659,46 @@ step_cli() {
 }
 
 step_node() {
-  echo "=== [step:node][profile=${PROFILE}] Installing prebuilt Node.js toolchain ==="
+  echo "=== [step:node][profile=${PROFILE}] Resolving shared Node.js runtime / Node 24 Active LTS ==="
   persist_profile_and_env
+  ensure_step_prereqs
 
-  # Core + all profiles: Node.js 22 LTS prebuilt binary
+  # Reuse existing compatible Linux Node (>=22, or >=24 when --upgrade-node) shared with DSH / mise / nvm / distro!
   local need_node="true"
-  if command -v node >/dev/null 2>&1; then
-    local major
-    major="$(node -v | sed -E 's/^v([0-9]+).*/\1/')"
-    if [[ "$major" -ge 22 ]]; then
-      echo "[step:node] Node $(node -v) already >= 22, skipping base Node 22 install."
+  local shared_info=""
+  if shared_info="$(find_shared_wsl_node)"; then
+    local shared_path shared_ver shared_major
+    IFS=$'\t' read -r shared_path shared_ver shared_major <<< "$shared_info"
+    if [[ "$UPGRADE_NODE" == "true" && "$shared_major" -lt 24 ]]; then
+      echo "[step:node] Found Node ${shared_ver} at ${shared_path}; upgrading to Node 24 Active LTS (--upgrade-node)..."
+    else
+      echo "[step:node] Sharing existing Linux Node ${shared_ver} at ${shared_path} (zero duplicate Node install!)."
       need_node="false"
+      if [[ "$DRY_RUN" != "true" ]] && ! command -v node >/dev/null 2>&1; then
+        mkdir -p "$HOME/.local/bin"
+        ln -sf "$shared_path" "$HOME/.local/bin/node"
+      fi
     fi
   fi
 
   if [[ "$need_node" == "true" ]]; then
     if [[ "$DRY_RUN" == "true" ]]; then
-      echo "[dry-run] Install prebuilt Node.js 22 LTS for ${PKG_MGR}"
+      echo "[dry-run] Install prebuilt Node.js 24 Active LTS for ${PKG_MGR}"
     else
       case "$PKG_MGR" in
         apt)
-          curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+          curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
           pkg_install nodejs
           ;;
         dnf)
-          curl -fsSL https://rpm.nodesource.com/setup_22.x | sudo -E bash -
+          curl -fsSL https://rpm.nodesource.com/setup_24.x | sudo -E bash -
           pkg_install nodejs
           ;;
         pacman)
           pkg_install nodejs npm
           ;;
         zypper)
-          pkg_install nodejs22 npm22 || pkg_install nodejs npm
+          pkg_install nodejs24 npm24 || pkg_install nodejs22 npm22 || pkg_install nodejs npm
           ;;
         apk)
           pkg_install nodejs npm
@@ -634,7 +708,7 @@ step_node() {
   fi
 
   if [[ "$PROFILE" == "core" ]]; then
-    echo "[step:node][profile=core] Core profile stops at Node.js 22 LTS (skipping mise/pnpm/yarn/bun/eslint)."
+    echo "[step:node][profile=core] Core profile stops at shared Node / Node.js 24 LTS (skipping mise/pnpm/yarn/bun/eslint)."
     return 0
   fi
 
@@ -671,15 +745,15 @@ step_node() {
     fi
   fi
 
-  # Universal only: multi-version Node 20 / 22 / 24 prebuilt via mise
+  # Universal only: multi-version Node 22 & 24 Active LTS prebuilt via mise (default global = node@24 aligned with DSH)
   if [[ "$PROFILE" == "universal" ]]; then
-    echo "[step:node][profile=universal] Installing prebuilt Node 20, 22, 24 via mise..."
+    echo "[step:node][profile=universal] Installing prebuilt Node 22 & 24 LTS via mise..."
     if [[ "$DRY_RUN" == "true" ]]; then
-      echo "[dry-run] mise install node@20 node@22 node@24 && mise use -g node@22"
+      echo "[dry-run] mise install node@22 node@24 && mise use -g node@24"
     else
       export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$PATH"
-      mise install node@20 node@22 node@24
-      mise use -g node@22
+      mise install node@22 node@24
+      mise use -g node@24
     fi
   fi
 }
@@ -687,6 +761,7 @@ step_node() {
 step_python() {
   echo "=== [step:python][profile=${PROFILE}] Installing Python 3 (binary-only, ZERO pyenv source compilation) ==="
   persist_profile_and_env
+  ensure_step_prereqs
   case "$PKG_MGR" in
     apt)    pkg_install python3 python3-venv python3-pip ;;
     dnf)    pkg_install python3 python3-pip ;;
@@ -731,6 +806,7 @@ step_go() {
   fi
   echo "=== [step:go][profile=${PROFILE}] Installing prebuilt Go tarball + prebuilt golangci-lint ==="
   persist_profile_and_env
+  ensure_step_prereqs
 
   local go_ver="1.24.2"
   local go_base="https://go.dev/dl"
@@ -769,6 +845,7 @@ step_rust() {
   fi
   echo "=== [step:rust][profile=${PROFILE}] Installing prebuilt Rust minimal toolchain (rustup + rustfmt + clippy) ==="
   persist_profile_and_env
+  ensure_step_prereqs
 
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "[dry-run] Install Rust minimal profile via rustup (--profile minimal --component rustfmt,clippy)"
@@ -798,6 +875,20 @@ step_extra() {
     apk)    pkg_install openjdk21-jre-headless maven gradle ruby php83 composer ;;
   esac
 }
+
+# Bounded one-shot setup log (0600 inside 0700 logs/, keeps max 5 setup logs; skipped on --dry-run)
+if [[ "$DRY_RUN" != "true" ]]; then
+  PROVISION_LOG_DIR="$CONFIG_ROOT/logs"
+  mkdir -p "$PROVISION_LOG_DIR"
+  chmod 700 "$PROVISION_LOG_DIR"
+  PROVISION_LOG_FILE="$PROVISION_LOG_DIR/provision-$(date +%Y%m%d-%H%M%S).log"
+  touch "$PROVISION_LOG_FILE"
+  chmod 600 "$PROVISION_LOG_FILE"
+  # Prune older provision-*.log files beyond the 5 most recent
+  ls -1t "$PROVISION_LOG_DIR"/provision-*.log 2>/dev/null | tail -n +6 | xargs -r rm -f 2>/dev/null || true
+  exec > >(tee -a "$PROVISION_LOG_FILE") 2>&1
+  echo "[log] Saving setup log to $PROVISION_LOG_FILE"
+fi
 
 echo "[dsh-wsl-sandbox] Provisioning distro='${DISTRO_PRETTY}' (${PKG_MGR}) profile=${PROFILE} mirror=${MIRROR} step=${STEP} arch=${ARCH}"
 

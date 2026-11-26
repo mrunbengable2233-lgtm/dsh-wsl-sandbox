@@ -14,16 +14,17 @@ import {
   type TerminalExecResult,
 } from '../../packages/core/src/index.ts';
 import { WslTransport } from '../../packages/dsh-plugin/src/wsl-transport.ts';
+import { BUILT_RUNNER_PATH, BWRAP_SKIP_REASON } from '../test-env.ts';
 
 /**
  * REAL Linux Kernel Sandbox Verification Suite (Q17=A).
- * Executes actual `wsl-runner` -> `bwrap 0.9.0` + `seccomp-bpf` + `prlimit` + `UdsAllowlistProxy`
+ * Executes actual `wsl-runner` -> `bwrap` + `seccomp-bpf` + `prlimit` + `UdsAllowlistProxy`
  * on the real Linux kernel (no mocks for kernel isolation!).
  */
 
-const RUNNER_PATH = path.resolve('packages/wsl-runner/src/main.ts');
+const RUNNER_PATH = BUILT_RUNNER_PATH;
 
-describe('linux-sandbox — REAL bwrap + seccomp-bpf + prlimit + UdsAllowlistProxy kernel enforcement', () => {
+describe('linux-sandbox — REAL bwrap + seccomp-bpf + prlimit + UdsAllowlistProxy kernel enforcement', { skip: BWRAP_SKIP_REASON }, () => {
   let workspaceRoot = '';
   let shareDir = '';
   let outsideFile = '';
@@ -82,10 +83,10 @@ describe('linux-sandbox — REAL bwrap + seccomp-bpf + prlimit + UdsAllowlistPro
   });
 
   after(async () => {
-    await transport.dispose();
-    fs.rmSync(workspaceRoot, { recursive: true, force: true });
-    fs.rmSync(shareDir, { recursive: true, force: true });
-    fs.rmSync(outsideFile, { force: true });
+    await transport?.dispose();
+    if (workspaceRoot && fs.existsSync(workspaceRoot)) fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    if (shareDir && fs.existsSync(shareDir)) fs.rmSync(shareDir, { recursive: true, force: true });
+    if (outsideFile && fs.existsSync(outsideFile)) fs.rmSync(outsideFile, { force: true });
   });
 
   it('Positive: runs commands, private /tmp heredocs, git status/commit, and stateful wsl_terminal', async () => {
