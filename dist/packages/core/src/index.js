@@ -6,6 +6,7 @@ export * from './seccomp-bpf.js';
 export * from './bwrap-builder.js';
 export * from './bash-ast-guard.js';
 export * from './pwsh-guard.js';
+export * from './pwsh-system-parser.js';
 export * from './approval-controller.js';
 export * from './uds-proxy.js';
 export * from './protocol.js';

@@ -1,10 +1,6 @@
 node_modules/
 *.log
 .DS_Store
-Thumbs.db
-*.bundle
-*.tgz
-*.zip
 .trellis/workspace/*/tmp/
-.build-test.lock
-dist/.compiled-tests/
+.cache/
+*.tgz
