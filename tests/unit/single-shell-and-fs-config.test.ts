@@ -23,6 +23,15 @@ import {
 import { ConfinedFsService } from '../../packages/wsl-runner/src/fs-service.ts';
 import { ConfinedProcManager } from '../../packages/wsl-runner/src/proc-manager.ts';
 import { ConfinedTerminalManager } from '../../packages/wsl-runner/src/pty-manager.ts';
+import {
+  assertPrivateFileMode,
+  BWRAP_SKIP_REASON,
+  IS_WINDOWS,
+  POSIX_BASH_SKIP_REASON,
+  POSIX_TAR_SKIP_REASON,
+  PROVISION_SH_PATH,
+  UDS_SKIP_REASON,
+} from '../test-env.ts';
 
 function makeBinding(workspaceRoot: string, overrides?: Partial<SessionBinding>): SessionBinding {
   return {
@@ -121,7 +130,7 @@ describe('Single-Shell Purity & Pre-Execution Shell Dialect Guard (DeepSeek V4.1
 });
 
 describe('bwrap-builder — mount precedence, Checklist B placeholders, shares, devices & UDS socket', () => {
-  it('builds complete sandbox argv with --remount-ro /, Checklist B locks, .env masking, shares, and device binds', async () => {
+  it('builds complete sandbox argv with --remount-ro /, Checklist B locks, .env masking, shares, and device binds', { skip: UDS_SKIP_REASON }, async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-bwrap-unit-'));
     const shareDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-share-unit-'));
     const sockDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-sock-unit-'));
@@ -243,7 +252,7 @@ describe('ConfinedFsService & ConfinedTerminalManager — line slicing, .env mas
     }
   });
 
-  it('preserves working directory in ConfinedTerminalManager even when command calls exit 0', async () => {
+  it('preserves working directory in ConfinedTerminalManager even when command calls exit 0', { skip: BWRAP_SKIP_REASON }, async () => {
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-term-unit-'));
     try {
       fs.mkdirSync(path.join(ws, 'packages', 'sub'), { recursive: true });
@@ -290,8 +299,7 @@ describe('ConfigStore & ApprovalController — persistence, TTL timeout, and den
       assert.equal(store.get().distro, 'Ubuntu-26.04');
       assert.equal(store.get().environmentProfile, 'core');
 
-      const st = fs.statSync(cfgPath);
-      assert.equal(st.mode & 0o777, 0o600);
+      assertPrivateFileMode(cfgPath, 0o600);
 
       const updated = store.updateBasic({
         transportMode: 'local-linux',
@@ -438,12 +446,12 @@ describe('ConfigStore & ApprovalController — persistence, TTL timeout, and den
       assert.equal(bkRes.status, 200);
       assert.equal(bkRes.payload.backupDir, customBkDir);
       assert.equal(store.get().backupDir, customBkDir);
-      assert.equal(fs.statSync(customBkDir).mode & 0o777, 0o700, 'Backup directory must be owner-only 0700');
+      assertPrivateFileMode(customBkDir, 0o700, 'Backup directory must be owner-only 0700');
 
       const savedFiles = bkRes.payload.savedFiles as string[];
       assert.ok(savedFiles.length >= 1, 'Expected at least 1 saved backup file');
       for (const f of savedFiles) {
-        assert.equal(fs.statSync(f).mode & 0o777, 0o400, `Backup file ${f} must be read-only 0400`);
+        assertPrivateFileMode(f, 0o400, `Backup file ${f} must be read-only 0400`);
       }
 
       // 2. List backup items and verify explorerPath is populated
@@ -482,15 +490,15 @@ describe('ConfigStore & ApprovalController — persistence, TTL timeout, and den
 });
 
 describe('Bootstrap provisioning profiles, WSL Manager discovery & native ext4 tar staging', () => {
-  it('enforces genuine core/standard/universal profile differentiation and single-distro --terminate in provision-wsl.sh', () => {
-    const scriptPath = path.resolve('packages/bootstrap/provision-wsl.sh');
+  it('enforces genuine core/standard/universal profile differentiation, shared Node / Node 24 LTS, and single-distro --terminate in provision-wsl.sh', { skip: POSIX_BASH_SKIP_REASON }, () => {
     const runDry = (extraArgs: string[]) =>
-      spawnSync('bash', [scriptPath, ...extraArgs, '--dry-run'], { encoding: 'utf8' });
+      spawnSync('bash', [PROVISION_SH_PATH, ...extraArgs, '--dry-run'], { encoding: 'utf8' });
 
     const coreRes = runDry(['--profile', 'core']);
     assert.equal(coreRes.status, 0, coreRes.stderr);
     assert.match(coreRes.stdout, /bubblewrap/);
-    assert.match(coreRes.stdout, /Core profile stops at Node\.js 22 LTS/);
+    assert.match(coreRes.stdout, /unzip/);
+    assert.match(coreRes.stdout, /Core profile stops at shared Node \/ Node\.js 24 LTS/);
     assert.match(coreRes.stdout, /Core profile stops at system python3/);
     assert.match(coreRes.stdout, /\[step:go\]\[profile=core\] Skipped/);
     assert.match(coreRes.stdout, /\[step:rust\]\[profile=core\] Skipped/);
@@ -515,11 +523,12 @@ describe('Bootstrap provisioning profiles, WSL Manager discovery & native ext4 t
     assert.equal(uniRes.status, 0, uniRes.stderr);
     assert.match(uniRes.stdout, /clang clang-format clang-tidy/);
     assert.match(uniRes.stdout, /bazelisk/);
-    assert.match(uniRes.stdout, /mise install node@20 node@22 node@24/);
+    assert.match(uniRes.stdout, /mise install node@22 node@24 && mise use -g node@24/);
     assert.match(uniRes.stdout, /uv tool install poetry/);
     assert.match(uniRes.stdout, /openjdk-21-jdk-headless maven gradle ruby php-cli composer/);
 
-    // Individual spec steps `--step go` and `--step rust` must both work
+    // Individual spec steps `--step node`, `--step go`, and `--step rust` must all work standalone
+    assert.equal(runDry(['--profile', 'standard', '--step', 'node']).status, 0);
     assert.equal(runDry(['--profile', 'standard', '--step', 'go']).status, 0);
     assert.equal(runDry(['--profile', 'standard', '--step', 'rust']).status, 0);
 
@@ -605,7 +614,7 @@ describe('Bootstrap provisioning profiles, WSL Manager discovery & native ext4 t
     assert.equal(isInsideLxssBasePath('D:\\SafeBackups\\WSL', parsed), null);
   });
 
-  it('builds a valid POSIX ustar tar archive in stage-wsl-runner.mjs that extracts cleanly via real Linux tar', async () => {
+  it('builds a valid POSIX ustar tar archive in stage-wsl-runner.mjs that extracts cleanly via real tar', { skip: POSIX_TAR_SKIP_REASON }, async () => {
     const { buildTarBuffer } = await import('../../scripts/stage-wsl-runner.mjs');
     const tarBuf = buildTarBuffer([
       { path: 'dist/packages/wsl-runner/src/main.js', content: 'console.log("ok");\n', mode: 0o644 },
@@ -619,13 +628,15 @@ describe('Bootstrap provisioning profiles, WSL Manager discovery & native ext4 t
       const extractedSh = path.join(outDir, 'packages/bootstrap/provision-wsl.sh');
       assert.equal(fs.readFileSync(extractedJs, 'utf8'), 'console.log("ok");\n');
       assert.equal(fs.readFileSync(extractedSh, 'utf8'), '#!/usr/bin/env bash\necho hi\n');
-      assert.notEqual(fs.statSync(extractedSh).mode & 0o111, 0, 'Executable bit must be preserved');
+      if (!IS_WINDOWS) {
+        assert.notEqual(fs.statSync(extractedSh).mode & 0o111, 0, 'Executable bit must be preserved');
+      }
     } finally {
       fs.rmSync(outDir, { recursive: true, force: true });
     }
   });
 
-  it('masks sensitive $HOME config and credential dirs read-only inside buildBwrapArgs', () => {
+  it('masks sensitive $HOME config and credential dirs read-only inside buildBwrapArgs', { skip: IS_WINDOWS ? 'bwrap POSIX path builder runs inside Linux/WSL runner' : false }, () => {
     const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-home-mask-'));
     const ws = path.join(fakeHome, 'workspace');
     try {

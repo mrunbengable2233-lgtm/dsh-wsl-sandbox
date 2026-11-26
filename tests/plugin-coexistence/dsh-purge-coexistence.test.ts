@@ -18,6 +18,7 @@ import {
   type WslSandboxPluginHandle,
 } from '../../packages/dsh-plugin/src/index.ts';
 import { apply as applyWebUi } from '../../packages/dsh-plugin/src/web-ui-entry.ts';
+import { BUILT_RUNNER_PATH, BWRAP_SKIP_REASON } from '../test-env.ts';
 
 void _unused;
 
@@ -182,9 +183,9 @@ class MockCordisDshHost {
   }
 }
 
-const RUNNER_PATH = path.resolve('packages/wsl-runner/src/main.ts');
+const RUNNER_PATH = BUILT_RUNNER_PATH;
 
-describe('plugin-coexistence — dsh-wsl-sandbox + dsh-purge full Cordis coexistence', () => {
+describe('plugin-coexistence — dsh-wsl-sandbox + dsh-purge full Cordis coexistence', { skip: BWRAP_SKIP_REASON }, () => {
   let host: MockCordisDshHost;
   let workspaceRoot = '';
   let configPath = '';
@@ -247,8 +248,10 @@ describe('plugin-coexistence — dsh-wsl-sandbox + dsh-purge full Cordis coexist
   });
 
   after(async () => {
-    await host.disposeAll();
-    fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    await host?.disposeAll();
+    if (workspaceRoot && fs.existsSync(workspaceRoot)) {
+      fs.rmSync(workspaceRoot, { recursive: true, force: true });
+    }
   });
 
   it('preserves 100% of dsh-purge prompts, tools, and routes while adding 7 wsl_* tools and incremental routing prompt', async () => {

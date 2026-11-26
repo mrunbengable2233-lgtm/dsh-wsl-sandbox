@@ -82,6 +82,7 @@ function collectFiles(repoRoot) {
   const entries = [];
   const walkDir = (absDir) => {
     for (const ent of fs.readdirSync(absDir, { withFileTypes: true })) {
+      if (ent.name === '.compiled-tests') continue;
       const full = path.join(absDir, ent.name);
       if (ent.isDirectory()) {
         walkDir(full);
