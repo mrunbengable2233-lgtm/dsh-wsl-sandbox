@@ -224,6 +224,13 @@ if (-not $Distro -or $Distro.Trim() -eq "") {
       exit 0
     }
     Write-Host "Installing official WSL 2 distro '$selectedNew'..." -ForegroundColor Cyan
+    $manifestEarlyPath = Join-Path $cfgDir "install-manifest.json"
+    [ordered]@{
+      installedDistroByPlugin = $selectedNew
+      recordedAt = (Get-Date).ToString("o")
+      agentsMdFiles = @()
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestEarlyPath -Encoding UTF8
+    Set-PrivateOwnerAcl -TargetPath $manifestEarlyPath
     & wsl.exe --install -d $selectedNew
     Write-Host "After completing initial Linux non-root user creation in '$selectedNew', re-run this installer with -Distro $selectedNew." -ForegroundColor Green
     exit 0
@@ -386,16 +393,27 @@ if ($matchedDistro -and $matchedDistro.IsCustomMoved) {
 Write-Host "Profile      : $Profile (mirror=$Mirror)"
 Write-Host "[note] Windows WSL Settings and WSL Manager share %USERPROFILE%\.wslconfig and /etc/wsl.conf; this installer NEVER auto-edits either file." -ForegroundColor DarkGray
 
-# 0. Non-destructive read-only backup of original Windows %USERPROFILE%\.wslconfig and WSL /etc/wsl.conf
+# 0. Non-destructive read-only backup of original Windows %USERPROFILE%\.wslconfig and WSL /etc/wsl.conf (SHA-256 deduplicated, max 5 rolling .bak)
 if (Test-Path -LiteralPath $wslConfigHostPath) {
   if (-not (Test-Path -LiteralPath $origWslConfigBackup) -and -not (Test-Path -LiteralPath $absentWslConfigMarker)) {
     Copy-Item -LiteralPath $wslConfigHostPath -Destination $origWslConfigBackup -Force
     Set-PrivateOwnerAcl -TargetPath $origWslConfigBackup -ReadOnlyFile
     Write-Host "[0/5] Backed up original .wslconfig (read-only) -> $origWslConfigBackup" -ForegroundColor Green
   }
-  $tsHostBak = Join-Path $backupDir ".wslconfig.$ts.bak"
-  Copy-Item -LiteralPath $wslConfigHostPath -Destination $tsHostBak -Force
-  Set-PrivateOwnerAcl -TargetPath $tsHostBak -ReadOnlyFile
+  $curHash = (Get-FileHash -LiteralPath $wslConfigHostPath -Algorithm SHA256).Hash
+  $existingRolling = @(Get-ChildItem -LiteralPath $backupDir -Filter ".wslconfig.*.bak" -ErrorAction SilentlyContinue | Sort-Object Name)
+  $compareFile = if ($existingRolling.Count -gt 0) { $existingRolling[-1].FullName } else { $origWslConfigBackup }
+  $prevHash = if (Test-Path -LiteralPath $compareFile) { (Get-FileHash -LiteralPath $compareFile -Algorithm SHA256).Hash } else { "" }
+  if ($curHash -ne $prevHash) {
+    $tsHostBak = Join-Path $backupDir ".wslconfig.$ts.bak"
+    Copy-Item -LiteralPath $wslConfigHostPath -Destination $tsHostBak -Force
+    Set-PrivateOwnerAcl -TargetPath $tsHostBak -ReadOnlyFile
+    $allRolling = @(Get-ChildItem -LiteralPath $backupDir -Filter ".wslconfig.*.bak" -ErrorAction SilentlyContinue | Sort-Object Name -Descending)
+    foreach ($oldBak in ($allRolling | Select-Object -Skip 5)) {
+      try { $oldBak.IsReadOnly = $false } catch {}
+      Remove-Item -Force -LiteralPath $oldBak.FullName -ErrorAction SilentlyContinue
+    }
+  }
 } else {
   if (-not (Test-Path -LiteralPath $origWslConfigBackup) -and -not (Test-Path -LiteralPath $absentWslConfigMarker)) {
     Set-Content -LiteralPath $absentWslConfigMarker -Value "# Host had no %USERPROFILE%\.wslconfig at initial backup ($ts)`n# Shared by Windows WSL Settings & WSL Manager." -Encoding UTF8
@@ -423,7 +441,7 @@ if ($OpenBackupFolder) {
 }
 
 if ($BackupOnly) {
-  Write-Host "`nBackup complete (read-only snapshots) under: $backupDir" -ForegroundColor Green
+  Write-Host "`nBackup complete (read-only snapshots, SHA-256 deduplicated) under: $backupDir" -ForegroundColor Green
   exit 0
 }
 
@@ -448,7 +466,9 @@ if (-not $WorkspaceRoot -or $WorkspaceRoot.Trim() -eq "") {
 Write-Host "[1/5] Probed WSL user: $linuxUser (uid=$linuxUid, home=$linuxHome) -> workspaceRoot=$WorkspaceRoot" -ForegroundColor Green
 Add-InstallLog "Probed WSL user=$linuxUser uid=$linuxUid home=$linuxHome workspace=$WorkspaceRoot"
 
-# Ensure native ext4 workspace directory exists without touching /mnt
+# Check if workspace directory existed prior to setup (so uninstaller only removes an empty plugin-created ~/workspace)
+$wsExistedBefore = (& wsl.exe -d $Distro --cd ~ -- sh -c '[ -d "$1" ] && echo 1 || echo 0' -- $WorkspaceRoot 2>$null | Select-Object -Last 1).Trim()
+$createdDefaultWorkspace = ($wsExistedBefore -ne "1")
 & wsl.exe -d $Distro --cd ~ -- sh -c 'mkdir -p "$1"' -- $WorkspaceRoot | Out-Null
 
 # 2. Resolve shared Host Node (or prebuilt tar fallback), build dist/ if needed, and stage into native WSL ext4
@@ -509,7 +529,7 @@ for p in $PATH; do
   case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac
 done
 IFS="$OLD_IFS"
-export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"
+export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"
 MISS=""
 for bin in bwrap prlimit socat node; do
   command -v "$bin" >/dev/null 2>&1 || MISS="${MISS:+$MISS,}$bin"
@@ -522,7 +542,7 @@ $doProvision = [bool]$Provision
 if (-not $doProvision -and -not $NonInteractive) {
   if ($missingBins -ne "READY") {
     Write-Host "      Detected missing WSL sandbox/runtime binaries ($missingBins) in '$Distro'." -ForegroundColor Yellow
-    $runProv = Read-Host "Provision '$Distro' now with --profile $Profile --mirror $Mirror (shares existing Node or installs Node 24 LTS)? [Y/n]"
+    $runProv = Read-Host "Provision '$Distro' now with --profile $Profile --mirror $Mirror (shares existing Node or installs verified Node 24 LTS)? [Y/n]"
     if (-not $runProv.Trim() -or $runProv.Trim() -imatch '^(y|yes)$') { $doProvision = $true }
   } else {
     $runProv = Read-Host "Sandbox primitives & shared Node already ready in '$Distro'. Re-run provision-wsl.sh (--profile $Profile --mirror $Mirror) anyway? [y/N]"
@@ -530,7 +550,7 @@ if (-not $doProvision -and -not $NonInteractive) {
   }
 }
 
-$wslDoctorExecSh = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; exec node "$1" --strict-wsl2 --profile "$2"'
+$wslDoctorExecSh = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; exec node "$1" --strict-wsl2 --profile "$2"'
 
 if ($doProvision) {
   Write-Host "[3/5] Provisioning '$Distro' with profile='$Profile', mirror='$Mirror'..." -ForegroundColor Cyan
@@ -624,16 +644,81 @@ if ($dshCmd) {
   Write-Host "      Import '$PluginRepoPath' (or dsh-wsl-sandbox-0.2.0.tgz) in DSH Desktop Plugin Settings."
 }
 
-if ($UpsertAgentsMd -and $hostNode) {
-  Write-Host "      Upserting WSL-first routing block into $ProjectAgentsMdDir\AGENTS.md ..."
-  $js = "import { upsertAgentsMdWslSection } from './dist/packages/dsh-plugin/src/prompt-injector.js'; console.log(JSON.stringify(upsertAgentsMdWslSection(process.argv[1], { distro: process.argv[2], workspaceRoot: process.argv[3] })));"
-  Push-Location $PluginRepoPath
-  try {
-    Invoke-SharedHostNode -Runtime $hostNode -Arguments @("--input-type=module", "-e", $js, $ProjectAgentsMdDir, $Distro, $WorkspaceRoot)
-  } finally {
-    Pop-Location
+$manifestPath = Join-Path $cfgDir "install-manifest.json"
+$prevManifest = if (Test-Path -LiteralPath $manifestPath) {
+  try { Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $null }
+} else { $null }
+$recordedAgentsMd = New-Object System.Collections.Generic.List[string]
+if ($prevManifest -and $prevManifest.agentsMdFiles) {
+  foreach ($f in $prevManifest.agentsMdFiles) {
+    if ($f -and -not $recordedAgentsMd.Contains([string]$f)) { $recordedAgentsMd.Add([string]$f) }
   }
 }
+
+if ($UpsertAgentsMd) {
+  $targetAgentsFile = Join-Path (Resolve-Path -LiteralPath $ProjectAgentsMdDir).Path "AGENTS.md"
+  Write-Host "      Upserting WSL-first routing block into $targetAgentsFile ..."
+  if ($hostNode) {
+    $js = "import { upsertAgentsMdWslSection } from './dist/packages/dsh-plugin/src/prompt-injector.js'; console.log(JSON.stringify(upsertAgentsMdWslSection(process.argv[1], { distro: process.argv[2], workspaceRoot: process.argv[3] })));"
+    Push-Location $PluginRepoPath
+    try {
+      Invoke-SharedHostNode -Runtime $hostNode -Arguments @("--input-type=module", "-e", $js, $ProjectAgentsMdDir, $Distro, $WorkspaceRoot)
+    } finally {
+      Pop-Location
+    }
+  } else {
+    $block = @(
+      "<!-- dsh-wsl-sandbox:start -->",
+      "## WSL 2 Sandbox Tool Routing (Managed by dsh-wsl-sandbox)",
+      "",
+      "- Default Linux sandbox distro: ``$Distro`` (workspace: ``$WorkspaceRoot``).",
+      "- **Always prefer ``wsl_*`` tools** (``wsl_bash``, ``wsl_read``, ``wsl_write``, ``wsl_edit``, ``wsl_glob``, ``wsl_grep``, ``wsl_terminal``) for repository work, builds, tests, git, and Linux workflows.",
+      "<!-- dsh-wsl-sandbox:end -->"
+    ) -join "`n"
+    if (-not (Test-Path -LiteralPath $targetAgentsFile)) {
+      Set-Content -LiteralPath $targetAgentsFile -Value "# Project Agent Instructions`n`n$block`n" -Encoding UTF8
+    } else {
+      $raw = Get-Content -LiteralPath $targetAgentsFile -Raw -Encoding UTF8
+      if ($raw -match '<!--\s*dsh-wsl-sandbox:(?:start|begin)\s*-->[\s\S]*?<!--\s*dsh-wsl-sandbox:end\s*-->') {
+        $updated = [regex]::Replace($raw, '<!--\s*dsh-wsl-sandbox:(?:start|begin)\s*-->[\s\S]*?<!--\s*dsh-wsl-sandbox:end\s*-->', $block)
+        Set-Content -LiteralPath $targetAgentsFile -Value $updated -Encoding UTF8
+      } else {
+        Add-Content -LiteralPath $targetAgentsFile -Value "`n$block`n" -Encoding UTF8
+      }
+    }
+  }
+  if (-not $recordedAgentsMd.Contains($targetAgentsFile)) {
+    $recordedAgentsMd.Add($targetAgentsFile)
+  }
+}
+
+# Persist complete install-manifest.json so `uninstall-dsh-plugin.ps1` knows every touched path without digging logs!
+$installedDistroByPlugin = if ($prevManifest -and $prevManifest.installedDistroByPlugin) { $prevManifest.installedDistroByPlugin } else { $null }
+$prevCreatedWs = if ($prevManifest -and $prevManifest.createdDefaultWorkspace) { [bool]$prevManifest.createdDefaultWorkspace } else { $false }
+$manifestDoc = [ordered]@{
+  version = "0.2.0"
+  updatedAt = (Get-Date).ToString("o")
+  distro = $Distro
+  installedDistroByPlugin = $installedDistroByPlugin
+  linuxUser = $linuxUser
+  linuxHome = $linuxHome
+  workspaceRoot = $WorkspaceRoot
+  createdDefaultWorkspace = ($createdDefaultWorkspace -or $prevCreatedWs)
+  profile = $Profile
+  mirror = $Mirror
+  hostConfigDir = $cfgDir
+  backupDir = $backupDir
+  logDir = $logDir
+  wslPaths = [ordered]@{
+    stagedRoot = "$linuxHome/.local/share/dsh-wsl-sandbox"
+    configRoot = "$linuxHome/.config/dsh-wsl-sandbox"
+    cacheRoot = "$linuxHome/.cache/dsh-wsl-sandbox"
+    envSh = "$linuxHome/.dsh-wsl-env.sh"
+  }
+  agentsMdFiles = @($recordedAgentsMd)
+}
+$manifestDoc | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+Set-PrivateOwnerAcl -TargetPath $manifestPath
 
 # Single-write bounded install log (keeps max 5 setup logs, zero ongoing disk churn)
 $installLogFile = Join-Path $logDir "install-$ts.log"
@@ -646,4 +731,6 @@ Get-ChildItem -LiteralPath $logDir -Filter "install-*.log" -ErrorAction Silently
   Remove-Item -Force -ErrorAction SilentlyContinue
 
 Write-Host "`nDone! Original WSL configs backed up (read-only) under: $backupDir" -ForegroundColor Green
-Write-Host "Verify anytime: .\tests\windows-wsl-verify\verify-wsl2.ps1 -Distro $Distro -Profile $Profile"
+Write-Host "Verify anytime   : .\tests\windows-wsl-verify\verify-wsl2.ps1 -Distro $Distro -Profile $Profile"
+Write-Host "Clean uninstall  : .\packages\bootstrap\uninstall-dsh-plugin.ps1 [-DryRun] [-PurgeToolchains]"
+

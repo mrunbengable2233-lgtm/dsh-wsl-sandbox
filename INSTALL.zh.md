@@ -99,6 +99,40 @@ dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.2.0.tgz
   4. **单边落盘 + 滚动限额（`5 MiB × 3`）**：WSL Runner 日志通过内存管道汇总至宿主统一落盘，不在 WSL `ext4.vhdx` 虚拟磁盘内二次写文件；总日志体积硬上限 `15 MiB`。
   5. **全内存查询与敏感信息脱敏**：Web UI 轮询 `/wsl-sandbox/api/logs` 100% 从内存环形缓冲区返回（**`0` 次磁盘读取**，切到后台标签页自动暂停轮询），并自动脱敏 `API_KEY`、`TOKEN`、`Bearer`、`sk-...`、`ghp_...` 等密钥。
 
+### 7. 持久化落盘清单（13 项全透明对账）与一键可逆卸载
+
+> **设计透明性说明**：`bwrap` 的 `--tmpfs` 内存盘仅用于遮蔽 `/tmp`、`/run`、`/mnt` 及 `$HOME` 敏感凭证目录；插件的安装配置、备份、工作区缓存与工具链属于明确的持久化落盘，全部记录在 `install-manifest.json` 与 `provision-manifest.json` 中，**绝不留隐蔽垃圾，也无需翻查安装日志**。
+
+#### 一键可逆卸载命令（Windows PowerShell 7）
+```powershell
+# 1. 先预览将要还原和删除的全部 13 项路径（零修改安全演练）：
+.\packages\bootstrap\uninstall-dsh-plugin.ps1 -DryRun
+
+# 2. 标准卸载（从 DSH 移除插件、还原 /etc/wsl.conf 与 APT 源、剥离 AGENTS.md 块与 Shell 钩子、解锁 +R/0400 并删净宿主与 WSL 插件目录/缓存）：
+.\packages\bootstrap\uninstall-dsh-plugin.ps1
+
+# 3. 深度卸载（在标准卸载基础上，额外按 provision-manifest.json 增量清单卸载安装期新装的 apt/dnf 包、Node 24/Go/Rust/uv/mise/bun 等工具链，绝不误删你原本就有的环境）：
+.\packages\bootstrap\uninstall-dsh-plugin.ps1 -PurgeToolchains
+```
+
+#### 全量 13 项落盘位置与回收机制对账表
+
+| 侧 | 落盘产物 | 精确路径与权限 | 自动防护与卸载回收方式 |
+| :--- | :--- | :--- | :--- |
+| **Windows** | 1. 宿主配置、清单与日志 | `%DSH_HOME%\dsh-wsl-sandbox\{config.json, install-manifest.json, logs\}`（owner-only `icacls`） | `uninstall-dsh-plugin.ps1` 自动解锁并整目录移除 |
+| **Windows** | 2. `.wslconfig` 滚动备份 | `%DSH_HOME%\dsh-wsl-sandbox\backups\.wslconfig.*.bak`（`attrib +R`） | **SHA-256 去重**（内容未变绝不重复生成 `.bak`，最多保留 5 份）；卸载自动去 `+R` 删除（加 `-KeepBackups` 可保留） |
+| **Windows** | 3. 初始只读基准快照 | `backups\{.wslconfig.orig, .wslconfig.orig.absent, wsl.conf.<Distro>.orig}` | 可选 `-RestoreHostWslConfig` 还原后自动解锁删除 |
+| **Windows** | 4. 项目 `AGENTS.md` 注入块 | `<!-- dsh-wsl-sandbox:start --> ... <!-- dsh-wsl-sandbox:end -->` | 路径自动记录于 `install-manifest.json`；卸载（或 `DELETE /wsl-sandbox/api/agents-md`）自动剥离标记块，若文件为插件新建空壳则直接删文件 |
+| **Windows** | 5. 向导新装的 WSL 发行版 | `wsl.exe --install -d <Distro>`（可选） | 记录于 `install-manifest.json`；默认保留保护用户数据，传 `-UnregisterPluginDistro` 才注销 |
+| **WSL 2** | 6. 原生 ext4 Runner 与独立 Node | `~/.local/share/dsh-wsl-sandbox/{runner, toolchains/node}`（`0700`） | 官方 `SHASUMS256.txt` 校验解压（**零 `curl \| sudo bash`、零第三方 APT 源污染**）；`--uninstall` 直接删除 |
+| **WSL 2** | 7. 默认空工作区目录 | `~/workspace` | 卸载时仅当目录**完全为空**才 `rmdir`，非空自动保留 |
+| **WSL 2** | 8. WSL 配置、增量清单与备份 | `~/.config/dsh-wsl-sandbox/{profile.json, provision-manifest.json, backups/}`（`0400` 备份） | 备份按 SHA-256 去重限 5 份；卸载先还原配置，再 `chmod -R u+w` 解锁删净 |
+| **WSL 2** | 9. Shell 环境脚本与 RC 钩子 | `~/.dsh-wsl-env.sh` 及 `~/.bashrc`、`~/.profile` 单行引用 | `--uninstall` 自动精准剔除引用行并删除 `~/.dsh-wsl-env.sh` |
+| **WSL 2** | 10. 工作区持久化包缓存 | `~/.cache/dsh-wsl-sandbox/<sha256-12>` | 超过 30 天未访问自动过期清理；支持 UI 一键清空；`--uninstall` 全量删除（设 `cacheMode=ephemeral` 则不落盘） |
+| **WSL 2** | 11. 档位软件包与非 APT 工具链 | 新增系统包及 `/usr/local/go`、`~/.rustup`、`~/.cargo`、`~/.bun`、`~/.local/share/mise`、`uv` | 安装前比对记录增量至 `provision-manifest.json`；传 `-PurgeToolchains` / `--purge-toolchains` 精确回滚增量项 |
+| **WSL 2** | 12. `/etc/wsl.conf` 与 APT 镜像源 | `/etc/wsl.conf`、`/etc/apt/sources.list.d/*.bak` | `--uninstall` 默认自动还原原始文件并清理 `.bak` |
+| **WSL 2** | 13. Runner / UDS 代理运行期目录 | `dsh-wsl-runner-*`、`dsh-wsl-proxy-*`（含 `0444` `empty-mask`） | 优先建在内核真内存盘 `/run/user/<uid>` 或 `/dev/shm`（`tmpfs`，`wsl --terminate` 自动蒸发），并带 `owner.pid` 在每次启动及卸载时自动清扫 `kill -9` 残留 |
+
 ---
 
 ## 三、通过 GitHub Desktop 或命令行提交独立版本 PR（`release/v0.2.0` -> `main`）

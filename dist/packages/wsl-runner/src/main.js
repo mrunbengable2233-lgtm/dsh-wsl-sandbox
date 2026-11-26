@@ -29,6 +29,14 @@ import {
   UdsAllowlistProxy,
 } from '../../core/src/index.js';
 import { ConfinedFsService } from './fs-service.js';
+import {
+  collectWslFootprint,
+  forceRemoveReadOnlyTree,
+  pruneWorkspaceCaches,
+  resolveEphemeralRamTmpRoot,
+  sweepOrphanedRunnerTempDirs,
+  writeDeduplicatedReadOnlyBackup,
+} from './hygiene.js';
 import { runEnvironmentProbe } from './probe.js';
 import { ConfinedProcManager } from './proc-manager.js';
 import { ConfinedTerminalManager } from './pty-manager.js';
@@ -79,9 +87,29 @@ const fsService = new ConfinedFsService();
 const procManager = new ConfinedProcManager();
 const termManager = new ConfinedTerminalManager(procManager);
 
-const proxyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wsl-proxy-'));
+const proxyDir = fs.mkdtempSync(path.join(resolveEphemeralRamTmpRoot(), 'dsh-wsl-proxy-'));
 fs.chmodSync(proxyDir, 0o700);
+fs.writeFileSync(path.join(proxyDir, 'owner.pid'), `${process.pid}\n`, { mode: 0o600 });
 const managedProxySocketPath = path.join(proxyDir, 'proxy.sock');
+
+// Sweep any `/tmp/dsh-wsl-runner-*` or `/tmp/dsh-wsl-proxy-*` orphaned by a prior SIGKILL (`kill -9`)
+// or `wsl.exe --terminate`, plus workspace package caches untouched for > 30 days.
+try {
+  const swept = sweepOrphanedRunnerTempDirs({
+    excludeDirs: [procManager.getRuntimeDir(), proxyDir],
+  });
+  const cacheSweep = pruneWorkspaceCaches({
+    maxAgeDays: Number(process.env.DSH_WSL_CACHE_MAX_AGE_DAYS || 30),
+  });
+  if (swept.sweptDirs.length > 0 || cacheSweep.removedDirs.length > 0) {
+    rlog.info('runner.hygiene_sweep', 'Cleaned stale crash temp dirs and expired workspace caches', {
+      sweptTempDirs: swept.sweptDirs.length,
+      prunedCacheDirs: cacheSweep.removedDirs.length,
+    });
+  }
+} catch {
+  // Never block runner startup on best-effort hygiene sweep
+}
 let managedProxy                               ;
 let interactiveProxyApproval = false;
 
@@ -432,15 +460,25 @@ async function handleRequest(req            )                   {
       if (fs.existsSync(cacheBase)) {
         const st = fs.lstatSync(cacheBase);
         if (!st.isSymbolicLink() && st.isDirectory()) {
-          for (const entry of fs.readdirSync(cacheBase)) {
-            const full = path.join(cacheBase, entry);
-            fs.rmSync(full, { recursive: true, force: true });
-            clearedEntries += 1;
-          }
+          clearedEntries = fs.readdirSync(cacheBase).length;
+          forceRemoveReadOnlyTree(cacheBase);
         }
       }
-      rlog.info('cache.cleared', `Cleared ${clearedEntries} sandbox cache subdirectories`, { clearedEntries });
-      return { ok: true, cacheBase, clearedEntries };
+      const swept = sweepOrphanedRunnerTempDirs({
+        excludeDirs: [procManager.getRuntimeDir(), proxyDir],
+      });
+      rlog.info('cache.cleared', `Cleared ${clearedEntries} sandbox cache dirs and ${swept.sweptDirs.length} orphan temp dirs`, {
+        clearedEntries,
+        sweptTempDirs: swept.sweptDirs.length,
+      });
+      return { ok: true, cacheBase, clearedEntries, sweptTempDirs: swept.sweptDirs };
+    }
+
+    case 'wsl.footprint': {
+      return {
+        ok: true,
+        ...collectWslFootprint(),
+      };
     }
 
     case 'wsl.backupConfigs': {
@@ -452,33 +490,39 @@ async function handleRequest(req            )                   {
       let fstabContent                = null;
       let drvfsMountsContent                = null;
 
-      const writeReadOnlyBackup = (dest        , data        )       => {
-        fs.writeFileSync(dest, data, { mode: 0o400 });
-        try { fs.chmodSync(dest, 0o400); } catch { /* best effort */ }
-        savedFiles.push(dest);
-      };
-
       if (fs.existsSync('/etc/wsl.conf')) {
         wslConfContent = fs.readFileSync('/etc/wsl.conf', 'utf8');
-        const origPath = path.join(backupDir, 'wsl.conf.orig');
-        if (!fs.existsSync(origPath) && !fs.existsSync(`${origPath}.absent`)) {
-          writeReadOnlyBackup(origPath, wslConfContent);
-        }
-        writeReadOnlyBackup(path.join(backupDir, `wsl.conf.${ts}.bak`), wslConfContent);
+        const res = writeDeduplicatedReadOnlyBackup({
+          backupDir,
+          origFileName: 'wsl.conf.orig',
+          rollingPrefix: 'wsl.conf',
+          rollingExt: 'bak',
+          timestamp: ts,
+          content: wslConfContent,
+          maxRolling: 5,
+        });
+        savedFiles.push(...res.savedPaths);
       } else {
         const absentPath = path.join(backupDir, 'wsl.conf.orig.absent');
         if (!fs.existsSync(absentPath) && !fs.existsSync(path.join(backupDir, 'wsl.conf.orig'))) {
-          writeReadOnlyBackup(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`);
+          fs.writeFileSync(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`, { mode: 0o400 });
+          try { fs.chmodSync(absentPath, 0o400); } catch { /* best effort */ }
+          savedFiles.push(absentPath);
         }
       }
 
       if (fs.existsSync('/etc/fstab')) {
         fstabContent = fs.readFileSync('/etc/fstab', 'utf8');
-        const origFstab = path.join(backupDir, 'fstab.orig');
-        if (!fs.existsSync(origFstab)) {
-          writeReadOnlyBackup(origFstab, fstabContent);
-        }
-        writeReadOnlyBackup(path.join(backupDir, `fstab.${ts}.bak`), fstabContent);
+        const res = writeDeduplicatedReadOnlyBackup({
+          backupDir,
+          origFileName: 'fstab.orig',
+          rollingPrefix: 'fstab',
+          rollingExt: 'bak',
+          timestamp: ts,
+          content: fstabContent,
+          maxRolling: 5,
+        });
+        savedFiles.push(...res.savedPaths);
       }
 
       if (fs.existsSync('/proc/mounts')) {
@@ -488,7 +532,16 @@ async function handleRequest(req            )                   {
             .split('\n')
             .filter((line) => /drvfs|9p|\/mnt\//.test(line))
             .join('\n');
-          writeReadOnlyBackup(path.join(backupDir, `drvfs-mounts.${ts}.txt`), drvfsMountsContent + '\n');
+          const res = writeDeduplicatedReadOnlyBackup({
+            backupDir,
+            origFileName: 'drvfs-mounts.orig.txt',
+            rollingPrefix: 'drvfs-mounts',
+            rollingExt: 'txt',
+            timestamp: ts,
+            content: drvfsMountsContent + '\n',
+            maxRolling: 5,
+          });
+          savedFiles.push(...res.savedPaths);
         } catch {
           // ignore unreadable /proc/mounts
         }

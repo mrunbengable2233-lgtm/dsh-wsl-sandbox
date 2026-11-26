@@ -95,6 +95,7 @@ export function buildHostNodeChildEnv(
 export const WSL_SHARED_NODE_REL_DIRS                    = [
   '.dsh/runtime/bin',
   '.local/share/dsh/node/bin',
+  '.local/share/dsh-wsl-sandbox/toolchains/node/bin',
   '.local/share/mise/shims',
   '.local/bin',
   '.nvm/current/bin',

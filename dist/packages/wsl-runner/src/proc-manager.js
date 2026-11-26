@@ -12,6 +12,7 @@ import {
                       
   sanitizeSandboxEnv,
 } from '../../core/src/index.js';
+import { resolveEphemeralRamTmpRoot } from './hygiene.js';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_GRACE_MS = 2_000;
@@ -225,8 +226,10 @@ export class ConfinedProcManager {
                    spillDir        ;
 
   constructor(baseTempDir         ) {
-    this.runtimeDir = baseTempDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wsl-runner-'));
+    this.runtimeDir =
+      baseTempDir ?? fs.mkdtempSync(path.join(resolveEphemeralRamTmpRoot(), 'dsh-wsl-runner-'));
     fs.mkdirSync(this.runtimeDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(this.runtimeDir, 'owner.pid'), `${process.pid}\n`, { mode: 0o600 });
     this.emptyMaskFile = path.join(this.runtimeDir, 'empty-mask');
     fs.writeFileSync(this.emptyMaskFile, '', { mode: 0o444 });
     this.spillDir = path.join(this.runtimeDir, 'spills');
@@ -334,6 +337,13 @@ export class ConfinedProcManager {
       } catch {
         // ignore
       }
+    }
+    try {
+      if (fs.existsSync(this.emptyMaskFile)) {
+        fs.chmodSync(this.emptyMaskFile, 0o600);
+      }
+    } catch {
+      // ignore
     }
     fs.rmSync(this.runtimeDir, { recursive: true, force: true });
   }

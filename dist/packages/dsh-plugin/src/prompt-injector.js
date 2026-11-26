@@ -87,6 +87,9 @@ export function registerWslPromptSection(
   return undefined;
 }
 
+const AGENTS_MD_BLOCK_RE =
+  /[ \t]*<!--\s*dsh-wsl-sandbox:(?:start|begin)\s*-->[\s\S]*?<!--\s*dsh-wsl-sandbox:end\s*-->[ \t]*\r?\n?/g;
+
 /**
  * Cleanly inserts or updates the `dsh-wsl-sandbox` WSL-first routing block inside `<projectRoot>/AGENTS.md`
  * without altering any user-authored sections outside the markers.
@@ -105,13 +108,10 @@ export function upsertAgentsMdWslSection(
   }
 
   const existing = fs.readFileSync(filePath, 'utf8');
-  const startIdx = existing.indexOf(AGENTS_MD_START_MARKER);
-  const endIdx = existing.indexOf(AGENTS_MD_END_MARKER);
-
-  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-    const before = existing.slice(0, startIdx);
-    const after = existing.slice(endIdx + AGENTS_MD_END_MARKER.length);
-    fs.writeFileSync(filePath, `${before}${block}${after}`, 'utf8');
+  if (AGENTS_MD_BLOCK_RE.test(existing)) {
+    AGENTS_MD_BLOCK_RE.lastIndex = 0;
+    const updated = existing.replace(AGENTS_MD_BLOCK_RE, `${block}\n`);
+    fs.writeFileSync(filePath, updated, 'utf8');
     return { filePath, action: 'updated' };
   }
 
@@ -119,3 +119,45 @@ export function upsertAgentsMdWslSection(
   fs.writeFileSync(filePath, `${existing}${sep}${block}\n`, 'utf8');
   return { filePath, action: 'appended' };
 }
+
+/**
+ * Cleanly removes the `dsh-wsl-sandbox` block from `<projectRoot>/AGENTS.md` (or a direct `AGENTS.md` file path).
+ * If the remaining file only contains the default `# Project Agent Instructions` scaffold (or whitespace),
+ * deletes the empty `AGENTS.md` file completely so zero residual file is left behind on uninstall.
+ */
+export function removeAgentsMdWslSection(
+  projectRootOrFile        ,
+)   
+                   
+                                                                               
+  {
+  const filePath =
+    path.basename(projectRootOrFile).toLowerCase() === 'agents.md'
+      ? projectRootOrFile
+      : path.join(projectRootOrFile, 'AGENTS.md');
+
+  if (!fs.existsSync(filePath)) {
+    return { filePath, action: 'not-found' };
+  }
+
+  const existing = fs.readFileSync(filePath, 'utf8');
+  AGENTS_MD_BLOCK_RE.lastIndex = 0;
+  if (!AGENTS_MD_BLOCK_RE.test(existing)) {
+    return { filePath, action: 'unchanged' };
+  }
+
+  AGENTS_MD_BLOCK_RE.lastIndex = 0;
+  const stripped = existing
+    .replace(AGENTS_MD_BLOCK_RE, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  if (stripped === '' || stripped === '# Project Agent Instructions') {
+    fs.rmSync(filePath, { force: true });
+    return { filePath, action: 'deleted-empty-file' };
+  }
+
+  fs.writeFileSync(filePath, `${stripped}\n`, 'utf8');
+  return { filePath, action: 'removed-section' };
+}
+

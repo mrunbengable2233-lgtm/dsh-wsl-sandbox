@@ -403,6 +403,18 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
                 <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="saveAdvNet()">保存高级网络</button>
               </div>
             </div>
+            <div>
+              <b>4. 落盘足迹清单、包缓存清理与一键可逆卸载</b>
+              <div style="font-size:12px;color:var(--text-secondary);margin-top:4px">
+                无需翻查安装日志，实时查看宿主与 WSL 2 侧全部落盘目录体积，一键清空 <span class="dsh-wsl-sbx-mono">~/.cache/dsh-wsl-sandbox</span> 工作区包缓存或移除 <span class="dsh-wsl-sbx-mono">AGENTS.md</span> 注入块。彻底卸载请运行：<span class="dsh-wsl-sbx-mono">.\\packages\\bootstrap\\uninstall-dsh-plugin.ps1 [-DryRun] [-PurgeToolchains]</span>
+              </div>
+              <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+                <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="loadFootprint()">查看落盘足迹清单</button>
+                <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="purgeSandboxCache()">清空沙箱包缓存与残留临时目录</button>
+                <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="removeAgentsMdBlock()">移除工作区 AGENTS.md 注入块</button>
+              </div>
+              <pre id="footprintBox" class="dsh-wsl-sbx-mono" style="display:none;margin-top:8px;padding:10px;background:#0f1012;border:1px solid var(--border-subtle);border-radius:6px;font-size:11.5px;white-space:pre-wrap;max-height:220px;overflow:auto"></pre>
+            </div>
           </div>
         </details>
       </section>
@@ -769,6 +781,21 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
       });
       msg(r.ok ? '已更新高级网络白名单。' : ('拦截: ' + (r.error && r.error.message)));
       loadStatus();
+    }
+    async function loadFootprint() {
+      const box = document.getElementById('footprintBox');
+      box.style.display = 'block';
+      box.textContent = '正在扫描宿主机与 WSL 2 落盘足迹...';
+      const r = await api('GET', '/wsl-sandbox/api/footprint');
+      box.textContent = r.ok ? JSON.stringify({ host: r.host, wsl: r.wsl, uninstallCommands: r.uninstallCommands }, null, 2) : ('读取失败: ' + (r.error && r.error.message));
+    }
+    async function purgeSandboxCache() {
+      const r = await api('POST', '/wsl-sandbox/api/cache/purge', {});
+      msg(r.ok ? ('已清理沙箱缓存目录 (' + (r.clearedEntries || 0) + ' 项) 与孤儿临时目录 (' + ((r.sweptTempDirs && r.sweptTempDirs.length) || 0) + ' 项)。') : ('清理失败: ' + (r.error && r.error.message)));
+    }
+    async function removeAgentsMdBlock() {
+      const r = await api('DELETE', '/wsl-sandbox/api/agents-md', {});
+      msg(r.ok ? ('AGENTS.md 处理结果: ' + r.action + ' (' + r.filePath + ')') : ('移除失败: ' + (r.error && r.error.message)));
     }
     async function runDoc() {
       document.getElementById('docBox').textContent = '正在执行内核隔离与当前档位工具链自检...';

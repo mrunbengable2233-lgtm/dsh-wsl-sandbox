@@ -28,13 +28,15 @@ ACTION="provision"
 CUSTOM_BACKUP_DIR=""
 OPEN_BACKUP_EXPLORER="false"
 UPGRADE_NODE="false"
+PURGE_TOOLCHAINS="false"
+SKIP_RESTORE_ON_UNINSTALL="false"
 
 usage() {
   cat <<'EOF'
 Usage: provision-wsl.sh [options]
   --profile core|standard|universal   Toolchain profile (default: standard)
                                         core      (~350MB): sandbox base + Codex CLI + C/C++ base + system python3
-                                                            + shared Node (>=22) or Node 24 LTS
+                                                            + shared Node (>=22) or verified prebuilt Node 24 LTS
                                         standard  (~1.2GB): core + ccache/proto + mise + uv + pytest/ruff/mypy/pyright/black
                                                             + pnpm/yarn/bun/ts/eslint/prettier + Go + golangci-lint + Rust minimal
                                         universal (~3.5GB): standard + clang/bazelisk + mise Node 22 & 24 LTS + poetry/isort
@@ -44,13 +46,16 @@ Usage: provision-wsl.sh [options]
   --step    all|base|cli|node|python|go|rust|go-rust|extra
                                       Run one idempotent step or all steps (default: all)
   --upgrade-node                      Upgrade existing Node 22.x in WSL to Node 24 Active LTS (default reuses >=22)
-  --backup-configs                    Snapshot original /etc/wsl.conf, /etc/fstab & mounts (read-only 0400)
+  --backup-configs                    Snapshot original /etc/wsl.conf, /etc/fstab & mounts (read-only 0400, SHA-256 deduped)
   --backup-dir <path>                 Custom backup directory (Linux path or Windows path like D:\Backups\WSL)
   --open-backup-dir                   Open the backup directory in native Windows Explorer
   --disable-automount                 Back up /etc/wsl.conf and set [automount] enabled = false
                                       (Note: shared with WSL Settings & WSL Manager; apply via `wsl.exe --terminate <Distro>`)
   --restore-configs                   Restore original /etc/wsl.conf & package mirror sources from backup
-  --dry-run                           Print planned profile commands without modifying the system
+  --uninstall                         Restore configs, strip shell hooks, and remove all WSL plugin state/runner/caches/temp dirs
+  --purge-toolchains                  With --uninstall: also remove packages & toolchains recorded as newly installed in provision-manifest.json
+  --skip-restore                      With --uninstall: skip restoring /etc/wsl.conf & APT mirror sources
+  --dry-run                           Print planned actions without modifying the system
   -h, --help                          Show this help
 EOF
 }
@@ -67,6 +72,9 @@ while [[ $# -gt 0 ]]; do
     --open-backup-dir)   OPEN_BACKUP_EXPLORER="true"; shift ;;
     --disable-automount) ACTION="disable-automount"; shift ;;
     --restore-configs)   ACTION="restore"; shift ;;
+    --uninstall)         ACTION="uninstall"; shift ;;
+    --purge-toolchains)  PURGE_TOOLCHAINS="true"; shift ;;
+    --skip-restore)      SKIP_RESTORE_ON_UNINSTALL="true"; shift ;;
     --dry-run) DRY_RUN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[ERROR] Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -121,6 +129,7 @@ fi
 CURRENT_WSL_DISTRO="${WSL_DISTRO_NAME:-<YourDistro>}"
 
 CONFIG_ROOT="$HOME/.config/dsh-wsl-sandbox"
+MANIFEST_FILE="$CONFIG_ROOT/provision-manifest.json"
 BACKUP_DIR="$CONFIG_ROOT/backups"
 if [[ -n "$CUSTOM_BACKUP_DIR" ]]; then
   if [[ "$CUSTOM_BACKUP_DIR" =~ ^([A-Za-z]):[\\/](.*)$ ]]; then
@@ -168,11 +177,61 @@ write_readonly_text() {
   chmod 400 "$dest"
 }
 
+file_sha256() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" 2>/dev/null | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" 2>/dev/null | awk '{print $1}'
+  else
+    wc -c < "$f" 2>/dev/null | tr -d ' '
+  fi
+}
+
+# Writes `.orig` once (0400), skips creating duplicate `.bak` if SHA-256 matches latest snapshot,
+# and rotates rolling `.bak` snapshots to at most 5 (unlocking 0400 before deleting old `.bak`).
+save_deduped_backup_series() {
+  local src_file="$1"
+  local orig_name="$2"
+  local prefix="$3"
+  local ext="$4"
+  local ts="$5"
+  local orig_path="$BACKUP_DIR/$orig_name"
+
+  if [[ ! -f "$orig_path" ]]; then
+    save_readonly_file "$src_file" "$orig_path"
+    echo "[backup] Saved pristine read-only $orig_name -> $orig_path"
+  fi
+
+  local latest_rolling=""
+  latest_rolling="$(ls -1 "$BACKUP_DIR/${prefix}."*".""$ext" 2>/dev/null | grep -v -F "/$orig_name" | sort | tail -n 1 || true)"
+  local compare_file="${latest_rolling:-$orig_path}"
+
+  if [[ -f "$compare_file" ]]; then
+    local cur_hash prev_hash
+    cur_hash="$(file_sha256 "$src_file")"
+    prev_hash="$(file_sha256 "$compare_file")"
+    if [[ -n "$cur_hash" && "$cur_hash" == "$prev_hash" ]]; then
+      return 0
+    fi
+  fi
+
+  save_readonly_file "$src_file" "$BACKUP_DIR/${prefix}.${ts}.${ext}"
+
+  # Keep at most 5 rolling snapshots (never touch .orig)
+  local old_file
+  while IFS= read -r old_file; do
+    [[ -z "$old_file" ]] && continue
+    chmod u+w "$old_file" 2>/dev/null || true
+    rm -f "$old_file" 2>/dev/null || true
+  done < <(ls -1 "$BACKUP_DIR/${prefix}."*".""$ext" 2>/dev/null | grep -v -F "/$orig_name" | sort -r | tail -n +6 || true)
+}
+
 backup_original_wsl_configs() {
   local ts
   ts="$(date +%Y%m%d-%H%M%S)"
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] mkdir -p -m 700 $BACKUP_DIR && snapshot /etc/wsl.conf, /etc/fstab, /proc/mounts (read-only 0400)"
+    echo "[dry-run] mkdir -p -m 700 $BACKUP_DIR && snapshot /etc/wsl.conf, /etc/fstab, /proc/mounts (read-only 0400, SHA-256 deduplicated)"
     return 0
   fi
   mkdir -p "$CONFIG_ROOT"
@@ -181,11 +240,7 @@ backup_original_wsl_configs() {
   chmod 700 "$BACKUP_DIR"
 
   if [[ -f /etc/wsl.conf ]]; then
-    if [[ ! -f "$BACKUP_DIR/wsl.conf.orig" && ! -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
-      save_readonly_file /etc/wsl.conf "$BACKUP_DIR/wsl.conf.orig"
-      echo "[backup] Saved pristine read-only /etc/wsl.conf -> $BACKUP_DIR/wsl.conf.orig"
-    fi
-    save_readonly_file /etc/wsl.conf "$BACKUP_DIR/wsl.conf.${ts}.bak"
+    save_deduped_backup_series /etc/wsl.conf "wsl.conf.orig" "wsl.conf" "bak" "$ts"
   else
     if [[ ! -f "$BACKUP_DIR/wsl.conf.orig" && ! -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
       write_readonly_text "$BACKUP_DIR/wsl.conf.orig.absent" "# /etc/wsl.conf did not exist prior to dsh-wsl-sandbox setup (${ts})"
@@ -194,16 +249,14 @@ backup_original_wsl_configs() {
   fi
 
   if [[ -f /etc/fstab ]]; then
-    [[ ! -f "$BACKUP_DIR/fstab.orig" ]] && save_readonly_file /etc/fstab "$BACKUP_DIR/fstab.orig"
-    save_readonly_file /etc/fstab "$BACKUP_DIR/fstab.${ts}.bak"
+    save_deduped_backup_series /etc/fstab "fstab.orig" "fstab" "bak" "$ts"
   fi
 
   if [[ -r /proc/mounts ]]; then
     local mount_tmp
     mount_tmp="$(mktemp)"
     grep -E 'drvfs|9p|/mnt/' /proc/mounts > "$mount_tmp" 2>/dev/null || true
-    save_readonly_file "$mount_tmp" "$BACKUP_DIR/drvfs-mounts.${ts}.txt"
-    [[ ! -f "$BACKUP_DIR/drvfs-mounts.orig.txt" ]] && save_readonly_file "$mount_tmp" "$BACKUP_DIR/drvfs-mounts.orig.txt"
+    save_deduped_backup_series "$mount_tmp" "drvfs-mounts.orig.txt" "drvfs-mounts" "txt" "$ts"
     rm -f "$mount_tmp"
   fi
 }
@@ -258,20 +311,27 @@ EOF
 }
 
 restore_original_wsl_configs() {
+  local remove_apt_bak="${1:-false}"
   echo "=== [restore] Restoring original WSL configuration from $BACKUP_DIR ==="
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "[dry-run] Restore /etc/wsl.conf and package mirror sources from $BACKUP_DIR"
     return 0
   fi
   if [[ -f "$BACKUP_DIR/wsl.conf.orig" ]]; then
-    sudo cp "$BACKUP_DIR/wsl.conf.orig" /etc/wsl.conf
-    sudo chmod 644 /etc/wsl.conf
-    echo "[ok] Restored /etc/wsl.conf from $BACKUP_DIR/wsl.conf.orig"
+    if ! cmp -s "$BACKUP_DIR/wsl.conf.orig" /etc/wsl.conf 2>/dev/null; then
+      sudo cp "$BACKUP_DIR/wsl.conf.orig" /etc/wsl.conf
+      sudo chmod 644 /etc/wsl.conf
+      echo "[ok] Restored /etc/wsl.conf from $BACKUP_DIR/wsl.conf.orig"
+    else
+      echo "[ok] /etc/wsl.conf already matches pristine $BACKUP_DIR/wsl.conf.orig"
+    fi
   elif [[ -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
-    sudo rm -f /etc/wsl.conf
-    echo "[ok] Removed /etc/wsl.conf (system originally had no /etc/wsl.conf)"
+    if [[ -f /etc/wsl.conf ]]; then
+      sudo rm -f /etc/wsl.conf
+      echo "[ok] Removed /etc/wsl.conf (system originally had no /etc/wsl.conf)"
+    fi
   else
-    echo "[warn] No backup marker found in $BACKUP_DIR; /etc/wsl.conf left untouched."
+    echo "[info] No /etc/wsl.conf backup marker found in $BACKUP_DIR; left untouched."
   fi
 
   local src
@@ -279,9 +339,168 @@ restore_original_wsl_configs() {
     if [[ -f "${src}.bak" ]]; then
       sudo cp "${src}.bak" "$src"
       echo "[ok] Restored $src from ${src}.bak"
+      if [[ "$remove_apt_bak" == "true" ]]; then
+        sudo rm -f "${src}.bak"
+      fi
     fi
   done
   echo "[next] Run 'wsl.exe --terminate ${CURRENT_WSL_DISTRO}' in Windows PowerShell if /etc/wsl.conf was changed (avoids killing other distros)."
+}
+
+uninstall_wsl_sandbox() {
+  echo "=== [uninstall] Removing dsh-wsl-sandbox WSL artifacts (purgeToolchains=${PURGE_TOOLCHAINS}, dryRun=${DRY_RUN}) ==="
+
+  if [[ "$SKIP_RESTORE_ON_UNINSTALL" != "true" ]]; then
+    restore_original_wsl_configs "true"
+  fi
+
+  # 1. Strip shell RC hooks & remove ~/.dsh-wsl-env.sh
+  local rc
+  for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
+    if [[ -f "$rc" ]] && grep -Fq '.dsh-wsl-env.sh' "$rc"; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[dry-run] Strip .dsh-wsl-env.sh source line from $rc"
+      else
+        local tmp_rc
+        tmp_rc="$(mktemp)"
+        grep -Fv '.dsh-wsl-env.sh' "$rc" > "$tmp_rc" || true
+        cat "$tmp_rc" > "$rc"
+        rm -f "$tmp_rc"
+        echo "[ok] Cleaned shell hook from $rc"
+      fi
+    fi
+  done
+
+  if [[ -f "$HOME/.dsh-wsl-env.sh" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+      echo "[dry-run] Remove $HOME/.dsh-wsl-env.sh"
+    else
+      rm -f "$HOME/.dsh-wsl-env.sh"
+      echo "[ok] Removed $HOME/.dsh-wsl-env.sh"
+    fi
+  fi
+
+  # 2. Optional toolchain delta rollback (from $MANIFEST_FILE)
+  if [[ "$PURGE_TOOLCHAINS" == "true" ]]; then
+    if [[ -f "$MANIFEST_FILE" ]]; then
+      echo "[uninstall] Rolling back newly installed toolchains & packages recorded in $MANIFEST_FILE ..."
+      local uv_tools=() npm_globals=() created_paths=() installed_pkgs=()
+      while IFS= read -r line; do [[ -n "$line" ]] && uv_tools+=("$line"); done < <(grep -o '"uv:[^"]*"' "$MANIFEST_FILE" 2>/dev/null | sed 's/"uv://;s/"$//' || true)
+      while IFS= read -r line; do [[ -n "$line" ]] && npm_globals+=("$line"); done < <(grep -o '"npm:[^"]*"' "$MANIFEST_FILE" 2>/dev/null | sed 's/"npm://;s/"$//' || true)
+      while IFS= read -r line; do [[ -n "$line" ]] && created_paths+=("$line"); done < <(grep -o '"path:[^"]*"' "$MANIFEST_FILE" 2>/dev/null | sed 's/"path://;s/"$//' || true)
+      while IFS= read -r line; do [[ -n "$line" ]] && installed_pkgs+=("$line"); done < <(grep -o '"pkg:[^"]*"' "$MANIFEST_FILE" 2>/dev/null | sed 's/"pkg://;s/"$//' || true)
+
+      if [[ ${#uv_tools[@]} -gt 0 ]] && command -v uv >/dev/null 2>&1; then
+        for t in "${uv_tools[@]}"; do
+          if [[ "$DRY_RUN" == "true" ]]; then echo "[dry-run] uv tool uninstall $t"; else uv tool uninstall "$t" 2>/dev/null || true; fi
+        done
+      fi
+      if [[ ${#npm_globals[@]} -gt 0 ]] && command -v npm >/dev/null 2>&1; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "[dry-run] npm uninstall -g --prefix $HOME/.local ${npm_globals[*]}"
+        else
+          npm uninstall -g --prefix "$HOME/.local" "${npm_globals[@]}" 2>/dev/null || true
+        fi
+      fi
+      for p in "${created_paths[@]}"; do
+        if [[ -e "$p" || -L "$p" ]]; then
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "[dry-run] Remove newly installed toolchain path: $p"
+          elif [[ "$p" == /usr/local/* || "$p" == /etc/* ]]; then
+            sudo rm -rf "$p"
+            echo "[ok] Removed $p"
+          else
+            chmod -R u+w "$p" 2>/dev/null || true
+            rm -rf "$p"
+            echo "[ok] Removed $p"
+          fi
+        fi
+      done
+      if [[ ${#installed_pkgs[@]} -gt 0 ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "[dry-run] Uninstall ${#installed_pkgs[@]} delta OS packages (${PKG_MGR}): ${installed_pkgs[*]}"
+        else
+          case "$PKG_MGR" in
+            apt)    sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove "${installed_pkgs[@]}" || true ;;
+            dnf)    sudo dnf remove -y "${installed_pkgs[@]}" || true ;;
+            pacman) sudo pacman -Rns --noconfirm "${installed_pkgs[@]}" || true ;;
+            zypper) sudo zypper --non-interactive remove "${installed_pkgs[@]}" || true ;;
+            apk)    sudo apk del "${installed_pkgs[@]}" || true ;;
+          esac
+        fi
+      fi
+    else
+      echo "[info] $MANIFEST_FILE not found (was provision-wsl.sh run on v0.1.0 or skipped?); skipping automatic OS package purge."
+    fi
+
+    # Also clean legacy v0.1.0 NodeSource APT repo/keyring if present
+    for legacy_ns in /etc/apt/sources.list.d/nodesource.list /etc/apt/keyrings/nodesource.gpg /usr/share/keyrings/nodesource.gpg; do
+      if [[ -f "$legacy_ns" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "[dry-run] Remove legacy NodeSource file: $legacy_ns"
+        else
+          sudo rm -f "$legacy_ns"
+          echo "[ok] Removed legacy NodeSource file: $legacy_ns"
+        fi
+      fi
+    done
+  fi
+
+  # 3. Sweep runtime temp dirs across /run/user/<uid>, /dev/shm, and /tmp (unlocking 0444 empty-mask first)
+  local tmp_base d
+  for tmp_base in "/run/user/$(id -u)" "/dev/shm" "/tmp"; do
+    [[ -d "$tmp_base" ]] || continue
+    for d in "$tmp_base"/dsh-wsl-runner-* "$tmp_base"/dsh-wsl-proxy-*; do
+      [[ -e "$d" ]] || continue
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[dry-run] Remove runtime temp dir: $d"
+      else
+        chmod -R u+w "$d" 2>/dev/null || true
+        rm -rf "$d" 2>/dev/null || true
+      fi
+    done
+  done
+
+  # 4. Remove workspace caches (~/.cache/dsh-wsl-sandbox) & staged runner/toolchains (~/.local/share/dsh-wsl-sandbox)
+  local plugin_dir
+  for plugin_dir in "$HOME/.cache/dsh-wsl-sandbox" "$HOME/.local/share/dsh-wsl-sandbox" "$CONFIG_ROOT"; do
+    if [[ -e "$plugin_dir" ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[dry-run] Unlock read-only files & remove directory: $plugin_dir"
+      else
+        chmod -R u+w "$plugin_dir" 2>/dev/null || true
+        rm -rf "$plugin_dir"
+        echo "[ok] Removed $plugin_dir"
+      fi
+    fi
+  done
+
+  # Clean isolated Node symlinks in ~/.dsh/runtime/bin if broken after removing ~/.local/share/dsh-wsl-sandbox
+  if [[ -d "$HOME/.dsh/runtime/bin" ]]; then
+    local link
+    for link in "$HOME/.dsh/runtime/bin"/*; do
+      if [[ -L "$link" && ! -e "$link" ]]; then
+        [[ "$DRY_RUN" == "true" ]] && echo "[dry-run] Remove broken symlink $link" || rm -f "$link"
+      fi
+    done
+    [[ "$DRY_RUN" != "true" ]] && rmdir "$HOME/.dsh/runtime/bin" "$HOME/.dsh/runtime" 2>/dev/null || true
+  fi
+
+  # 5. Remove default ~/workspace ONLY if completely empty (never delete user files!)
+  if [[ -d "$HOME/workspace" ]]; then
+    if [[ -z "$(ls -A "$HOME/workspace" 2>/dev/null)" ]]; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[dry-run] Remove empty default workspace directory: $HOME/workspace"
+      else
+        rmdir "$HOME/workspace" 2>/dev/null || true
+        echo "[ok] Removed empty $HOME/workspace"
+      fi
+    else
+      echo "[keep] Preserved non-empty $HOME/workspace (contains user files)."
+    fi
+  fi
+
+  echo "[ok] WSL-side dsh-wsl-sandbox uninstall complete."
 }
 
 if [[ "$ACTION" == "backup" ]]; then
@@ -297,6 +516,9 @@ elif [[ "$ACTION" == "disable-automount" ]]; then
   exit 0
 elif [[ "$ACTION" == "restore" ]]; then
   restore_original_wsl_configs
+  exit 0
+elif [[ "$ACTION" == "uninstall" ]]; then
+  uninstall_wsl_sandbox
   exit 0
 fi
 
@@ -358,8 +580,75 @@ pkg_update() {
   esac
 }
 
+is_os_pkg_installed() {
+  local pkg="$1"
+  case "$PKG_MGR" in
+    apt)    dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed" ;;
+    dnf)    rpm -q "$pkg" >/dev/null 2>&1 ;;
+    pacman) pacman -Qi "$pkg" >/dev/null 2>&1 ;;
+    zypper) rpm -q "$pkg" >/dev/null 2>&1 ;;
+    apk)    apk info -e "$pkg" >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+
+record_manifest_entries() {
+  if [[ "$DRY_RUN" == "true" || $# -eq 0 ]]; then
+    return 0
+  fi
+  mkdir -p "$CONFIG_ROOT"
+  chmod 700 "$CONFIG_ROOT"
+  local existing=()
+  if [[ -f "$MANIFEST_FILE" ]]; then
+    while IFS= read -r item; do
+      [[ -n "$item" ]] && existing+=("$item")
+    done < <(grep -o '"[^"]*:[^"]*"' "$MANIFEST_FILE" 2>/dev/null | tr -d '"' || true)
+  fi
+  local item seen
+  for item in "$@"; do
+    seen="false"
+    local ex
+    for ex in "${existing[@]:-}"; do
+      if [[ "$ex" == "$item" ]]; then seen="true"; break; fi
+    done
+    [[ "$seen" == "false" ]] && existing+=("$item")
+  done
+
+  local now_iso
+  now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  {
+    printf '{\n'
+    printf '  "updatedAt": "%s",\n' "$now_iso"
+    printf '  "profile": "%s",\n' "$PROFILE"
+    printf '  "pkgManager": "%s",\n' "$PKG_MGR"
+    printf '  "deltaEntries": [\n'
+    local idx=0 total=${#existing[@]}
+    for item in "${existing[@]:-}"; do
+      idx=$((idx + 1))
+      if [[ $idx -lt $total ]]; then
+        printf '    "%s",\n' "$item"
+      else
+        printf '    "%s"\n' "$item"
+      fi
+    done
+    printf '  ]\n'
+    printf '}\n'
+  } > "$MANIFEST_FILE"
+  chmod 600 "$MANIFEST_FILE"
+}
+
 pkg_install() {
   if [[ $# -eq 0 ]]; then return 0; fi
+  local newly_requested=()
+  if [[ "$DRY_RUN" != "true" ]]; then
+    local p
+    for p in "$@"; do
+      if ! is_os_pkg_installed "$p"; then
+        newly_requested+=("pkg:$p")
+      fi
+    done
+  fi
+
   case "$PKG_MGR" in
     apt)
       run_cmd sudo env DEBIAN_FRONTEND=noninteractive \
@@ -388,6 +677,10 @@ pkg_install() {
       exit 1
       ;;
   esac
+
+  if [[ ${#newly_requested[@]} -gt 0 ]]; then
+    record_manifest_entries "${newly_requested[@]}"
+  fi
 }
 
 persist_profile_and_env() {
@@ -419,7 +712,7 @@ EOF
 # Managed by dsh-wsl-sandbox provision-wsl.sh (profile=${PROFILE}, mirror=${MIRROR})
 export DSH_WSL_PROFILE="${PROFILE}"
 export DSH_WSL_MIRROR="${MIRROR}"
-export PATH="\$HOME/.dsh/runtime/bin:\$HOME/.local/share/dsh/node/bin:\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.nvm/current/bin:\$HOME/.volta/bin:\$HOME/.cargo/bin:\$HOME/.bun/bin:/usr/local/go/bin:\$PATH"
+export PATH="\$HOME/.dsh/runtime/bin:\$HOME/.local/share/dsh/node/bin:\$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.nvm/current/bin:\$HOME/.volta/bin:\$HOME/.cargo/bin:\$HOME/.bun/bin:/usr/local/go/bin:\$PATH"
 EOF
 
   if [[ "$MIRROR" == "cn" ]]; then
@@ -512,6 +805,7 @@ find_shared_wsl_node() {
   local search_dirs=(
     "$HOME/.dsh/runtime/bin"
     "$HOME/.local/share/dsh/node/bin"
+    "$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin"
     "$HOME/.local/share/mise/shims"
     "$HOME/.local/bin"
     "$HOME/.nvm/current/bin"
@@ -540,6 +834,55 @@ find_shared_wsl_node() {
     fi
   done
   return 1
+}
+
+# Installs official prebuilt Node.js 24 Active LTS into $HOME/.local/share/dsh-wsl-sandbox/toolchains/node
+# verified via official SHASUMS256.txt — ZERO `curl | sudo bash`, ZERO root APT repo/keyring pollution!
+install_verified_prebuilt_node24() {
+  local node_arch="x64"
+  [[ "$ARCH" == "aarch64" ]] && node_arch="arm64"
+  local dist_base="https://nodejs.org/dist/latest-v24.x"
+  [[ "$MIRROR" == "cn" ]] && dist_base="https://npmmirror.com/mirrors/node/latest-v24.x"
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  curl -fsSL "${dist_base}/SHASUMS256.txt" -o "$tmp_dir/SHASUMS256.txt"
+  local tarball_line tarball_name expected_sha
+  tarball_line="$(grep -E "  node-v24\.[0-9]+\.[0-9]+-linux-${node_arch}\.tar\.xz$" "$tmp_dir/SHASUMS256.txt" | head -n 1)"
+  if [[ -z "$tarball_line" ]]; then
+    rm -rf "$tmp_dir"
+    echo "[ERROR] Failed to locate linux-${node_arch} tarball in ${dist_base}/SHASUMS256.txt" >&2
+    exit 1
+  fi
+  expected_sha="$(echo "$tarball_line" | awk '{print $1}')"
+  tarball_name="$(echo "$tarball_line" | awk '{print $2}')"
+
+  echo "[step:node] Downloading verified ${tarball_name} (SHA-256=${expected_sha:0:12}...)..."
+  curl -fsSL "${dist_base}/${tarball_name}" -o "$tmp_dir/${tarball_name}"
+  local actual_sha
+  actual_sha="$(file_sha256 "$tmp_dir/${tarball_name}")"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    rm -rf "$tmp_dir"
+    echo "[ERROR] SHA-256 mismatch for ${tarball_name}: expected ${expected_sha}, got ${actual_sha}" >&2
+    exit 1
+  fi
+
+  local dest_root="$HOME/.local/share/dsh-wsl-sandbox/toolchains/node"
+  rm -rf "$dest_root"
+  mkdir -p "$dest_root"
+  chmod 700 "$HOME/.local/share/dsh-wsl-sandbox" "$HOME/.local/share/dsh-wsl-sandbox/toolchains"
+  tar -xJf "$tmp_dir/${tarball_name}" --strip-components=1 -C "$dest_root"
+  rm -rf "$tmp_dir"
+
+  mkdir -p "$HOME/.dsh/runtime/bin" "$HOME/.local/bin"
+  for b in node npm npx corepack; do
+    if [[ -x "$dest_root/bin/$b" ]]; then
+      ln -sf "$dest_root/bin/$b" "$HOME/.dsh/runtime/bin/$b"
+      [[ ! -e "$HOME/.local/bin/$b" ]] && ln -sf "$dest_root/bin/$b" "$HOME/.local/bin/$b" && record_manifest_entries "path:$HOME/.local/bin/$b"
+    fi
+  done
+  record_manifest_entries "path:$dest_root"
+  echo "[step:node] Installed SHA-256 verified Node.js $("$dest_root/bin/node" -v) into $dest_root (zero root APT pollution)."
 }
 
 step_base() {
@@ -619,6 +962,7 @@ step_cli() {
   elif command -v fdfind >/dev/null 2>&1 && ! command -v fd >/dev/null 2>&1; then
     run_cmd mkdir -p "$HOME/.local/bin"
     run_cmd ln -sf "$(command -v fdfind)" "$HOME/.local/bin/fd"
+    record_manifest_entries "path:$HOME/.local/bin/fd"
   fi
 
   # 2. Standard & Universal layer (C/C++ extended headers)
@@ -652,6 +996,7 @@ step_cli() {
       curl -fsSL "$bazelisk_url" -o "$HOME/.local/bin/bazelisk"
       chmod +x "$HOME/.local/bin/bazelisk"
       ln -sf "$HOME/.local/bin/bazelisk" "$HOME/.local/bin/bazel"
+      record_manifest_entries "path:$HOME/.local/bin/bazelisk" "path:$HOME/.local/bin/bazel"
     else
       echo "[step:cli] bazelisk already installed: $(command -v bazelisk)"
     fi
@@ -677,33 +1022,19 @@ step_node() {
       if [[ "$DRY_RUN" != "true" ]] && ! command -v node >/dev/null 2>&1; then
         mkdir -p "$HOME/.local/bin"
         ln -sf "$shared_path" "$HOME/.local/bin/node"
+        record_manifest_entries "path:$HOME/.local/bin/node"
       fi
     fi
   fi
 
   if [[ "$need_node" == "true" ]]; then
     if [[ "$DRY_RUN" == "true" ]]; then
-      echo "[dry-run] Install prebuilt Node.js 24 Active LTS for ${PKG_MGR}"
+      echo "[dry-run] Install SHA-256 verified prebuilt Node.js 24 Active LTS into \$HOME/.local/share/dsh-wsl-sandbox/toolchains/node (zero root repo pollution)"
+    elif [[ "$PKG_MGR" == "apk" ]]; then
+      # Alpine uses musl libc rather than glibc tarballs
+      pkg_install nodejs npm
     else
-      case "$PKG_MGR" in
-        apt)
-          curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-          pkg_install nodejs
-          ;;
-        dnf)
-          curl -fsSL https://rpm.nodesource.com/setup_24.x | sudo -E bash -
-          pkg_install nodejs
-          ;;
-        pacman)
-          pkg_install nodejs npm
-          ;;
-        zypper)
-          pkg_install nodejs24 npm24 || pkg_install nodejs22 npm22 || pkg_install nodejs npm
-          ;;
-        apk)
-          pkg_install nodejs npm
-          ;;
-      esac
+      install_verified_prebuilt_node24
     fi
   fi
 
@@ -719,13 +1050,18 @@ step_node() {
     echo "[dry-run] Enable corepack (yarn/pnpm) and ensure global npm packages: pnpm yarn typescript eslint prettier"
     echo "[dry-run] Ensure prebuilt bun binary (https://bun.sh/install)"
   else
+    export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.bun/bin:$PATH"
     if ! command -v mise >/dev/null 2>&1; then
+      local had_mise_dir="false"
+      [[ -d "$HOME/.local/share/mise" ]] && had_mise_dir="true"
       curl -fsSL https://mise.run | sh
+      record_manifest_entries "path:$HOME/.local/bin/mise"
+      [[ "$had_mise_dir" == "false" ]] && record_manifest_entries "path:$HOME/.local/share/mise"
     fi
-    export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.bun/bin:$PATH"
 
     if command -v corepack >/dev/null 2>&1; then
-      sudo corepack enable 2>/dev/null || corepack enable --install-directory "$HOME/.local/bin" 2>/dev/null || true
+      mkdir -p "$HOME/.local/bin"
+      corepack enable --install-directory "$HOME/.local/bin" 2>/dev/null || true
     fi
 
     local npm_prefix="$HOME/.local"
@@ -738,10 +1074,17 @@ step_node() {
     command -v prettier >/dev/null 2>&1 || missing_npm_pkgs+=(prettier)
     if [[ ${#missing_npm_pkgs[@]} -gt 0 ]]; then
       npm install -g --prefix "$npm_prefix" "${missing_npm_pkgs[@]}"
+      local np
+      for np in "${missing_npm_pkgs[@]}"; do
+        record_manifest_entries "npm:$np"
+      done
     fi
 
     if ! command -v bun >/dev/null 2>&1; then
+      local had_bun="false"
+      [[ -d "$HOME/.bun" ]] && had_bun="true"
       curl -fsSL https://bun.sh/install | bash
+      [[ "$had_bun" == "false" ]] && record_manifest_entries "path:$HOME/.bun"
     fi
   fi
 
@@ -780,6 +1123,7 @@ step_python() {
     echo "[dry-run] Ensure prebuilt Astral uv binary (https://astral.sh/uv/install.sh)"
   elif ! command -v uv >/dev/null 2>&1; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
+    record_manifest_entries "path:$HOME/.local/bin/uv" "path:$HOME/.local/bin/uvx"
   fi
   export PATH="$HOME/.local/bin:$PATH"
 
@@ -793,6 +1137,7 @@ step_python() {
       echo "[dry-run] uv tool install ${t}"
     elif ! command -v "$t" >/dev/null 2>&1; then
       run_cmd uv tool install "$t"
+      record_manifest_entries "uv:$t"
     else
       echo "[step:python] ${t} already installed."
     fi
@@ -822,10 +1167,13 @@ step_go() {
   fi
 
   if ! command -v go >/dev/null 2>&1; then
+    local had_usr_go="false"
+    [[ -d /usr/local/go ]] && had_usr_go="true"
     curl -fsSL "${go_base}/${tarball}" -o "/tmp/${tarball}"
     sudo rm -rf /usr/local/go
     sudo tar -C /usr/local -xzf "/tmp/${tarball}"
     rm -f "/tmp/${tarball}"
+    [[ "$had_usr_go" == "false" ]] && record_manifest_entries "path:/usr/local/go"
   else
     echo "[step:go] Go already installed: $(go version)"
   fi
@@ -833,6 +1181,7 @@ step_go() {
   if ! command -v golangci-lint >/dev/null 2>&1; then
     mkdir -p "$HOME/.local/bin"
     curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$HOME/.local/bin"
+    record_manifest_entries "path:$HOME/.local/bin/golangci-lint"
   else
     echo "[step:go] golangci-lint already installed: $(golangci-lint --version | head -n 1)"
   fi
@@ -853,7 +1202,12 @@ step_rust() {
   fi
 
   if ! command -v rustc >/dev/null 2>&1; then
+    local had_rustup="false" had_cargo="false"
+    [[ -d "$HOME/.rustup" ]] && had_rustup="true"
+    [[ -d "$HOME/.cargo" ]] && had_cargo="true"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component rustfmt,clippy
+    [[ "$had_rustup" == "false" ]] && record_manifest_entries "path:$HOME/.rustup"
+    [[ "$had_cargo" == "false" ]] && record_manifest_entries "path:$HOME/.cargo"
   else
     echo "[step:rust] Rust already installed: $(rustc --version)"
   fi

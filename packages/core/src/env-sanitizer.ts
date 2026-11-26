@@ -70,6 +70,7 @@ export function buildDefaultSandboxPath(homeDir?: string): string {
   return [
     `${cleanHome}/.dsh/runtime/bin`,
     `${cleanHome}/.local/share/dsh/node/bin`,
+    `${cleanHome}/.local/share/dsh-wsl-sandbox/toolchains/node/bin`,
     `${cleanHome}/.local/share/mise/shims`,
     `${cleanHome}/.local/bin`,
     `${cleanHome}/.nvm/current/bin`,
