@@ -127,6 +127,21 @@ export function evaluateHostPosixBashOnWindows(command        )                 
       externalPaths: [],
     };
   }
+  if (
+    /\bpnputil(?:\.exe)?\b[^\n;|&]*(?:\/(?:add-driver|delete-driver|install|enable-device|disable-device|restart-device|remove-device)\b|\s-[adi]\b)|\b(?:devcon(?:\.exe)?\b[^\n;|&]*\b(?:install|update|remove|enable|disable|restart)\b|zadig(?:\.exe)?\b)/i.test(
+      command,
+    )
+  ) {
+    return {
+      decision: 'ask',
+      riskLevel: 'high',
+      reasons: ['Windows driver / PnP device mutation requires manual single-shot approval'],
+      unwrappedCommands: [['pnputil']],
+      touchesPhysicalDevice: true,
+      requiresSessionRuleBlocked: true,
+      externalPaths: [],
+    };
+  }
   return evaluateBashCommand(command, { workspaceRoot: '/host-workspace' });
 }
 
@@ -144,6 +159,7 @@ function evaluateByKind(kind               , command        )                   
                                              
                                                      
                                           
+                                                                       
  
 
 /**
@@ -173,6 +189,12 @@ export function registerHostPwshGuardHook(
 
       const verdict = evaluateByKind(kind, command);
       if (verdict?.decision === 'deny') {
+        options.logger?.log('warn', {
+          component: 'pwsh-guard',
+          event: 'pwshGuard.deny',
+          message: `Blocked host shell '${toolName}' at L0 monotonic guard: ${verdict.reasons.join('; ')}`,
+          data: { toolName, kind, riskLevel: verdict.riskLevel, reasons: verdict.reasons },
+        });
         return {
           reason: `Host shell command blocked by dsh-wsl-sandbox policy: ${verdict.reasons.join('; ')}`,
           info: {
@@ -220,6 +242,12 @@ export function registerHostPwshGuardHook(
         }
 
         if (verdict.decision === 'deny') {
+          options.logger?.log('warn', {
+            component: 'pwsh-guard',
+            event: 'pwshGuard.deny',
+            message: `Blocked host shell '${toolName}' at L0 pre-execute: ${verdict.reasons.join('; ')}`,
+            data: { toolName, kind, riskLevel: verdict.riskLevel, reasons: verdict.reasons },
+          });
           const message = `Host shell command blocked by dsh-wsl-sandbox L0 policy: ${verdict.reasons.join('; ')}`;
           if (isRealDshExec) {
             return {

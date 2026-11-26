@@ -1,30 +1,32 @@
 #!/usr/bin/env node
 /**
- * `dsh-wsl-doctor` — Real Kernel Isolation & Codex Toolchain Diagnostic CLI.
+ * `dsh-wsl-doctor` — Real Kernel Isolation, Config Masking, USB Driver & Codex Toolchain Diagnostic CLI.
  *
  * Verifies:
- * 1. OS & WSL 2 environment detection
+ * 1. OS, Linux distro (`/etc/os-release`), WSL 2 kernel detection & DrvFS automount status
  * 2. Non-root UID enforcement (blocks UID 0)
  * 3. Real `bwrap` execution, `--disable-userns` support
  * 4. Real `seccomp-bpf` kernel enforcement (`io_uring_setup` EPERM & `AF_VSOCK` EPERM)
- * 5. WSL 2 escape-surface masking self-test (`/mnt` and `/run/WSL` isolated via `--tmpfs`)
- * 6. 22-tool Codex matrix (required vs optional profile tools)
- * 7. Optional upstream proxy TCP reachability
+ * 5. Escape-surface & private config masking self-test (`/mnt`, `/run`, and `$HOME/.config/dsh-wsl-sandbox` / `$HOME/.dsh`)
+ * 6. Profile-aware Codex toolchain matrix (`core` / `standard` / `universal`, pure Node PATH resolver across mise/uv/cargo/bun/go)
+ * 7. WSL 2 kernel USBIP (`vhci_hcd`) & attached device node diagnostics (generic: phones, USB NICs, HID/CDC/serial)
+ * 8. Optional upstream proxy TCP reachability
  *
  * Usage:
- *   node packages/bootstrap/src/doctor.ts [--json] [--proxy http://127.0.0.1:7890] [--strict-wsl2]
+ *   dsh-wsl-doctor [--profile core|standard|universal] [--json] [--proxy http://127.0.0.1:7890] [--strict-wsl2]
  */
 
-import { execFileSync, spawnSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { compileSeccompBpf, type LinuxArch } from '../../core/src/index.ts';
+import { fileURLToPath } from 'node:url';
+import { compileSeccompBpf, type EnvironmentProfile, type LinuxArch } from '../../core/src/index.ts';
 
 export interface ToolProbe {
   readonly name: string;
-  readonly tier: 'mandatory' | 'core' | 'standard';
+  readonly tier: 'mandatory' | 'core' | 'standard' | 'universal';
   readonly present: boolean;
   readonly path?: string;
   readonly version?: string;
@@ -32,11 +34,16 @@ export interface ToolProbe {
 
 export interface DoctorReport {
   readonly timestamp: string;
+  readonly selectedProfile: EnvironmentProfile;
   readonly os: {
     readonly platform: string;
     readonly arch: string;
     readonly kernel: string;
     readonly isWsl2: boolean;
+    readonly wslDistroName?: string;
+    readonly distroId?: string;
+    readonly distroPrettyName?: string;
+    readonly drvfsAutomountActive: boolean;
   };
   readonly user: {
     readonly uid: number;
@@ -51,7 +58,16 @@ export interface DoctorReport {
     readonly seccompIoUringBlocked: boolean | null;
     readonly seccompAfVsockBlocked: boolean | null;
     readonly escapeMaskSelfTest: boolean;
+    readonly configMaskSelfTest: boolean;
+    readonly configDirPermsOk: boolean;
     readonly details: string[];
+  };
+  readonly hardware: {
+    readonly vhciHcdReady: boolean;
+    readonly lsusbPresent: boolean;
+    readonly usbBusNodesCount: number;
+    readonly serialAndHidNodes: string[];
+    readonly driverNote: string;
   };
   readonly tools: ToolProbe[];
   readonly network: {
@@ -66,7 +82,7 @@ const TOOL_MATRIX: ReadonlyArray<{
   readonly name: string;
   readonly binaries: readonly string[];
   readonly versionArgs: readonly string[];
-  readonly tier: 'mandatory' | 'core' | 'standard';
+  readonly tier: 'mandatory' | 'core' | 'standard' | 'universal';
 }> = [
   { name: 'bwrap', binaries: ['bwrap'], versionArgs: ['--version'], tier: 'mandatory' },
   { name: 'prlimit', binaries: ['prlimit'], versionArgs: ['--version'], tier: 'mandatory' },
@@ -85,20 +101,64 @@ const TOOL_MATRIX: ReadonlyArray<{
   { name: 'pytest', binaries: ['pytest'], versionArgs: ['--version'], tier: 'standard' },
   { name: 'ruff', binaries: ['ruff'], versionArgs: ['--version'], tier: 'standard' },
   { name: 'pnpm', binaries: ['pnpm'], versionArgs: ['-v'], tier: 'standard' },
+  { name: 'yarn', binaries: ['yarn'], versionArgs: ['-v'], tier: 'standard' },
   { name: 'bun', binaries: ['bun'], versionArgs: ['-v'], tier: 'standard' },
   { name: 'go', binaries: ['go'], versionArgs: ['version'], tier: 'standard' },
+  { name: 'golangci-lint', binaries: ['golangci-lint'], versionArgs: ['--version'], tier: 'standard' },
   { name: 'rustc', binaries: ['rustc'], versionArgs: ['--version'], tier: 'standard' },
   { name: 'cargo', binaries: ['cargo'], versionArgs: ['--version'], tier: 'standard' },
   { name: 'mise', binaries: ['mise'], versionArgs: ['--version'], tier: 'standard' },
+  { name: 'clang', binaries: ['clang'], versionArgs: ['--version'], tier: 'universal' },
+  { name: 'bazelisk', binaries: ['bazelisk', 'bazel'], versionArgs: ['--version'], tier: 'universal' },
+  { name: 'java', binaries: ['java'], versionArgs: ['-version'], tier: 'universal' },
+  { name: 'mvn', binaries: ['mvn'], versionArgs: ['--version'], tier: 'universal' },
+  { name: 'gradle', binaries: ['gradle'], versionArgs: ['--version'], tier: 'universal' },
+  { name: 'ruby', binaries: ['ruby'], versionArgs: ['--version'], tier: 'universal' },
+  { name: 'php', binaries: ['php'], versionArgs: ['--version'], tier: 'universal' },
+  { name: 'poetry', binaries: ['poetry'], versionArgs: ['--version'], tier: 'universal' },
 ];
 
-function which(bin: string): string | null {
-  try {
-    const out = execFileSync('which', [bin], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    return out || null;
-  } catch {
-    return null;
+/**
+ * Pure-Node executable resolver that ALSO checks standard user toolchain directories
+ * (mise shims, ~/.local/bin, ~/.cargo/bin, ~/.bun/bin, /usr/local/go/bin) so non-login
+ * `wsl.exe -d <Distro> -- node doctor.js` invocations accurately detect provisioned tools
+ * on ALL distros (including minimal Fedora/Arch/Alpine without external `which`).
+ */
+function getSearchDirs(): string[] {
+  const home = os.homedir();
+  const extra = [
+    path.join(home, '.dsh', 'runtime', 'bin'),
+    path.join(home, '.local', 'share', 'dsh', 'node', 'bin'),
+    path.join(home, '.local', 'share', 'mise', 'shims'),
+    path.join(home, '.local', 'bin'),
+    path.join(home, '.nvm', 'current', 'bin'),
+    path.join(home, '.local', 'share', 'fnm', 'aliases', 'default', 'bin'),
+    path.join(home, '.volta', 'bin'),
+    path.join(home, '.cargo', 'bin'),
+    path.join(home, '.bun', 'bin'),
+    '/opt/dsh-toolchain/shims',
+    '/opt/dsh-toolchain/bin',
+    '/usr/local/go/bin',
+  ];
+  const envDirs = (process.env.PATH ?? '')
+    .split(path.delimiter)
+    .filter((p) => Boolean(p) && !p.startsWith('/mnt/'));
+  return [...new Set([...extra, ...envDirs, '/usr/local/bin', '/usr/bin', '/bin'])];
+}
+
+function findExecutable(bin: string): string | null {
+  for (const dir of getSearchDirs()) {
+    const candidate = path.join(dir, bin);
+    try {
+      const st = fs.statSync(candidate);
+      if (!st.isFile()) continue;
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // keep searching
+    }
   }
+  return null;
 }
 
 function detectWsl2(kernel: string): boolean {
@@ -112,19 +172,34 @@ function detectWsl2(kernel: string): boolean {
   return Boolean(process.env.WSL_DISTRO_NAME && fs.existsSync('/run/WSL'));
 }
 
+function detectDrvfsAutomount(): boolean {
+  try {
+    const mounts = fs.readFileSync('/proc/mounts', 'utf8');
+    return /\s\/mnt\/[a-z]\s+(?:9p|drvfs)\s/i.test(mounts);
+  } catch {
+    return false;
+  }
+}
+
 function probeTool(spec: (typeof TOOL_MATRIX)[number]): ToolProbe {
+  const enrichedPath = getSearchDirs().join(path.delimiter);
   for (const bin of spec.binaries) {
-    const found = which(bin);
+    const found = findExecutable(bin);
     if (!found) continue;
     let version: string | undefined;
     try {
-      const out = execFileSync(found, [...spec.versionArgs], {
+      const res = spawnSync(found, [...spec.versionArgs], {
         encoding: 'utf8',
         timeout: 3000,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, PATH: enrichedPath },
       });
-      const firstLine = out.split('\n').map((l) => l.trim()).find(Boolean);
-      version = firstLine?.slice(0, 80);
+      // Tools like `java -version` print to stderr; tools like `gradle --version` lead with `----`
+      const combined = `${res.stdout ?? ''}\n${res.stderr ?? ''}`;
+      const firstLine = combined
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l.length > 0 && !/^[-=*_#]+$/.test(l));
+      version = firstLine ? firstLine.slice(0, 80) : 'present';
     } catch {
       version = 'present';
     }
@@ -162,7 +237,7 @@ function runRealSeccompSelfTest(
   bwrapPath: string,
   arch: LinuxArch,
 ): { ioUringBlocked: boolean | null; afVsockBlocked: boolean | null; detail: string } {
-  const python3 = which('python3');
+  const python3 = findExecutable('python3');
   if (!python3) {
     return { ioUringBlocked: null, afVsockBlocked: null, detail: 'python3 missing; skipped live seccomp syscall probe' };
   }
@@ -177,7 +252,7 @@ function runRealSeccompSelfTest(
 
     // SYS_io_uring_setup is 425 on both x86_64 and aarch64; AF_VSOCK is 40.
     const pyScript = [
-      'import ctypes, errno, json, socket',
+      'import ctypes, json, socket',
       'libc = ctypes.CDLL(None, use_errno=True)',
       'buf = ctypes.create_string_buffer(120)',
       'ctypes.set_errno(0)',
@@ -248,15 +323,112 @@ function runRealSeccompSelfTest(
   }
 }
 
+function probeHardwareCapabilities(): DoctorReport['hardware'] {
+  const vhciHcdReady =
+    fs.existsSync('/sys/devices/platform/vhci_hcd.0') ||
+    fs.existsSync('/sys/module/vhci_hcd');
+  const lsusbPresent = Boolean(findExecutable('lsusb'));
+
+  let usbBusNodesCount = 0;
+  try {
+    if (fs.existsSync('/dev/bus/usb')) {
+      for (const bus of fs.readdirSync('/dev/bus/usb')) {
+        const busPath = path.join('/dev/bus/usb', bus);
+        if (fs.statSync(busPath).isDirectory()) {
+          usbBusNodesCount += fs.readdirSync(busPath).length;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const serialAndHidNodes: string[] = [];
+  try {
+    for (const ent of fs.readdirSync('/dev')) {
+      if (/^(?:ttyUSB\d+|ttyACM\d+|hidraw\d+|cdc-wdm\d+|video\d+)$/.test(ent)) {
+        serialAndHidNodes.push(`/dev/${ent}`);
+      }
+    }
+    serialAndHidNodes.sort();
+  } catch {
+    // ignore
+  }
+
+  return {
+    vhciHcdReady,
+    lsusbPresent,
+    usbBusNodesCount,
+    serialAndHidNodes,
+    driverNote:
+      'Stock WSL 2 kernels ship minimal USB drivers: libusb/user-space devices (/dev/bus/usb/NNN/NNN, e.g. phone ADB/Fastboot/EDL/DFU) work over USBIP, whereas Windows OEM Bootloader tools or Windows-driverless USB NICs lacking Linux .ko modules should remain on Windows host under single-shot L3 approval (or load matching Linux kernel modules).',
+  };
+}
+
+function readPersistedProfile(): EnvironmentProfile | undefined {
+  const envP = process.env.DSH_WSL_PROFILE;
+  if (envP === 'core' || envP === 'standard' || envP === 'universal') return envP;
+  try {
+    const p = path.join(os.homedir(), '.config', 'dsh-wsl-sandbox', 'profile.json');
+    if (fs.existsSync(p)) {
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf8')) as { profile?: string };
+      if (parsed.profile === 'core' || parsed.profile === 'standard' || parsed.profile === 'universal') {
+        return parsed.profile;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+function readOsRelease(): { id?: string; prettyName?: string } {
+  try {
+    const raw = fs.readFileSync('/etc/os-release', 'utf8');
+    const id = raw.match(/^ID=["']?([^"'\n]+)["']?/m)?.[1];
+    const prettyName = raw.match(/^PRETTY_NAME=["']?([^"'\n]+)["']?/m)?.[1];
+    return { id, prettyName };
+  } catch {
+    return {};
+  }
+}
+
+function checkPrivateConfigPermissions(): { ok: boolean; detail: string } {
+  const home = os.homedir();
+  const sensitiveDirs = [
+    path.join(home, '.config', 'dsh-wsl-sandbox'),
+    path.join(home, '.dsh', 'dsh-wsl-sandbox'),
+  ];
+  const issues: string[] = [];
+  for (const dir of sensitiveDirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      const mode = fs.statSync(dir).mode & 0o777;
+      if ((mode & 0o077) !== 0) {
+        issues.push(`${dir} has overly broad permissions 0${mode.toString(8)} (expected 0700)`);
+      }
+    } catch {
+      // ignore unreadable
+    }
+  }
+  return issues.length === 0
+    ? { ok: true, detail: 'private config directories have owner-only permissions (0700)' }
+    : { ok: false, detail: issues.join('; ') };
+}
+
 export async function runDoctor(options?: {
   upstreamProxy?: string;
   strictWsl2?: boolean;
+  profile?: EnvironmentProfile;
 }): Promise<DoctorReport> {
+  const selectedProfile: EnvironmentProfile = options?.profile ?? readPersistedProfile() ?? 'standard';
   const platform = process.platform;
   const rawArch = os.arch();
   const arch: LinuxArch | string = rawArch === 'x64' ? 'x86_64' : rawArch === 'arm64' ? 'aarch64' : rawArch;
   const kernel = os.release();
   const isWsl2 = detectWsl2(kernel);
+  const drvfsAutomountActive = detectDrvfsAutomount();
+  const osRel = readOsRelease();
   const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
   const username = os.userInfo().username;
   const nonRoot = uid > 0;
@@ -271,22 +443,28 @@ export async function runDoctor(options?: {
     remediation.push('Run inside a WSL 2 distribution (not WSL 1 or non-WSL host).');
   }
 
-  const bwrapPath = which('bwrap');
+  const permCheck = checkPrivateConfigPermissions();
+  sandboxDetails.push(`config dir ACL: ${permCheck.detail}`);
+  if (!permCheck.ok) {
+    remediation.push(`Tighten config directory permissions: chmod 700 ~/.config/dsh-wsl-sandbox ~/.dsh/dsh-wsl-sandbox (${permCheck.detail})`);
+  }
+
+  const bwrapPath = findExecutable('bwrap');
+  const trueBin = findExecutable('true') ?? '/bin/true';
+  const shellBin = findExecutable('bash') ?? findExecutable('sh') ?? '/bin/sh';
   let bwrapVersion: string | null = null;
   let unprivilegedUserns = false;
   let disableUsernsFlag = false;
   let seccompIoUringBlocked: boolean | null = null;
   let seccompAfVsockBlocked: boolean | null = null;
   let escapeMaskSelfTest = false;
+  let configMaskSelfTest = false;
 
   if (!bwrapPath) {
-    remediation.push('Install bubblewrap: sudo apt-get update && sudo apt-get install -y bubblewrap socat util-linux');
+    remediation.push('Install bubblewrap, util-linux (prlimit), and socat via provision-wsl.sh --step base.');
   } else {
-    try {
-      bwrapVersion = execFileSync(bwrapPath, ['--version'], { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch {
-      bwrapVersion = 'unknown';
-    }
+    const verRes = spawnSync(bwrapPath, ['--version'], { encoding: 'utf8', timeout: 3000 });
+    bwrapVersion = (verRes.stdout || verRes.stderr || 'unknown').trim() || 'unknown';
 
     const nsTest = spawnSync(
       bwrapPath,
@@ -300,14 +478,14 @@ export async function runDoctor(options?: {
         '--new-session',
         '--die-with-parent',
         '--',
-        '/bin/true',
+        trueBin,
       ],
       { encoding: 'utf8', timeout: 5000 },
     );
     unprivilegedUserns = nsTest.status === 0;
     if (!unprivilegedUserns) {
       sandboxDetails.push(`bwrap userns test failed: ${(nsTest.stderr || '').trim()}`);
-      remediation.push('Enable unprivileged user namespaces (check Ubuntu 24.04 AppArmor profile for bwrap or kernel.unprivileged_userns_clone).');
+      remediation.push('Enable unprivileged user namespaces (check Ubuntu 24.04+/26.04 AppArmor bwrap profile or kernel.unprivileged_userns_clone).');
     }
 
     const disableTest = spawnSync(
@@ -323,7 +501,7 @@ export async function runDoctor(options?: {
         '--new-session',
         '--die-with-parent',
         '--',
-        '/bin/true',
+        trueBin,
       ],
       { encoding: 'utf8', timeout: 5000 },
     );
@@ -331,7 +509,6 @@ export async function runDoctor(options?: {
     sandboxDetails.push(`--disable-userns: ${disableUsernsFlag ? 'supported' : 'not supported (will rely on seccomp unshare/clone3 block)'}`);
 
     if (unprivilegedUserns) {
-      // Escape-surface masking self-test (--tmpfs /run hides /run/WSL, dbus, docker; --tmpfs /mnt hides /mnt/c & /mnt/wslg)
       const maskTest = spawnSync(
         bwrapPath,
         [
@@ -346,12 +523,35 @@ export async function runDoctor(options?: {
           '--new-session',
           '--die-with-parent',
           '--',
-          '/bin/bash', '-c', 'test -z "$(ls -A /mnt 2>/dev/null)" && test -z "$(ls -A /run 2>/dev/null)"',
+          shellBin, '-c', 'test -z "$(ls -A /mnt 2>/dev/null)" && test -z "$(ls -A /run 2>/dev/null)"',
         ],
         { encoding: 'utf8', timeout: 5000 },
       );
       escapeMaskSelfTest = maskTest.status === 0;
       sandboxDetails.push(`escape-surface mask (/mnt + /run tmpfs): ${escapeMaskSelfTest ? 'PASS' : 'FAIL'}`);
+
+      // Verify private config directory read-only empty tmpfs masking works on this kernel/bwrap
+      const probeMaskTarget = path.join(os.homedir(), '.config');
+      const maskArgs = [
+        '--ro-bind', '/', '/',
+        '--dev', '/dev',
+        '--proc', '/proc',
+      ];
+      const checkDir = fs.existsSync(probeMaskTarget) ? probeMaskTarget : '/tmp';
+      maskArgs.push(
+        '--tmpfs', checkDir,
+        '--remount-ro', checkDir,
+        '--unshare-user',
+        '--unshare-pid',
+        '--unshare-net',
+        '--new-session',
+        '--die-with-parent',
+        '--',
+        shellBin, '-c', `test -z "$(ls -A '${checkDir}' 2>/dev/null)" && ! touch '${checkDir}/__probe' 2>/dev/null`,
+      );
+      const cfgMaskRes = spawnSync(bwrapPath, maskArgs, { encoding: 'utf8', timeout: 5000 });
+      configMaskSelfTest = cfgMaskRes.status === 0;
+      sandboxDetails.push(`config folder mask (--tmpfs + --remount-ro): ${configMaskSelfTest ? 'PASS' : 'FAIL'}`);
 
       if (arch === 'x86_64' || arch === 'aarch64') {
         const sec = runRealSeccompSelfTest(bwrapPath, arch);
@@ -365,26 +565,31 @@ export async function runDoctor(options?: {
     }
   }
 
+  const hardware = probeHardwareCapabilities();
   const tools = TOOL_MATRIX.map(probeTool);
   const missingMandatory = tools.filter((t) => t.tier === 'mandatory' && !t.present);
   const missingCore = tools.filter((t) => t.tier === 'core' && !t.present);
   const missingStandard = tools.filter((t) => t.tier === 'standard' && !t.present);
+  const missingUniversal = tools.filter((t) => t.tier === 'universal' && !t.present);
 
   if (missingMandatory.length > 0) {
-    remediation.push(`Install mandatory sandbox tools: ${missingMandatory.map((t) => t.name).join(', ')} (run provision-wsl.sh --step base)`);
+    remediation.push(`Install mandatory sandbox tools: ${missingMandatory.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile} --step base)`);
   }
   if (missingCore.length > 0) {
-    remediation.push(`Install missing core Codex CLI tools: ${missingCore.map((t) => t.name).join(', ')} (run provision-wsl.sh --step cli)`);
+    remediation.push(`Install missing core Codex CLI tools: ${missingCore.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile} --step cli)`);
   }
-  if (missingStandard.length > 0) {
-    remediation.push(`Optional standard Codex tools missing: ${missingStandard.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile standard)`);
+  if ((selectedProfile === 'standard' || selectedProfile === 'universal') && missingStandard.length > 0) {
+    remediation.push(`Missing '${selectedProfile}' profile tools: ${missingStandard.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile})`);
+  }
+  if (selectedProfile === 'universal' && missingUniversal.length > 0) {
+    remediation.push(`Missing 'universal' profile tools: ${missingUniversal.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile universal)`);
   }
 
   let upstreamReachable: boolean | undefined;
   if (options?.upstreamProxy) {
     upstreamReachable = await testTcpReachable(options.upstreamProxy);
     if (!upstreamReachable) {
-      remediation.push(`Upstream proxy ${options.upstreamProxy} is unreachable from Linux; verify Clash/Mihomo Allow LAN or WSL networkingMode=mirrored.`);
+      remediation.push(`Upstream proxy ${options.upstreamProxy} is unreachable from Linux; verify local proxy Allow LAN or WSL networkingMode=mirrored.`);
     }
   }
 
@@ -393,20 +598,38 @@ export async function runDoctor(options?: {
     !bwrapPath ||
     !unprivilegedUserns ||
     !escapeMaskSelfTest ||
+    !configMaskSelfTest ||
     seccompIoUringBlocked === false ||
     seccompAfVsockBlocked === false ||
     missingMandatory.length > 0 ||
     Boolean(options?.strictWsl2 && !isWsl2);
 
+  const profileDegraded =
+    !permCheck.ok ||
+    missingCore.length > 0 ||
+    ((selectedProfile === 'standard' || selectedProfile === 'universal') && missingStandard.length > 0) ||
+    (selectedProfile === 'universal' && missingUniversal.length > 0) ||
+    upstreamReachable === false;
+
   const verdict: 'ready' | 'degraded' | 'blocked' = hardBlocked
     ? 'blocked'
-    : missingCore.length > 0 || upstreamReachable === false
+    : profileDegraded
       ? 'degraded'
       : 'ready';
 
   return {
     timestamp: new Date().toISOString(),
-    os: { platform, arch, kernel, isWsl2 },
+    selectedProfile,
+    os: {
+      platform,
+      arch,
+      kernel,
+      isWsl2,
+      wslDistroName: process.env.WSL_DISTRO_NAME || undefined,
+      distroId: osRel.id,
+      distroPrettyName: osRel.prettyName,
+      drvfsAutomountActive,
+    },
     user: { uid, username, nonRoot },
     sandbox: {
       bwrapPath,
@@ -416,8 +639,11 @@ export async function runDoctor(options?: {
       seccompIoUringBlocked,
       seccompAfVsockBlocked,
       escapeMaskSelfTest,
+      configMaskSelfTest,
+      configDirPermsOk: permCheck.ok,
       details: sandboxDetails,
     },
+    hardware,
     tools,
     network: {
       upstreamProxy: options?.upstreamProxy,
@@ -431,21 +657,23 @@ export async function runDoctor(options?: {
 function formatHumanReport(report: DoctorReport): string {
   const lines: string[] = [];
   lines.push('============================================================');
-  lines.push(` dsh-wsl-doctor  |  Verdict: ${report.verdict.toUpperCase()}`);
+  lines.push(` dsh-wsl-doctor  |  Profile: ${report.selectedProfile}  |  Verdict: ${report.verdict.toUpperCase()}`);
   lines.push('============================================================');
-  lines.push(`OS      : ${report.os.platform} ${report.os.arch} (kernel ${report.os.kernel}, WSL2=${report.os.isWsl2})`);
-  lines.push(`User    : ${report.user.username} (uid=${report.user.uid}, nonRoot=${report.user.nonRoot})`);
-  lines.push(`bwrap   : ${report.sandbox.bwrapVersion ?? 'MISSING'} (${report.sandbox.bwrapPath ?? 'not found'})`);
-  lines.push(`Sandbox : userns=${report.sandbox.unprivilegedUserns}, disable-userns=${report.sandbox.disableUsernsFlag}, escapeMask=${report.sandbox.escapeMaskSelfTest}`);
-  lines.push(`Seccomp : io_uring_EPERM=${String(report.sandbox.seccompIoUringBlocked)}, AF_VSOCK_EPERM=${String(report.sandbox.seccompAfVsockBlocked)}`);
+  lines.push(`OS       : ${report.os.distroPrettyName ?? report.os.platform} (${report.os.arch}, kernel ${report.os.kernel}, WSL2=${report.os.isWsl2}${report.os.wslDistroName ? `, distro=${report.os.wslDistroName}` : ''})`);
+  lines.push(`Mounts   : host DrvFS /mnt/* automount=${report.os.drvfsAutomountActive ? 'active (masked inside bwrap via --tmpfs /mnt)' : 'disabled'}`);
+  lines.push(`User     : ${report.user.username} (uid=${report.user.uid}, nonRoot=${report.user.nonRoot})`);
+  lines.push(`bwrap    : ${report.sandbox.bwrapVersion ?? 'MISSING'} (${report.sandbox.bwrapPath ?? 'not found'})`);
+  lines.push(`Sandbox  : userns=${report.sandbox.unprivilegedUserns}, disable-userns=${report.sandbox.disableUsernsFlag}, escapeMask=${report.sandbox.escapeMaskSelfTest}, configMask=${report.sandbox.configMaskSelfTest}, configACL=${report.sandbox.configDirPermsOk}`);
+  lines.push(`Seccomp  : io_uring_EPERM=${String(report.sandbox.seccompIoUringBlocked)}, AF_VSOCK_EPERM=${String(report.sandbox.seccompAfVsockBlocked)}`);
+  lines.push(`USB/HW   : vhci_hcd=${report.hardware.vhciHcdReady}, lsusb=${report.hardware.lsusbPresent}, /dev/bus/usb nodes=${report.hardware.usbBusNodesCount}, charNodes=[${report.hardware.serialAndHidNodes.join(', ')}]`);
   if (report.network.upstreamProxy) {
-    lines.push(`Proxy   : ${report.network.upstreamProxy} (reachable=${String(report.network.upstreamReachable)})`);
+    lines.push(`Proxy    : ${report.network.upstreamProxy} (reachable=${String(report.network.upstreamReachable)})`);
   }
   lines.push('');
-  lines.push('Codex Tool Matrix:');
+  lines.push(`Codex Tool Matrix (selected profile: ${report.selectedProfile}):`);
   for (const t of report.tools) {
     const mark = t.present ? '[OK]  ' : '[MISS]';
-    lines.push(`  ${mark} ${t.name.padEnd(10)} (${t.tier.padEnd(9)}) ${t.version ?? ''}`);
+    lines.push(`  ${mark} ${t.name.padEnd(14)} (${t.tier.padEnd(9)}) ${t.version ?? ''}`);
   }
   if (report.remediation.length > 0) {
     lines.push('');
@@ -457,10 +685,15 @@ function formatHumanReport(report: DoctorReport): string {
   return lines.join('\n');
 }
 
-// CLI entrypoint
-const isDirectRun =
-  process.argv[1] &&
-  (process.argv[1].endsWith('doctor.ts') || process.argv[1].endsWith('doctor.js'));
+// CLI entrypoint (works whether invoked directly via .ts/.js OR via symlinked `dsh-wsl-doctor` bin)
+let isDirectRun = false;
+if (process.argv[1]) {
+  try {
+    isDirectRun = fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    isDirectRun = process.argv[1].endsWith('doctor.ts') || process.argv[1].endsWith('doctor.js');
+  }
+}
 
 if (isDirectRun) {
   const args = process.argv.slice(2);
@@ -468,8 +701,19 @@ if (isDirectRun) {
   const strictWsl2 = args.includes('--strict-wsl2');
   const proxyIdx = args.indexOf('--proxy');
   const upstreamProxy = proxyIdx !== -1 ? args[proxyIdx + 1] : undefined;
+  const profileIdx = args.indexOf('--profile');
+  let profile: EnvironmentProfile | undefined;
+  if (profileIdx !== -1) {
+    const rawProfile = args[profileIdx + 1];
+    if (rawProfile === 'core' || rawProfile === 'standard' || rawProfile === 'universal') {
+      profile = rawProfile;
+    } else {
+      process.stderr.write(`[ERROR] Invalid --profile '${String(rawProfile ?? '')}' (expected core|standard|universal)\n`);
+      process.exit(2);
+    }
+  }
 
-  void runDoctor({ upstreamProxy, strictWsl2 }).then((report) => {
+  void runDoctor({ upstreamProxy, strictWsl2, profile }).then((report) => {
     if (asJson) {
       process.stdout.write(JSON.stringify(report, null, 2) + '\n');
     } else {

@@ -18,6 +18,7 @@ import {
   type DshWebServerRoute,
   type WslSandboxPluginHandle,
 } from '../../packages/dsh-plugin/src/index.ts';
+import { BUILT_CLIENT_PATH, BUILT_RUNNER_PATH, BWRAP_SKIP_REASON } from '../test-env.ts';
 
 /**
  * Faithful emulation of the REAL `@deepseek-ai/dsh@0.2.2-rc.5` Cordis Host + WebServer + ClientModuleLoader,
@@ -155,9 +156,10 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
       allowLinuxDevMode: true,
       initialConfig: {
         transportMode: 'local-linux',
-        distro: 'Ubuntu-24.04',
-        workspaceRoot,
-        runnerPath: path.resolve('packages/wsl-runner/src/main.ts'),
+        distro: 'MyMovedUbuntu26',
+        environmentProfile: 'core',
+        workspaceRoot: process.platform === 'win32' ? '/home/dev/workspace' : workspaceRoot,
+        runnerPath: BUILT_RUNNER_PATH,
       },
     });
   });
@@ -235,7 +237,7 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
 
     // 2. Host escape (`\\wsl.localhost\` or `.wslconfig`) on `win_bash` / `ops_bash` MUST be blocked!
     const winBashEscape = await runRealPreExecuteAndGuards('ops_bash', {
-      command: 'cp evil //wsl.localhost/Ubuntu-24.04/home/dev/workspace/.git/hooks/pre-commit',
+      command: 'cp evil //wsl.localhost/MyMovedUbuntu26/home/dev/workspace/.git/hooks/pre-commit',
     });
     assert.equal(winBashEscape.allowed, false);
 
@@ -255,24 +257,42 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
     assert.match(ccBlock.reason ?? '', /cc-safety-net/);
   });
 
-  it('serves live /wsl-sandbox/ui and /wsl-sandbox/api/* over real ctx.webServer and blocks cross-origin CSRF', async () => {
+  it('serves live /wsl-sandbox/ui, /api/distros, /api/logs, /api/doctor (profile-aware), and blocks CSRF', async () => {
     const uiRes = await fetch(`${serverOrigin}/wsl-sandbox/ui`);
     assert.equal(uiRes.status, 200);
     const html = await uiRes.text();
     assert.match(html, /WSL 2 沙箱/);
-    assert.doesNotMatch(html, /rev-4 · gen #4/);
+    assert.doesNotMatch(html, /\brev-\d+\s*·\s*gen\s*#\d+/i);
+    assert.match(html, /in-profile/);
+    assert.match(html, /in-distro-select/);
+    assert.match(html, /pane-logs/);
 
     const stRes = await fetch(`${serverOrigin}/wsl-sandbox/api/status`);
     assert.equal(stRes.status, 200);
-    const stJson = (await stRes.json()) as { ok: boolean; config: { distro: string } };
+    const stJson = (await stRes.json()) as {
+      ok: boolean;
+      config: { distro: string; environmentProfile: string };
+      nodeRuntime: { hostNodeVersion: string; hostSharedWithDsh: boolean };
+    };
     assert.equal(stJson.ok, true);
-    assert.equal(stJson.config.distro, 'Ubuntu-24.04');
+    assert.equal(stJson.config.distro, 'MyMovedUbuntu26');
+    assert.equal(stJson.config.environmentProfile, 'core');
+    assert.equal(stJson.nodeRuntime.hostSharedWithDsh, true);
+    assert.equal(stJson.nodeRuntime.hostNodeVersion, process.version);
 
-    const docRes = await fetch(`${serverOrigin}/wsl-sandbox/api/doctor`);
-    assert.equal(docRes.status, 200);
-    const docJson = (await docRes.json()) as { ok: boolean; report: { verdict: string } };
-    assert.equal(docJson.ok, true);
-    assert.ok(['ready', 'degraded'].includes(docJson.report.verdict));
+    const distrosRes = await fetch(`${serverOrigin}/wsl-sandbox/api/distros`);
+    assert.equal(distrosRes.status, 200);
+    const distrosJson = (await distrosRes.json()) as { ok: boolean; distros: unknown[] };
+    assert.equal(distrosJson.ok, true);
+    assert.ok(Array.isArray(distrosJson.distros));
+
+    // Switch environmentProfile via API -> verify doctor immediately respects 'universal'!
+    const putProf = await fetch(`${serverOrigin}/wsl-sandbox/api/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ environmentProfile: 'universal' }),
+    });
+    assert.equal(putProf.status, 200);
 
     // Cross-origin CSRF attack from https://evil.example MUST be rejected with 403!
     const csrfRes = await fetch(`${serverOrigin}/wsl-sandbox/api/config`, {
@@ -286,10 +306,34 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
     assert.equal(csrfRes.status, 403);
   });
 
+  it('runs real local-linux doctor & aborts in-flight wsl_bash cleanly with zero leaked processes', { skip: BWRAP_SKIP_REASON }, async () => {
+    const docRes = await fetch(`${serverOrigin}/wsl-sandbox/api/doctor`);
+    assert.equal(docRes.status, 200);
+    const docJson = (await docRes.json()) as { ok: boolean; report: { verdict: string; selectedProfile: string } };
+    assert.equal(docJson.ok, true);
+    assert.equal(docJson.report.selectedProfile, 'universal');
+    assert.ok(['ready', 'degraded'].includes(docJson.report.verdict));
+
+    // Abort an in-flight wsl_bash (`sleep 30`) via AbortController -> zero leaked active processes!
+    const wslBash = registeredTools.get('wsl_bash')!;
+    const ac = new AbortController();
+    const runPromise = wslBash.execute({ command: 'sleep 30', timeoutMs: 30_000 }, { signal: ac.signal }) as Promise<{
+      aborted?: boolean;
+    }>;
+    await new Promise((r) => setTimeout(r, 250));
+    ac.abort();
+    const abortedOut = await runPromise;
+    assert.equal(abortedOut.aborted, true, 'Aborting tool signal must immediately terminate in-flight sandbox process');
+
+    const procsRes = await fetch(`${serverOrigin}/wsl-sandbox/api/processes`);
+    const procsJson = (await procsRes.json()) as { ok: boolean; active: unknown[] };
+    assert.equal(procsJson.ok, true);
+    assert.equal(procsJson.active.length, 0, 'Zero active processes may remain after AbortController cancel');
+  });
+
   it('loads and mounts built client.js inside window.__ModuleLoader__ registering settings.section & icon cleanly', () => {
-    const clientPath = path.resolve('client.js');
-    assert.equal(fs.existsSync(clientPath), true, 'client.js must be generated by build.mjs');
-    const code = fs.readFileSync(clientPath, 'utf8');
+    assert.equal(fs.existsSync(BUILT_CLIENT_PATH), true, 'client.js must be generated by build.mjs');
+    const code = fs.readFileSync(BUILT_CLIENT_PATH, 'utf8');
     assert.ok(code.startsWith('window.__ModuleLoader__.load('), 'client.js must start with single-line ModuleLoader header');
 
     let loadedEntry: { id: string; factory: (req: (id: string) => unknown) => Record<string, unknown> } | undefined;

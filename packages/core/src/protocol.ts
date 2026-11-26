@@ -87,6 +87,8 @@ export interface ShellSandboxFacts {
 
 export interface ProcExecParams {
   readonly execId?: string;
+  readonly terminalId?: string;
+  readonly ownerRunnerId?: string;
   readonly binding: SessionBinding;
   readonly command?: string;
   readonly argv?: readonly string[];
@@ -104,6 +106,12 @@ export interface ProcExecParams {
   readonly cacheDir?: string;
   readonly maskEnvSecrets?: boolean;
   readonly mirrorCn?: boolean;
+}
+
+export interface InvalidateParams {
+  readonly generation?: number;
+  readonly sessionId?: string;
+  readonly terminalId?: string;
 }
 
 export interface ProcExecResult {

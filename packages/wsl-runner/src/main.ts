@@ -10,20 +10,33 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import {
+  formatRunnerWireLog,
   isSandboxError,
+  type LogQueryFilter,
   MAX_RPC_FRAME_BYTES,
+  normalizeLogLevel,
   type ProbeParams,
   type ProcExecParams,
   type ProxyConfigureParams,
+  RotatingNdjsonSink,
   type RpcCallbackRequest,
   type RpcCallbackResponse,
   type RpcRequest,
   type RpcResponse,
   type SessionBinding,
+  StructuredLogger,
   type TerminalExecParams,
   UdsAllowlistProxy,
 } from '../../core/src/index.ts';
 import { ConfinedFsService } from './fs-service.ts';
+import {
+  collectWslFootprint,
+  forceRemoveReadOnlyTree,
+  pruneWorkspaceCaches,
+  resolveEphemeralRamTmpRoot,
+  sweepOrphanedRunnerTempDirs,
+  writeDeduplicatedReadOnlyBackup,
+} from './hygiene.ts';
 import { runEnvironmentProbe } from './probe.ts';
 import { ConfinedProcManager } from './proc-manager.ts';
 import { ConfinedTerminalManager } from './pty-manager.ts';
@@ -32,13 +45,71 @@ const runnerId = randomUUID();
 const startedAt = Date.now();
 const leaseMs = Number(process.env.DSH_WSL_RUNNER_LEASE_MS || 0);
 
+const runnerLogDir =
+  process.env.DSH_WSL_RUNNER_LOG_DIR || path.join(os.homedir(), '.config', 'dsh-wsl-sandbox', 'logs');
+// When paired with Host WslTransport, runner logs stream over memory stderr pipe to Host's coalesced sink
+// so we NEVER double-write every log line to both WSL VHDX ext4 and Windows NTFS!
+const runnerFileSink =
+  process.env.DSH_WSL_RUNNER_FILE_LOG === '1' && process.env.DSH_WSL_DISABLE_FILE_LOG !== '1'
+    ? new RotatingNdjsonSink({
+        logDir: runnerLogDir,
+        fileName: 'wsl-runner.ndjson',
+        maxBytes: 5 * 1024 * 1024,
+        maxFiles: 3,
+        flushIntervalMs: 2500,
+      })
+    : undefined;
+
+const runnerLogger = new StructuredLogger({
+  source: 'wsl-runner',
+  level: normalizeLogLevel(process.env.DSH_WSL_LOG_LEVEL, 'info'),
+  fileSink: runnerFileSink,
+  preloadFromDisk: false,
+  onEntry: (entry) => {
+    try {
+      process.stderr.write(formatRunnerWireLog(entry));
+    } catch {
+      // ignore broken stderr during teardown
+    }
+  },
+});
+
+const rlog = runnerLogger.child('runner');
+rlog.info('runner.start', 'WSL sandbox runner started', {
+  runnerId,
+  nodeVersion: process.version,
+  nodeExecPath: process.execPath,
+  leaseMs,
+  logFilePath: runnerLogger.getLogFilePath() ?? null,
+});
+
 const fsService = new ConfinedFsService();
 const procManager = new ConfinedProcManager();
 const termManager = new ConfinedTerminalManager(procManager);
 
-const proxyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wsl-proxy-'));
+const proxyDir = fs.mkdtempSync(path.join(resolveEphemeralRamTmpRoot(), 'dsh-wsl-proxy-'));
 fs.chmodSync(proxyDir, 0o700);
+fs.writeFileSync(path.join(proxyDir, 'owner.pid'), `${process.pid}\n`, { mode: 0o600 });
 const managedProxySocketPath = path.join(proxyDir, 'proxy.sock');
+
+// Sweep any `/tmp/dsh-wsl-runner-*` or `/tmp/dsh-wsl-proxy-*` orphaned by a prior SIGKILL (`kill -9`)
+// or `wsl.exe --terminate`, plus workspace package caches untouched for > 30 days.
+try {
+  const swept = sweepOrphanedRunnerTempDirs({
+    excludeDirs: [procManager.getRuntimeDir(), proxyDir],
+  });
+  const cacheSweep = pruneWorkspaceCaches({
+    maxAgeDays: Number(process.env.DSH_WSL_CACHE_MAX_AGE_DAYS || 30),
+  });
+  if (swept.sweptDirs.length > 0 || cacheSweep.removedDirs.length > 0) {
+    rlog.info('runner.hygiene_sweep', 'Cleaned stale crash temp dirs and expired workspace caches', {
+      sweptTempDirs: swept.sweptDirs.length,
+      prunedCacheDirs: cacheSweep.removedDirs.length,
+    });
+  }
+} catch {
+  // Never block runner startup on best-effort hygiene sweep
+}
 let managedProxy: UdsAllowlistProxy | undefined;
 let interactiveProxyApproval = false;
 
@@ -85,6 +156,7 @@ async function configureManagedProxy(params: ProxyConfigureParams): Promise<{ en
     if (managedProxy) {
       await managedProxy.stop();
       managedProxy = undefined;
+      rlog.info('proxy.stopped', 'Managed UDS allowlist proxy stopped');
     }
     return { enabled: false };
   }
@@ -96,6 +168,10 @@ async function configureManagedProxy(params: ProxyConfigureParams): Promise<{ en
       localLabCidrs: params.localLabCidrs ?? [],
       localLabPorts: params.localLabPorts ?? [],
     });
+    rlog.debug('proxy.updated', 'Managed UDS allowlist proxy policy updated', {
+      customDomains: (params.customAllowedDomains ?? []).length,
+      hasUpstreamProxy: Boolean(params.upstreamProxy),
+    });
     return { enabled: true, socketPath: managedProxy.getSocketPath() };
   }
 
@@ -106,9 +182,29 @@ async function configureManagedProxy(params: ProxyConfigureParams): Promise<{ en
     localLabCidrs: params.localLabCidrs,
     localLabPorts: params.localLabPorts,
     authorizeUnknownHost: (host, port) => requestHostProxyAuthorization(host, port),
+    onDenied: ({ host, port, reason }) => {
+      runnerLogger.log('warn', {
+        component: 'proxy',
+        event: 'proxy.blocked',
+        message: `Blocked outbound connection to ${host}:${port} (${reason})`,
+        data: { host, port, reason },
+      });
+    },
+    onAllowed: ({ host, port, via }) => {
+      runnerLogger.log('debug', {
+        component: 'proxy',
+        event: 'proxy.allowed',
+        message: `Allowed outbound connection to ${host}:${port} via ${via}`,
+        data: { host, port, via },
+      });
+    },
   });
   await proxy.start();
   managedProxy = proxy;
+  rlog.info('proxy.started', 'Managed UDS allowlist proxy started', {
+    socketPath: proxy.getSocketPath(),
+    hasUpstreamProxy: Boolean(params.upstreamProxy),
+  });
   return { enabled: true, socketPath: proxy.getSocketPath() };
 }
 
@@ -131,14 +227,39 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
     case 'ping':
       return {
         ok: true,
+        pid: process.pid,
         runnerId,
+        nodeVersion: process.version,
+        nodeExecPath: process.execPath,
         uptimeMs: Date.now() - startedAt,
         activeProcs: procManager.getActiveCount(),
         proxyEnabled: Boolean(managedProxy),
       };
 
-    case 'probe':
-      return runEnvironmentProbe(p as unknown as ProbeParams, runnerId);
+    case 'probe': {
+      const t0 = Date.now();
+      const probeRes = await runEnvironmentProbe(p as unknown as ProbeParams, runnerId);
+      rlog.info(
+        'probe.completed',
+        `Environment probe completed (ready=${probeRes.sandboxReady}, enforcement=${probeRes.enforcement})`,
+        {
+          distribution: probeRes.distribution,
+          uid: probeRes.uid,
+          username: probeRes.username,
+          workspaceRoot: probeRes.workspaceRoot,
+          sandboxReady: probeRes.sandboxReady,
+          enforcement: probeRes.enforcement,
+          nodeVersion: process.version,
+          nodeExecPath: process.execPath,
+        },
+        { sessionId: probeRes.sessionId, durationMs: Date.now() - t0 },
+      );
+      return {
+        ...probeRes,
+        nodeVersion: process.version,
+        nodeExecPath: process.execPath,
+      };
+    }
 
     case 'proxy.configure':
       return configureManagedProxy(p as unknown as ProxyConfigureParams);
@@ -147,6 +268,12 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       const host = String(p.host ?? '').trim();
       if (managedProxy && host) {
         managedProxy.addSessionAllowedDomain(host);
+        runnerLogger.log('info', {
+          component: 'proxy',
+          event: 'proxy.domainApproved',
+          message: `Approved domain '${host}' for current runner session`,
+          data: { host },
+        });
         return { approved: true, host };
       }
       return { approved: false, host };
@@ -191,26 +318,131 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
     case 'fs.move':
       return fsService.move(p as unknown as { binding: SessionBinding; from: string; to: string });
 
-    case 'proc.exec':
-      return procManager.exec(withManagedProxy(p as unknown as ProcExecParams));
+    case 'proc.exec': {
+      const execParams = withManagedProxy({ ...(p as unknown as ProcExecParams), ownerRunnerId: runnerId });
+      const t0 = Date.now();
+      const res = await procManager.exec(execParams);
+      const dur = Date.now() - t0;
+      const lvl = res.timedOut || res.sandbox.denied || res.sandbox.runnerFailed ? 'warn' : 'info';
+      runnerLogger.log(lvl, {
+        component: 'proc',
+        event: 'proc.exec',
+        message: `Sandbox exec finished (exit=${res.exitCode}, timedOut=${res.timedOut}, denied=${res.sandbox.denied})`,
+        sessionId: execParams.binding?.sessionId,
+        durationMs: dur,
+        data: {
+          cwd: execParams.cwd,
+          mode: execParams.mode,
+          networkMode: execParams.networkMode,
+          exitCode: res.exitCode,
+          signal: res.signal,
+          timedOut: res.timedOut,
+          aborted: res.aborted,
+          denied: res.sandbox.denied,
+          denialMatches: res.sandbox.denialMatches,
+        },
+      });
+      return res;
+    }
 
     case 'proc.kill':
       return { killed: await procManager.kill(String(p.execId ?? '')) };
 
+    case 'proc.list':
+      return {
+        runnerId,
+        active: procManager.listActive(typeof p.sessionId === 'string' ? p.sessionId : undefined),
+        terminals: termManager.listSessions(typeof p.sessionId === 'string' ? p.sessionId : undefined),
+      };
+
     case 'term.exec': {
       const tp = p as unknown as TerminalExecParams;
-      return termManager.exec({ ...withManagedProxy(tp), terminalId: tp.terminalId });
+      const t0 = Date.now();
+      const res = await termManager.exec({ ...withManagedProxy({ ...tp, ownerRunnerId: runnerId }), terminalId: tp.terminalId });
+      const dur = Date.now() - t0;
+      const lvl = res.timedOut || res.sandbox.denied ? 'warn' : 'info';
+      runnerLogger.log(lvl, {
+        component: 'terminal',
+        event: 'term.exec',
+        message: `Terminal '${tp.terminalId}' exec finished (exit=${res.exitCode}, cwd=${res.cwd})`,
+        sessionId: tp.binding?.sessionId,
+        durationMs: dur,
+        data: {
+          terminalId: tp.terminalId,
+          cwd: res.cwd,
+          exitCode: res.exitCode,
+          timedOut: res.timedOut,
+          denied: res.sandbox.denied,
+        },
+      });
+      return res;
     }
 
     case 'term.reset':
-      return { reset: termManager.reset(String(p.terminalId ?? '')) };
+      return {
+        reset: await termManager.reset(
+          String(p.terminalId ?? ''),
+          typeof p.sessionId === 'string' ? p.sessionId : undefined,
+        ),
+      };
+
+    case 'term.kill': {
+      const sid = String(p.sessionId ?? '');
+      const tid = String(p.terminalId ?? '');
+      if (!sid || !tid) return { killedCount: 0 };
+      const killedCount = await procManager.killTerminal(sid, tid);
+      return { killedCount };
+    }
 
     case 'invalidate': {
       const gen = Number(p.generation ?? Number.MAX_SAFE_INTEGER);
-      termManager.clearAll();
-      managedProxy?.clearSessionAllowedDomains();
-      const killedCount = await procManager.invalidateGeneration(gen);
-      return { killedCount };
+      const sessionId = typeof p.sessionId === 'string' && p.sessionId ? p.sessionId : undefined;
+      const terminalId = typeof p.terminalId === 'string' && p.terminalId ? p.terminalId : undefined;
+      if (sessionId) {
+        termManager.clearSession(sessionId, terminalId);
+      } else if (!terminalId) {
+        termManager.clearAll();
+      }
+      if (!terminalId) {
+        managedProxy?.clearSessionAllowedDomains();
+      }
+      const killedCount = await procManager.invalidateGeneration(gen, { sessionId, terminalId });
+      rlog.info(
+        'session.invalidate',
+        `Invalidated generation < ${gen} (killed=${killedCount})`,
+        { generation: gen, killedCount, scopedSessionId: sessionId ?? null, scopedTerminalId: terminalId ?? null },
+        { sessionId },
+      );
+      return { killedCount, scopedSessionId: sessionId ?? null, scopedTerminalId: terminalId ?? null };
+    }
+
+    case 'logs.tail': {
+      const entries = runnerLogger.query(p as unknown as LogQueryFilter);
+      return {
+        ok: true,
+        entries,
+        level: runnerLogger.getLevel(),
+        bufferedCount: runnerLogger.getBufferedCount(),
+      };
+    }
+
+    case 'logs.setLevel': {
+      const nextLvl = normalizeLogLevel(p.level, runnerLogger.getLevel());
+      runnerLogger.setLevel(nextLvl);
+      return { ok: true, level: nextLvl };
+    }
+
+    case 'logs.clear': {
+      return { ok: true, ...runnerLogger.clear() };
+    }
+
+    case 'shutdown': {
+      rlog.info('runner.shutdown', 'Graceful shutdown requested by host');
+      // Respond cleanly first so host transport knows graceful cleanup completed, then exit
+      setImmediate(() => {
+        void shutdown();
+      });
+      return { ok: true, runnerId, shuttingDown: true };
     }
 
     case 'env.doctor': {
@@ -218,6 +450,7 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       return runDoctor({
         upstreamProxy: typeof p.upstreamProxy === 'string' && p.upstreamProxy ? p.upstreamProxy : undefined,
         strictWsl2: Boolean(p.strictWsl2),
+        profile: typeof p.profile === 'string' ? (p.profile as 'core' | 'standard' | 'universal') : undefined,
       });
     }
 
@@ -227,14 +460,25 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       if (fs.existsSync(cacheBase)) {
         const st = fs.lstatSync(cacheBase);
         if (!st.isSymbolicLink() && st.isDirectory()) {
-          for (const entry of fs.readdirSync(cacheBase)) {
-            const full = path.join(cacheBase, entry);
-            fs.rmSync(full, { recursive: true, force: true });
-            clearedEntries += 1;
-          }
+          clearedEntries = fs.readdirSync(cacheBase).length;
+          forceRemoveReadOnlyTree(cacheBase);
         }
       }
-      return { ok: true, cacheBase, clearedEntries };
+      const swept = sweepOrphanedRunnerTempDirs({
+        excludeDirs: [procManager.getRuntimeDir(), proxyDir],
+      });
+      rlog.info('cache.cleared', `Cleared ${clearedEntries} sandbox cache dirs and ${swept.sweptDirs.length} orphan temp dirs`, {
+        clearedEntries,
+        sweptTempDirs: swept.sweptDirs.length,
+      });
+      return { ok: true, cacheBase, clearedEntries, sweptTempDirs: swept.sweptDirs };
+    }
+
+    case 'wsl.footprint': {
+      return {
+        ok: true,
+        ...collectWslFootprint(),
+      };
     }
 
     case 'wsl.backupConfigs': {
@@ -248,32 +492,37 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
 
       if (fs.existsSync('/etc/wsl.conf')) {
         wslConfContent = fs.readFileSync('/etc/wsl.conf', 'utf8');
-        const origPath = path.join(backupDir, 'wsl.conf.orig');
-        if (!fs.existsSync(origPath) && !fs.existsSync(`${origPath}.absent`)) {
-          fs.writeFileSync(origPath, wslConfContent, { mode: 0o600 });
-          savedFiles.push(origPath);
-        }
-        const snapPath = path.join(backupDir, `wsl.conf.${ts}.bak`);
-        fs.writeFileSync(snapPath, wslConfContent, { mode: 0o600 });
-        savedFiles.push(snapPath);
+        const res = writeDeduplicatedReadOnlyBackup({
+          backupDir,
+          origFileName: 'wsl.conf.orig',
+          rollingPrefix: 'wsl.conf',
+          rollingExt: 'bak',
+          timestamp: ts,
+          content: wslConfContent,
+          maxRolling: 5,
+        });
+        savedFiles.push(...res.savedPaths);
       } else {
         const absentPath = path.join(backupDir, 'wsl.conf.orig.absent');
         if (!fs.existsSync(absentPath) && !fs.existsSync(path.join(backupDir, 'wsl.conf.orig'))) {
-          fs.writeFileSync(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`, { mode: 0o600 });
+          fs.writeFileSync(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`, { mode: 0o400 });
+          try { fs.chmodSync(absentPath, 0o400); } catch { /* best effort */ }
           savedFiles.push(absentPath);
         }
       }
 
       if (fs.existsSync('/etc/fstab')) {
         fstabContent = fs.readFileSync('/etc/fstab', 'utf8');
-        const origFstab = path.join(backupDir, 'fstab.orig');
-        if (!fs.existsSync(origFstab)) {
-          fs.writeFileSync(origFstab, fstabContent, { mode: 0o600 });
-          savedFiles.push(origFstab);
-        }
-        const snapFstab = path.join(backupDir, `fstab.${ts}.bak`);
-        fs.writeFileSync(snapFstab, fstabContent, { mode: 0o600 });
-        savedFiles.push(snapFstab);
+        const res = writeDeduplicatedReadOnlyBackup({
+          backupDir,
+          origFileName: 'fstab.orig',
+          rollingPrefix: 'fstab',
+          rollingExt: 'bak',
+          timestamp: ts,
+          content: fstabContent,
+          maxRolling: 5,
+        });
+        savedFiles.push(...res.savedPaths);
       }
 
       if (fs.existsSync('/proc/mounts')) {
@@ -283,9 +532,16 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
             .split('\n')
             .filter((line) => /drvfs|9p|\/mnt\//.test(line))
             .join('\n');
-          const snapMounts = path.join(backupDir, `drvfs-mounts.${ts}.txt`);
-          fs.writeFileSync(snapMounts, drvfsMountsContent + '\n', { mode: 0o600 });
-          savedFiles.push(snapMounts);
+          const res = writeDeduplicatedReadOnlyBackup({
+            backupDir,
+            origFileName: 'drvfs-mounts.orig.txt',
+            rollingPrefix: 'drvfs-mounts',
+            rollingExt: 'txt',
+            timestamp: ts,
+            content: drvfsMountsContent + '\n',
+            maxRolling: 5,
+          });
+          savedFiles.push(...res.savedPaths);
         } catch {
           // ignore unreadable /proc/mounts
         }
@@ -328,20 +584,49 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
   }
 }
 
+let shuttingDown = false;
+
+function cleanupTempArtifactsSync(): void {
+  runnerLogger.dispose();
+  procManager.cleanupSync();
+  try {
+    fs.rmSync(proxyDir, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+}
+
 async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  // Hard exit watchdog guarantees the WSL runner can NEVER hang on exit/disable
+  const watchdog = setTimeout(() => {
+    cleanupTempArtifactsSync();
+    process.exit(0);
+  }, 3000);
+  watchdog.unref();
+
   for (const [, cb] of pendingCallbacks) {
     clearTimeout(cb.timer);
     cb.resolve(false);
   }
   pendingCallbacks.clear();
+
   if (managedProxy) {
-    await managedProxy.stop().catch(() => {});
+    const p = managedProxy;
     managedProxy = undefined;
+    await p.stop().catch(() => {});
   }
-  await procManager.disposeAll();
-  fs.rmSync(proxyDir, { recursive: true, force: true });
+  await procManager.disposeAll().catch(() => {});
+  cleanupTempArtifactsSync();
+  clearTimeout(watchdog);
   process.exit(0);
 }
+
+process.on('exit', () => {
+  cleanupTempArtifactsSync();
+});
 
 if (leaseMs > 0) {
   const leaseTimer = setInterval(() => {
@@ -417,6 +702,12 @@ rl.on('line', (line) => {
 rl.on('close', () => {
   void shutdown();
 });
-
+process.stdin.on('end', () => {
+  void shutdown();
+});
+process.stdin.on('close', () => {
+  void shutdown();
+});
+process.on('SIGHUP', () => void shutdown());
 process.on('SIGTERM', () => void shutdown());
 process.on('SIGINT', () => void shutdown());

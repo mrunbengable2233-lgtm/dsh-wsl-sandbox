@@ -2,14 +2,20 @@ import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import readline from 'node:readline';
 import {
+  buildHostNodeChildEnv,
+  buildWslNodeSpawnArgs,
   failSandbox,
   isValidIdentifier,
+  type LogLevel,
   MAX_RPC_FRAME_BYTES,
+  parseRunnerWireLog,
+  resolveSharedHostNodeRuntime,
   type RpcCallbackRequest,
   type RpcCallbackResponse,
   type RpcRequest,
   type RpcResponse,
   SandboxError,
+  type StructuredLogger,
 } from '../../core/src/index.ts';
 
 export interface WslTransportOptions {
@@ -19,7 +25,11 @@ export interface WslTransportOptions {
   readonly runnerPath: string;
   readonly nodeExecutable?: string;
   readonly wslExecutable?: string;
+  readonly logLevel?: LogLevel;
+  readonly logger?: StructuredLogger;
+  /** Idle self-termination lease inside WSL runner (defaults to 180s with 30s heartbeat so crashed hosts leave 0 orphans). */
   readonly runnerLeaseMs?: number;
+  readonly heartbeatIntervalMs?: number;
   readonly onAuthorizeProxyHost?: (host: string, port: number) => Promise<boolean>;
   readonly onStderr?: (line: string) => void;
 }
@@ -30,20 +40,33 @@ interface InFlightCall {
   readonly timer: NodeJS.Timeout;
 }
 
+const DEFAULT_RUNNER_LEASE_MS = 180_000;
+const DEFAULT_HEARTBEAT_MS = 30_000;
+
 /**
  * Persistent NDJSON RPC transport connecting the DSH Host plugin to `wsl-runner`.
  *
- * Security invariants:
- * - Always uses `shell: false` (never passes untrusted strings to cmd.exe or pwsh).
- * - Zero silent fallback to Windows host execution when WSL is unavailable.
- * - Cleanly rejects all in-flight RPCs on runner EOF/crash and supports bidirectional
- *   `proxy.authorizeHost` approval callbacks.
+ * Lifecycle, shared-Node & leak-prevention invariants:
+ * - Always uses `shell: false` on the Windows host and passes `--cd ~` to `wsl.exe` so the Linux
+ *   runner NEVER holds an open working-directory handle on any Windows NTFS plugin or project folder.
+ * - Shares Node.js cleanly:
+ *   - On `local-linux`: reuses DSH's own `process.execPath` carrier (`ELECTRON_RUN_AS_NODE=1` when
+ *     inside Electron DSH Desktop, with `NODE_OPTIONS`/`TSX_*` scrubbed).
+ *   - On `wsl`: resolves shared Linux `node` across `.dsh-wsl-env.sh`, `~/.dsh/runtime/bin`, `mise`,
+ *     `nvm`, `fnm`, `volta`, and `/usr/bin` via positional `sh -c '... exec "$NODE_BIN" "$TARGET"'`,
+ *     preserving exact runner PID while strictly rejecting `/mnt/*.exe`.
+ * - Ingests `[DSH_RUNNER_LOG]` structured lines from runner `stderr` into the Host `StructuredLogger`
+ *   so runner events are unified into Host's coalesced `2.5s` batched sink with ZERO extra WSL VHDX I/O.
  */
 export class WslTransport {
   private readonly options: WslTransportOptions;
   private child: ChildProcessWithoutNullStreams | undefined;
-  private rl: readline.Interface | undefined;
+  private stdoutRl: readline.Interface | undefined;
+  private stderrRl: readline.Interface | undefined;
+  private heartbeatTimer: NodeJS.Timeout | undefined;
+  private processExitHook: (() => void) | undefined;
   private readonly inFlight = new Map<string, InFlightCall>();
+  private runnerNodeInfo: { nodeVersion?: string; nodeExecPath?: string } = {};
   private disposed = false;
 
   constructor(options: WslTransportOptions) {
@@ -57,30 +80,70 @@ export class WslTransport {
     return Boolean(this.child && !this.child.killed && this.child.exitCode === null);
   }
 
+  getChildPid(): number | undefined {
+    return this.child?.pid;
+  }
+
+  getRunnerNodeInfo(): { readonly nodeVersion?: string; readonly nodeExecPath?: string } {
+    return this.runnerNodeInfo;
+  }
+
+  private clearHeartbeatAndExitHook(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+    if (this.processExitHook) {
+      process.off('exit', this.processExitHook);
+      this.processExitHook = undefined;
+    }
+  }
+
+  private closeReadlines(): void {
+    this.stdoutRl?.close();
+    this.stdoutRl = undefined;
+    this.stderrRl?.close();
+    this.stderrRl = undefined;
+  }
+
   async ensureStarted(): Promise<void> {
     if (this.disposed) {
       failSandbox('BACKEND_UNAVAILABLE', 'WslTransport has been disposed');
     }
     if (this.isRunning()) return;
 
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    if (this.options.runnerLeaseMs && this.options.runnerLeaseMs > 0) {
-      env.DSH_WSL_RUNNER_LEASE_MS = String(this.options.runnerLeaseMs);
-    }
+    const leaseMs = this.options.runnerLeaseMs ?? DEFAULT_RUNNER_LEASE_MS;
+    const logLevel = this.options.logLevel ?? this.options.logger?.getLevel() ?? 'info';
 
     let command: string;
     let args: string[];
+    let env: NodeJS.ProcessEnv;
 
     if (this.options.mode === 'wsl') {
       command = this.options.wslExecutable ?? 'wsl.exe';
-      args = ['-d', this.options.distro];
-      if (this.options.username) {
-        args.push('-u', this.options.username);
-      }
-      args.push('--', this.options.nodeExecutable ?? 'node', this.options.runnerPath);
+      args = buildWslNodeSpawnArgs({
+        distro: this.options.distro,
+        username: this.options.username,
+        nodeExecutable: this.options.nodeExecutable,
+        scriptPath: this.options.runnerPath,
+        leaseMs,
+        logLevel,
+      });
+      env = buildHostNodeChildEnv(process.env, {
+        DSH_WSL_RUNNER_LEASE_MS: leaseMs > 0 ? String(leaseMs) : undefined,
+      });
     } else {
-      command = this.options.nodeExecutable ?? process.execPath;
+      const hostNode = resolveSharedHostNodeRuntime(this.options.nodeExecutable);
+      command = hostNode.executable;
       args = [this.options.runnerPath];
+      env = buildHostNodeChildEnv(
+        process.env,
+        {
+          DSH_WSL_RUNNER_LEASE_MS: leaseMs > 0 ? String(leaseMs) : undefined,
+          DSH_WSL_LOG_LEVEL: logLevel,
+        },
+        this.options.nodeExecutable,
+      );
     }
 
     const child = spawn(command, args, {
@@ -91,37 +154,88 @@ export class WslTransport {
     });
 
     this.child = child;
+    this.options.logger?.log('info', {
+      component: 'transport',
+      event: 'transport.spawn',
+      message: `Spawned WSL sandbox runner (${this.options.mode}:${this.options.distro}, pid=${child.pid ?? 'pending'})`,
+      data: {
+        mode: this.options.mode,
+        distro: this.options.distro,
+        runnerPath: this.options.runnerPath,
+        childPid: child.pid ?? null,
+      },
+    });
 
-    child.stderr.on('data', (chunk: Buffer) => {
-      const text = chunk.toString('utf8').trim();
-      if (text) this.options.onStderr?.(text);
+    const onProcessExit = (): void => {
+      try {
+        if (!child.killed && child.exitCode === null) {
+          try { child.stdin.destroy(); } catch { /* ignore */ }
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
+        }
+      } catch {
+        // ignore
+      }
+    };
+    this.processExitHook = onProcessExit;
+    process.once('exit', onProcessExit);
+
+    const stderrRl = readline.createInterface({ input: child.stderr, crlfDelay: Infinity });
+    this.stderrRl = stderrRl;
+    stderrRl.on('line', (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      const wireEntry = parseRunnerWireLog(trimmed);
+      if (wireEntry) {
+        this.options.logger?.ingestExternal(wireEntry);
+        return;
+      }
+      this.options.logger?.log('warn', {
+        component: 'transport',
+        event: 'runner.stderr',
+        message: trimmed,
+      });
+      this.options.onStderr?.(trimmed);
     });
 
     const rejectAll = (reason: string): void => {
+      this.clearHeartbeatAndExitHook();
       for (const [id, call] of this.inFlight) {
         clearTimeout(call.timer);
         call.reject(new SandboxError('BACKEND_UNAVAILABLE', reason));
         this.inFlight.delete(id);
       }
-      this.rl?.close();
-      this.rl = undefined;
+      this.closeReadlines();
       if (this.child === child) {
         this.child = undefined;
       }
     };
 
     child.once('error', (err) => {
+      this.options.logger?.log('error', {
+        component: 'transport',
+        event: 'transport.error',
+        message: `Failed to spawn WSL runner (${command}): ${err.message}`,
+        data: { command, error: err.message },
+      });
       rejectAll(`Failed to spawn WSL runner (${command}): ${err.message}`);
     });
 
     child.once('exit', (code, signal) => {
+      if (!this.disposed) {
+        this.options.logger?.log('warn', {
+          component: 'transport',
+          event: 'transport.exit',
+          message: `WSL runner exited (code=${code}, signal=${signal})`,
+          data: { code, signal },
+        });
+      }
       rejectAll(`WSL runner exited unexpectedly (code=${code}, signal=${signal})`);
     });
 
-    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-    this.rl = rl;
+    const stdoutRl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    this.stdoutRl = stdoutRl;
 
-    rl.on('line', (line) => {
+    stdoutRl.on('line', (line) => {
       if (!line.trim()) return;
       if (Buffer.byteLength(line, 'utf8') > MAX_RPC_FRAME_BYTES) return;
 
@@ -145,6 +259,15 @@ export class WslTransport {
       this.inFlight.delete(resp.id);
 
       if (resp.ok) {
+        if (resp.result && typeof resp.result === 'object') {
+          const rObj = resp.result as { nodeVersion?: unknown; nodeExecPath?: unknown };
+          if (typeof rObj.nodeVersion === 'string') {
+            this.runnerNodeInfo = {
+              nodeVersion: rObj.nodeVersion,
+              nodeExecPath: typeof rObj.nodeExecPath === 'string' ? rObj.nodeExecPath : this.runnerNodeInfo.nodeExecPath,
+            };
+          }
+        }
         pending.resolve(resp.result);
       } else {
         const errCode = resp.error?.code ?? 'PROCESS_EXIT';
@@ -153,6 +276,15 @@ export class WslTransport {
         );
       }
     });
+
+    if (leaseMs > 0) {
+      const interval = Math.max(2000, Math.min(this.options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS, Math.floor(leaseMs / 3)));
+      this.heartbeatTimer = setInterval(() => {
+        if (!this.isRunning()) return;
+        void this.call('ping', {}, 5_000).catch(() => {});
+      }, interval);
+      this.heartbeatTimer.unref();
+    }
   }
 
   private async handleRunnerCallback(cb: RpcCallbackRequest): Promise<void> {
@@ -196,6 +328,12 @@ export class WslTransport {
     return new Promise<TResult>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.inFlight.delete(id);
+        this.options.logger?.log('error', {
+          component: 'transport',
+          event: 'transport.rpcTimeout',
+          message: `WSL runner RPC '${method}' timed out after ${timeoutMs}ms`,
+          data: { method, timeoutMs },
+        });
         reject(new SandboxError('TIMEOUT', `WSL runner RPC '${method}' timed out after ${timeoutMs}ms`));
       }, timeoutMs);
       timer.unref();
@@ -216,10 +354,26 @@ export class WslTransport {
     });
   }
 
-  async invalidate(minValidGeneration: number): Promise<number> {
+  async setRunnerLogLevel(level: LogLevel): Promise<void> {
+    if (!this.isRunning()) return;
+    await this.call('logs.setLevel', { level }, 3_000).catch(() => {});
+  }
+
+  async invalidate(
+    minValidGeneration: number,
+    scope?: { readonly sessionId?: string; readonly terminalId?: string },
+  ): Promise<number> {
     if (!this.isRunning()) return 0;
     try {
-      const res = await this.call<{ killedCount: number }>('invalidate', { generation: minValidGeneration }, 10_000);
+      const res = await this.call<{ killedCount: number }>(
+        'invalidate',
+        {
+          generation: minValidGeneration,
+          sessionId: scope?.sessionId,
+          terminalId: scope?.terminalId,
+        },
+        10_000,
+      );
       return res.killedCount;
     } catch {
       return 0;
@@ -227,11 +381,35 @@ export class WslTransport {
   }
 
   async dispose(): Promise<void> {
+    if (this.disposed) return;
     this.disposed = true;
+    this.clearHeartbeatAndExitHook();
+
     const child = this.child;
+
+    // 1. Send graceful shutdown RPC first so in-WSL runner closes proxy sockets, kills owned PGIDs,
+    //    flushes logs, and deletes /tmp/dsh-wsl-* cleanly before stdio closes.
+    if (child && !child.killed && child.exitCode === null && child.stdin.writable) {
+      try {
+        const id = randomUUID();
+        const frame: RpcRequest = { id, method: 'shutdown', params: {} };
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, 1200);
+          t.unref();
+          this.inFlight.set(id, {
+            resolve: () => { clearTimeout(t); resolve(); },
+            reject: () => { clearTimeout(t); resolve(); },
+            timer: t,
+          });
+          child.stdin.write(JSON.stringify(frame) + '\n', () => {});
+        });
+      } catch {
+        // Proceed to EOF / signal teardown
+      }
+    }
+
     this.child = undefined;
-    this.rl?.close();
-    this.rl = undefined;
+    this.closeReadlines();
 
     for (const [id, call] of this.inFlight) {
       clearTimeout(call.timer);
@@ -258,9 +436,15 @@ export class WslTransport {
         try {
           child.stdin.end();
         } catch {
-          child.kill('SIGTERM');
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
         }
       });
     }
+
+    this.options.logger?.log('info', {
+      component: 'transport',
+      event: 'transport.disposed',
+      message: 'WslTransport disposed cleanly',
+    });
   }
 }

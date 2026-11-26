@@ -73,29 +73,30 @@ flowchart TB
 
 这是最容易写出挂载逃逸或挂载失败 bug 的地方，请重点审查以下严格顺序：
 1. **顶层目录选择性只读绑定**：遍历 `/` 下顶层条目，跳过 `dev, proc, sys, tmp, run, mnt, shares`（`SKIP_TOP_LEVEL`），对其余目录执行 `--ro-bind /usr /usr` 等或 `--symlink`。
-2. **WSL 特有跨界逃逸面内存盘遮蔽（Checklist C）**：
+2. **WSL 特有跨界逃逸面与私有配置目录内存盘遮蔽（Checklist C + Config Isolation）**：
    - `--dev /dev`、`--proc /proc`、`--ro-bind /sys /sys`
    - `--tmpfs /tmp`、`--tmpfs /var/tmp`
    - `--tmpfs /run`：**一次性抹除 `/run/WSL/*`（WSL `init` 互操作套接字，可被用于在宿主 Windows 上免审拉起任意 `.exe`！）、`/run/dbus/system_bus_socket`、`docker.sock`、`podman.sock`、`containerd.sock`**。
    - `--tmpfs /mnt`：**一次性抹除 `/mnt/c`、`/mnt/d`（9P DrvFS Windows 全盘挂载）、`/mnt/wsl`（跨发行版共享盘）以及 `/mnt/wslg`（WSLg Wayland/X11/PulseAudio 与 `/mnt/wslg/distro` 原始发行版只读镜像）**。
-   - 额外高危套接字发现与遮蔽（`discoverSocketsToMask`，`bwrap-builder.ts:143-184`）：自动解析环境变量中的 `SSH_AUTH_SOCK`、`GPG_AGENT_INFO`、`XDG_RUNTIME_DIR/bus`（跟随 `realpath` 同时遮蔽符号链接源与目标，解析失败则 `SANDBOX_PREPARATION_FAILED` 拒绝启动），将位于 `/home` 等非 `tmpfs` 路径下的高危 socket `--ro-bind /dev/null <sock>`。
+   - **私有配置与凭证目录内核级遮蔽**（`SENSITIVE_HOME_CONFIG_DIRS` / `SENSITIVE_HOME_CREDENTIAL_FILES`，`bwrap-builder.ts`）：对 `$HOME/.dsh`、`$HOME/.config/dsh-wsl-sandbox`、`$HOME/.ssh`、`$HOME/.gnupg`、`$HOME/.aws`、`$HOME/.kube`、`$HOME/.docker` 自动叠加 `--tmpfs <dir> --remount-ro <dir>`，对 `.git-credentials`/`.netrc`/`.npmrc`/`.pypirc`/shell history 叠加 `--ro-bind <emptyMask> <file>`，确保沙箱内 AI 对插件自身配置、备份快照及宿主机凭证**零读取、零写入权限**。
+   - 额外高危套接字发现与遮蔽（`discoverSocketsToMask`，`bwrap-builder.ts`）：自动解析环境变量中的 `SSH_AUTH_SOCK`、`GPG_AGENT_INFO`、`XDG_RUNTIME_DIR/bus`（跟随 `realpath` 同时遮蔽符号链接源与目标，解析失败则 `SANDBOX_PREPARATION_FAILED` 拒绝启动），将位于 `/home` 等非 `tmpfs` 路径下的高危 socket `--ro-bind /dev/null <sock>`。
 3. **按需注入受控 UDS 代理与受控单目录 `/shares/<alias>`**：
    - 当 `networkMode === 'allowlist-proxy'` 时：校验 `proxySocketHostPath` 物理存在后，挂载 `--tmpfs /run/dsh-proxy` + `--bind <host_sock> /run/dsh-proxy/proxy.sock`。
-   - 当人类在主界面配置了单目录共享时：挂载 `--tmpfs /shares` + `--ro-bind`（或 `--bind`）`<oldroot_src> /shares/<alias>`。注意 `bwrap` 在内部通过 `oldroot` 解析源路径 `/mnt/d/Datasets/ESP32`，因此即使新根 `/newroot/mnt` 已被空 `tmpfs` 覆盖，单目录挂载依然精准生效，且沙箱内 `/mnt` 仍保持完全空白。
-4. **锁死新根 `/` 为只读**：在顶层挂载点（`/shares`、`/run`、`/mnt`）创建完毕**之后**，执行 `--remount-ro /`（`bwrap-builder.ts:277`），防止沙箱在 `/` 下新建任何顶层目录。
-5. **绑定工作区与 Checklist B 工作区内敏感文件只读锁死**（`bwrap-builder.ts:280-333`）：
+   - 当人类在主界面配置了单目录共享时：挂载 `--tmpfs /shares` + `--ro-bind`（或 `--bind`）`<oldroot_src> /shares/<alias>`。注意 `bwrap` 在内部通过 `oldroot` 解析源路径（如 `/mnt/d/Datasets/Project`），因此即使新根 `/newroot/mnt` 已被空 `tmpfs` 覆盖，单目录挂载依然精准生效，且沙箱内 `/mnt` 仍保持完全空白。同时严禁指向配置目录、`AppData/Local/Packages` 或 WSL 发行版 VHDX `BasePath`。
+4. **锁死新根 `/` 为只读**：在顶层挂载点（`/shares`、`/run`、`/mnt`）创建完毕**之后**，执行 `--remount-ro /`（`bwrap-builder.ts`），防止沙箱在 `/` 下新建任何顶层目录。
+5. **绑定工作区与 Checklist B 工作区内敏感文件只读锁死**（`bwrap-builder.ts`）：
    - 在 `workspace-write` 模式下先 `--bind <workspaceRoot> <workspaceRoot>`，**随后紧接着**对工作区内的敏感配置覆盖挂载 `--ro-bind`（利用 Linux VFS 子挂载覆盖父挂载的语义使其返回 `EROFS`）：
      - 锁死文件（`packages/core/src/dangerous-paths.ts`）：`.gitconfig`, `.gitmodules`, `.bashrc`, `.bash_profile`, `.zshrc`, `.profile`, `.mcp.json`, `.ripgreprc` 等。
      - 锁死目录：`.git/hooks`, `.git/config`, `.vscode`, `.idea`, `.agents`, `.claude`, `.dsh`, `.trellis` 等。
-   - **不存在路径的防创建占位与并发引用计数清理**：若 `.git` 存在但 `.git/hooks` 尚不存在，若不挂载则沙箱可在运行期间自行 `mkdir .git/hooks` 植入恶意 `post-checkout` 钩子。因此 `bwrap-builder` 将只读空文件 `--ro-bind <emptyMask> <workspace>/.git/hooks` 挂载上去；由于 `bwrap` 会在宿主机侧创建 0 字节挂载点占位文件，`ConfinedProcManager`（`packages/wsl-runner/src/proc-manager.ts:184-223`）维护了 `placeholderRefs: Map<string, number>` 引用计数，仅当并发沙箱全部退出且占位文件仍为 0 字节普通文件时才 `unlinkSync`，彻底消除并发竞态误删。
+   - **不存在路径的防创建占位与并发引用计数清理**：若 `.git` 存在但 `.git/hooks` 尚不存在，若不挂载则沙箱可在运行期间自行 `mkdir .git/hooks` 植入恶意 `post-checkout` 钩子。因此 `bwrap-builder` 将只读空文件 `--ro-bind <emptyMask> <workspace>/.git/hooks` 挂载上去；由于 `bwrap` 会在宿主机侧创建 0 字节挂载点占位文件，`ConfinedProcManager`（`packages/wsl-runner/src/proc-manager.ts`）维护了 `placeholderRefs: Map<string, number>` 引用计数，仅当并发沙箱全部退出且占位文件仍为 0 字节普通文件时才 `unlinkSync`，彻底消除并发竞态误删。
 6. **`.env*` 密钥文件自动归零遮蔽**：扫描工作区深度 `<= 3` 的 `.env` / `.env.*`（显式豁免 `.env.example` / `.env.sample` / `.env.template`），统一 `--ro-bind <emptyMask> <envFile>`，沙箱读取时返回空内容而非宿主机真实密钥。
 
 ### 3.3 原生 `seccomp-bpf` (`struct sock_filter`) 字节码编译器
-代码位置：`packages/core/src/seccomp-bpf.ts:1-284`
+代码位置：`packages/core/src/seccomp-bpf.ts`
 
-为保证零原生 C 插件编译依赖（无需 `libseccomp-dev` 或 `node-gyp`），我们用纯 TypeScript 实现了小端序 Linux Classic BPF (`cBPF`, `8 bytes/insn`) 汇编器，通过匿名临时文件打开只读 FD 3 传给 `bwrap --seccomp 3`（子进程继承后父进程立即 `close` + `unlink`，见 `proc-manager.ts:283-330`）。
+为保证零原生 C 插件编译依赖（无需 `libseccomp-dev` 或 `node-gyp`），我们用纯 TypeScript 实现了小端序 Linux Classic BPF (`cBPF`, `8 bytes/insn`) 汇编器，通过匿名临时文件打开只读 FD 3 传给 `bwrap --seccomp 3`（子进程继承后父进程立即 `close` + `unlink`，见 `proc-manager.ts`）。
 
-BPF 过滤器执行流（请核对 `seccomp-bpf.ts:225-283`）：
+BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 1. **严格校验 `seccomp_data.arch`（偏移 `4`）**：
    - `x86_64` 仅允许 `AUDIT_ARCH_X86_64 (0xc000003e)`；`aarch64` 仅允许 `AUDIT_ARCH_AARCH64 (0xc00000b7)`。
    - 不匹配直接返回 `SECCOMP_RET_KILL_PROCESS (0x80000000)`，**彻底堵死 `int 0x80` / `IA32` 32 位兼容系统调用号混淆绕过**。
@@ -111,42 +112,66 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts:225-283`）：
    - **无条件封禁 `AF_PACKET (17)` -> `EPERM`**：防止构造原始链路层套接字。
    - 在 `offline` 模式下，仅放行 `AF_UNIX (1)` 与 `AF_NETLINK (16)`（glibc `getaddrinfo` 在空 netns 内的兼容性探测），其余如 `AF_INET`/`AF_INET6` 直接返回 `EACCES`。
 
-### 3.4 资源配额限制 (`prlimit`) 与进程组生命周期回收
-- **资源硬上限**（`bwrap-builder.ts:40-44, 368-381`）：沙箱内部入口包裹 `prlimit --nproc=256 --nofile=1024 --fsize=536870912 -- <argv>`，防止 fork 炸弹耗尽 WSL VM PID 表或单文件写爆虚拟磁盘（`512 MiB` 上限）。
-- **输出流有界收集**（`proc-manager.ts:44-132`）：内存仅保留尾部 `256 KiB`，溢出部分写入 `0600` 临时 spill 文件（硬上限 `10 MiB`），防止 `yes` 类无限输出打爆 Runner 堆内存。
-- **整组信号强杀**（`proc-manager.ts:321-375`）：`bwrap` 以 `detached: true` 成为独立进程组长（PGID = `child.pid`），同时内部 `--new-session` 调 `setsid()` 脱离控制终端防 `TIOCSTI`。超时、取消挂载或人工点击「熔断强杀」时，Runner 发送 `kill(-pid, SIGTERM)`，宽限期（默认 `2000ms`）未退则发送 `kill(-pid, SIGKILL)`。
+### 3.4 资源配额限制 (`prlimit`)、多会话进程隔离与零残留退出回收
+- **资源硬上限**（`bwrap-builder.ts`）：沙箱内部入口包裹 `prlimit --nproc=256 --nofile=1024 --fsize=536870912 -- <argv>`，防止 fork 炸弹耗尽 WSL VM PID 表或单文件写爆虚拟磁盘（`512 MiB` 上限）。
+- **输出流有界收集与 FD 零泄漏**（`proc-manager.ts`）：内存仅保留尾部 `256 KiB`，溢出部分写入 `0600` 临时 spill 文件（硬上限 `10 MiB`）；`finish()` 具幂等性并在 `finally` 中无条件执行，即使 `bwrap` spawn 失败也不会泄漏 `spillFd`。
+- **严格会话/终端作用域与 PGID 归属校验（不误杀其他终端会话）**：
+  - `ConfinedTerminalManager` 以 `${sessionId}::${terminalId}` 为键隔离并发 DSH 会话的工作目录与进程；每个活跃进程记录 `sessionId`、`terminalId` 与 `pgid`，并在环境变量中注入 `DSH_WSL_OWNER_RUNNER` / `DSH_WSL_SESSION_ID` / `DSH_WSL_EXEC_ID` / `DSH_WSL_TERMINAL_ID`。
+  - 发送 `kill(-pid, SIGTERM/SIGKILL)` 前先读取 `/proc/<pid>/stat` 核验 `pgrp === pid`（防 PID 复用误杀无关人类终端），且 `invalidate` / `term.reset` 严格按 `(sessionId, terminalId)` 作用域过滤，绝不波及其他 DSH 会话或人工 WSL 终端。
+  - 在 `allowlist-proxy` UDS 桥接封装中，将用户命令置于子壳 `( ... )` 内执行并在退出后显式回收 `$__dsh_bridge_pid`（`socat`/Node），彻底消除 `trap ... EXIT` 覆盖导致的孤儿 `socat` 残留。
+- **插件禁用 / DSH 退出零残留与零 NTFS 文件锁**：
+  - `WslTransport` 固定使用 `wsl.exe -d <Distro> --cd ~` 且 Runner 落地在 WSL 原生 `ext4`（`$HOME/.local/share/dsh-wsl-sandbox/runner/`），**对 Windows 插件目录保持零句柄占用**（支持随时卸载/删除目录，且完全兼容 WSL Manager 迁移磁盘实例与 `[automount] enabled = false`）。
+  - `WslTransport` 启用 `30s` 心跳 + `180s` 租约看门狗；`dispose()` 先发 `shutdown` RPC 优雅关闭（`UdsAllowlistProxy.stop()` 主动销毁全部活跃 HTTP/CONNECT socket 并删除 UDS 文件），并注册 `process.once('exit')` 同步清理钩子（正常 `dispose()` 时注销）与 `wsl-runner` 侧 `stdin end/close` / `SIGHUP` / `3s` 硬退出保险，杜绝孤儿进程与临时目录残留。
 
 ---
 
 ## 4. 受控文件系统、UDS 代理防 SSRF、单壳守卫与单票审批
 
-### 4.1 `ConfinedFsService` 防符号链接穿越与 TOCTOU 防护
-代码位置：`packages/wsl-runner/src/fs-service.ts:25-156`
-- `wsl_read` / `wsl_write` / `wsl_edit` / `wsl_glob` / `wsl_grep` 不启动完整 shell，由 Runner 在 WSL 原生 `ext4` 上直接服务（绕开缓慢的 9P 协议）。
-- **祖先链 `realpath` 校验**（`canonicalizeWithinRoot`）：即使写入目标文件尚不存在，也会向上回溯至最近已存在的祖先目录执行 `fs.realpathSync`，验证其严格位于 `realpath(workspaceRoot)` 或已授权 `/shares/<alias>` 内部，阻断通过指向外部的父目录软链接写穿工作区。
-- **`O_NOFOLLOW | O_CREAT | O_EXCL` 原子落盘**（`atomicWriteNoFollow`）：先 `lstat` 拒绝直接覆写符号链接目标，再以 `O_NOFOLLOW | O_EXCL` 创建同目录随机临时文件，`fsync` 后 `rename` 原子替换。
+### 4.1 `ConfinedFsService` 防符号链接穿越、Checklist B 对齐与落盘边界声明
+代码位置：`packages/wsl-runner/src/fs-service.ts` & `packages/wsl-runner/src/hygiene.ts`
+- **架构边界透明声明（内存遮蔽层 vs 受控落盘层）**：
+  - `bwrap` 的 `--tmpfs` 内存盘仅用于隔离遮蔽层（`/tmp`、`/var/tmp`、`/run`、`/mnt` 及 `~/.dsh`、`~/.config/dsh-wsl-sandbox`、`~/.ssh` 等敏感目录），随子进程退出销毁；
+  - `workspace-write` 下的 `workspaceRoot`、显式 `rw` 模式的 `/shares/<alias>`、默认 `cacheMode=workspace-persistent` 下的 `~/.cache/dsh-wsl-sandbox/<sha256-12>`（设 `ephemeral` 则不落盘）以及 `wsl_write`/`wsl_edit` 均属于受控 `ext4` 落盘写入。
+- **`wsl_write` / `wsl_edit` 与 `bwrap` 写保护完全对齐**：
+  - 由 Runner 在 WSL 原生 `ext4` 上直接服务（绕开缓慢的 9P 协议），同时在 `assertWriteAllowed` 中强制执行 `binding.profile === 'workspace-write'`、`share.mode === 'rw'`，并对 **`workspaceRoot` 与 `rw` 共享目录统一执行 `isProtectedWorkspaceWrite`（Checklist B：拦截 `.git/hooks`、`.gitconfig`、`.bashrc`、`.vscode`、`.dsh` 等）**。
+  - **祖先链 `realpath` 校验**（`canonicalizeWithinRoot`）与 **`O_NOFOLLOW | O_CREAT | O_EXCL` 原子落盘**（`atomicWriteNoFollow`）阻断符号链接写穿与 TOCTOU。
+- **WSL 2 真内存 `tmpfs` 运行期目录与 `kill -9` 孤儿清扫**：
+  - 鉴于 WSL 2（如 Ubuntu 24.04）中 `/tmp` 挂载在根磁盘 `ext4.vhdx` 而非内存盘，`resolveEphemeralRamTmpRoot` 优先解析 `/proc/mounts` 中真正的 `tmpfs`（`/run/user/<uid>` 或 `/dev/shm`）存放 `dsh-wsl-runner-*` 与 `dsh-wsl-proxy-*`（`wsl --terminate` 即随内核内存自动蒸发），同时写入 `owner.pid` 并在每次启动时跨 `/run/user/<uid>`、`/dev/shm`、`/tmp` 自动清扫 `SIGKILL` 崩溃残留（先解锁 `0444` `empty-mask` 再递归回收）与超 30 天未访问的缓存。
+- **零 `curl | sudo bash` 供应链加固与增量可逆卸载**：
+  - `provision-wsl.sh` 已彻底移除 `curl deb.nodesource.com/setup_XX.x | sudo -E bash`，改为校验官方 `SHASUMS256.txt` 后将预编译 Node 24 LTS 解压至用户态 `~/.local/share/dsh-wsl-sandbox/toolchains/node`（零 root APT 源污染）；所有备份启用 SHA-256 内容去重（最多保留 5 份滚动 `.bak`）；安装期增量包与路径记录于 `provision-manifest.json` / `install-manifest.json`，由 `uninstall-dsh-plugin.ps1` + `removeAgentsMdWslSection` 全量可逆回收。
 
 ### 4.2 `--unshare-net` 下的 UDS 白名单代理与 SSRF / DNS Rebinding 防御
-代码位置：`packages/core/src/uds-proxy.ts:68-248` & `packages/wsl-runner/src/proc-manager.ts:140-160`
+代码位置：`packages/core/src/uds-proxy.ts` & `packages/wsl-runner/src/proc-manager.ts`
 - 沙箱内部没有外网网卡，通过轻量级 `socat`（或内置 Node fallback）在沙箱私有 `127.0.0.1:<port>` 监听并转发至 `/run/dsh-proxy/proxy.sock`。
 - 沙箱外的 `UdsAllowlistProxy` 检验每一次 HTTP / `CONNECT` 请求：
   1. 校验域名是否命中内置开发源白名单（GitHub / npm / PyPI / Crates / GoProxy / Ubuntu / TUNA 等）或人工会话放行列表。
-  2. **强制拦截私网/环回/链路本地/云元数据 IP**（`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 `::1`, `fc00::/7`, `fe80::/10`, 以及 IPv4-mapped IPv6 `::ffff:127.0.0.1`），除非命中人类显式配置的 `localLabCidrs` / `localLabPorts` 嵌入式靶机网段。
+  2. **强制拦截私网/环回/链路本地/云元数据 IP**（`0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, IPv6 `::1`, `fc00::/7`, `fe80::/10`, 以及 IPv4-mapped IPv6 `::ffff:127.0.0.1`），除非命中人类显式配置的 `localLabCidrs` / `localLabPorts` 靶机网段。
   3. **防 DNS Rebinding**：直连模式下先在代理侧调用 `dns.lookup(host, { all: true })` 检查全部解析出的 A/AAAA 记录，若任一记录落入私网/环回网段立即以 SSRF 拦截。
+  4. **无挂起停机**：追踪全部 HTTP 与 `CONNECT` 上下游 `net.Socket`，`stop()` 时主动销毁所有隧道并 `unlink` 套接字文件。
 
 ### 4.3 单壳纯净度与预执行方言守卫（Single-Shell Purity & Dialect Guard）
 - **Windows 宿主侧 (`packages/core/src/pwsh-guard.ts`)**：
   - 先解码 `-EncodedCommand`（UTF-16LE Base64）并剥离 PowerShell 反引号 `` ` `` 与未加引号的 CMD 脱字符 `^` 混淆。
   - **L0 硬阻断**：外层 PowerShell 套内层 `cmd.exe` / `%COMSPEC%` / `--%`；混用 `pwsh.exe` 与 `powershell.exe` 子壳；交互挂起参数（`-NoExit`, `-Command -`, `Read-Host`, `pause`）；CMD 斜杠参数（`rmdir /s /q`, `del /f /q`, `move /y`）与 `2>nul` 保留名陷阱；`\\wsl.localhost\` / `\\wsl$\` 反向跨界写入；篡改 `.wslconfig` 或注册表。
-  - 同时兼容 `@linxin666/dsh-win-bash` (`win_bash`) 与 `dsh-ops` (`ops_bash`) 等宿主 POSIX 工具（按 POSIX 方言检查 UNC/`.wslconfig`/`wsl.exe` 绕过，不误报 PowerShell 规则，`packages/dsh-plugin/src/pwsh-hook.ts`）。
+  - 同时兼容 `@linxin666/dsh-win-bash` (`win_bash`) 与 `dsh-ops` (`ops_bash`) 等宿主 POSIX 工具（按 POSIX 方言检查 UNC/`.wslconfig`/`wsl.exe`/驱动变更，不误报 PowerShell 规则，`packages/dsh-plugin/src/pwsh-hook.ts`）。
 - **WSL 沙箱侧 (`packages/core/src/bash-ast-guard.ts`)**：
   - 在 `wsl_bash` 执行前拦截误粘贴的 PowerShell Cmdlet（`Get-ChildItem`, `Move-Item` 等）、`$env:VAR`、`%VAR%` 以及 `.exe` 跨界调用。
 
-### 4.4 动作哈希绑定的一次性审批票据与防 `dsh-purge` 穿透兜底
+### 4.4 动作哈希绑定的一次性审批票据与物理硬件/驱动单次降级锁
 代码位置：`packages/core/src/approval-controller.ts` & `packages/dsh-plugin/src/approval-bridge.ts`
 - 票据哈希：`SHA-256(canonicalJson({ binding, action }))`，绑定 `sessionId`、`uid`、`cwd`、`revision`、`generation`、`runnerId` 与精确命令，单次 `consume()` 后立即失效（防重放与审批调包）。
-- **防 `hooksDenyBypass` 自动放行穿透**：当宿主安装了 `dsh-purge` 并开启权限补丁时，`ctx.approval.request()` 会在 `< 15ms` 内无人工交互直接合成返回放行。`ApprovalBridge` 检测到非人工瞬时合成放行且请求属于高危/越界/未知域名/物理硬件时，**自动将其拦截转入本插件独立人工审批队列 (`/wsl-sandbox/api/approvals`)**。
-- **物理硬件硬编码降级锁**：凡触及 `/dev/ttyUSB*`, `/dev/ttyACM*`, `/dev/bus/usb/*`, `esptool`, `openocd`, `usbipd` 的请求，硬件级强制锁死为人工单次审批（`allowSessionRuleOption = false`），绝不允许缓存会话前缀。
+- **防 `hooksDenyBypass` 自动放行穿透**：当宿主安装了 `dsh-purge` 并开启权限补丁时，`ctx.approval.request()` 会在 `< 15ms` 内无人工交互直接合成返回放行。`ApprovalBridge` 检测到非人工瞬时合成放行且请求属于高危/越界/未知域名/物理硬件与驱动变更时，**自动将其拦截转入本插件独立人工审批队列 (`/wsl-sandbox/api/approvals`)**。
+- **物理硬件与 Windows 驱动硬编码降级锁**：凡触及以下任意对象或工具——`/dev/bus/usb/NNN/NNN`、`/dev/hidraw*`、`/dev/cdc-wdm*`、`/dev/video*`、`/dev/ttyUSB*`、`/dev/ttyACM*`，`usbipd bind|unbind|attach|detach`，手机 Bootloader/线刷工具（`fastboot` 非只读子命令、`adb reboot|sideload|install|push|root|remount|shell`、`odin`/`heimdall`/`qdl`/`edl`/`mtk`），Windows 驱动与网卡变更工具（`pnputil /add-driver|/delete-driver|/install|/enable-device|/disable-device`、`devcon`、`zadig`、`Enable/Disable/Set-NetAdapter*`、`Enable/Disable/Remove-PnpDevice`），以及串口/JTAG 烧录器（`esptool`/`openocd`/`avrdude`/`dfu-util`）——均强制锁死为人工单次审批（`allowSessionRuleOption = false`），绝不允许缓存会话前缀；同时放行只读查询（`usbipd list`、`Get-PnpDevice`、`Get-NetAdapter`、`pnputil /enum-drivers`、`adb devices`、`fastboot devices`）。
+
+### 4.5 共用 Node 运行时载体隔离与 SSD 友好型脱敏结构化日志
+代码位置：`packages/core/src/node-runtime.ts` & `packages/core/src/logger.ts`
+- **双侧共用 Node 运行时与跨界 `.exe` 阻断**：
+  - 宿主侧（`resolveSharedHostNodeRuntime`）与 `@deepseek-ai/dsh-subprocess-local` 保持一致：直接共用 DSH 进程自身 `process.execPath`（Electron 环境下注入 `ELECTRON_RUN_AS_NODE=1` 并剥离 `NODE_OPTIONS` / `TSX_*` 注入面），支持 `^22.19.0 || >=24.0.0`。
+  - WSL 2 侧（`WSL_SHARED_NODE_EXEC_SH` / `validateWslNodeExecutable`）在非登录 Shell 中主动清理 `PATH` 里的全部 `/mnt/*` 项，按固定安全优先级发现并复用 `~/.dsh/runtime/bin`、`mise`、`nvm`、`fnm`、`volta` 或 `/usr/bin` 下的原生 Linux ELF Node（`>=22` / 24 Active LTS），无条件拒绝 `/mnt/c/.../node.exe` 以防跨界回弹到 Windows 宿主执行。
+- **零常驻句柄、低写放大、自动脱敏的 NDJSON 日志引擎（`RotatingNdjsonSink` + `StructuredLogger`）**：
+  - **零 NTFS 文件夹锁 + 合并批量落盘**：不在空闲态持有打开的文件描述符；内存缓冲累积达 `2.5s` 或 `64 KiB` 时才执行单次 `openSync -> writeSync -> closeSync` 原子批量落盘，并在 `dispose()` / `process.once('exit')` 同步刷盘。
+  - **护盘限流与单边落盘**：内置 `3s` 重复风暴折叠与 `120 条/10s` 落盘速率上限，单文件 `5 MiB × 3` 滚动（权限 `0700`/`0600` + Windows `icacls /inheritance:r`）；WSL Runner 通过 `stderr` 内存管道回传结构化日志帧至宿主统一归档，默认不在 WSL `ext4.vhdx` 内重复写盘。
+  - **全内存 UI 查询与递归密钥脱敏**：启动时仅做尾部 `64 KiB` seek 预热，运行期 `/wsl-sandbox/api/logs` 查询 100% 由内存环形缓冲区响应（`0` 次磁盘读），并对 `API_KEY`、`TOKEN`、`SECRET`、`Authorization`、`Bearer`、`sk-...`、`ghp_...`、`AKIA...` 及 URL 内嵌口令执行深度递归脱敏。
 
 ---
 
@@ -158,10 +183,12 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts:225-283`）：
    - Windows 同一用户下的所有 WSL 2 发行版运行在**同一个轻量级 Hyper-V Linux 内核实例**之上。`bwrap` + `seccomp-bpf` 提供的是进程/命名空间/系统调用过滤隔离，而非独立 Hypervisor VM 级隔离。
    - 若攻击者在允许的系统调用子集（如常规 `read`/`write`/`mmap`/`futex`/`AF_UNIX`）中触发 Microsoft WSL 2 内核 0-day 提权漏洞，理论上可突破该 WSL 2 Utility VM 内核（但仍受外层 Windows Hyper-V VMBus 虚拟化边界约束）。
    - **缓解措施**：已通过 `--disable-userns` + `seccomp` 裁剪掉 `io_uring_*`, `bpf`, `unshare`, `mount`, `fsopen`, `keyctl`, `AF_VSOCK`, `AF_PACKET`, `x32` 等最高危内核子系统。若审阅极高危未知二进制恶意样本，建议在独立硬件或独立 QEMU/Hyper-V 全虚拟化靶机中进行。
-2. **`allowlist-proxy` 模式下的白名单域名侧信道**：
+2. **WSL 2 USBIP 驱动现实边界（手机解 BL / 免驱 USB 网卡）**：
+   - 微软默认 WSL 2 内核仅编入了极少数 USB 驱动模块。使用 `usbipd` 透传进 WSL 2 时，用户态 `libusb` 协议设备（如手机 ADB/Fastboot/EDL/DFU 通过 `/dev/bus/usb/NNN/NNN`）可工作，但许多手机原厂解锁工具依赖 Windows WinUSB/OEM 驱动，且许多 Windows 免驱 USB 网卡/外设在 WSL 2 默认内核中缺少对应 `.ko` 模块（无法在 WSL 2 内直接驱动）。本插件显式区分两条路径：不假设 USBIP 仅服务于串口开发板，而是允许用户在 Windows 侧以 L3 单次审批调用原厂驱动，或在 WSL 2 侧按精确节点放行。
+3. **`allowlist-proxy` 模式下的白名单域名侧信道**：
    - 默认白名单包含 `github.com`、`registry.npmjs.org`、`pypi.org` 等开发基础设施。若需执行完全断网的代码审计，请将 `networkMode` 切换为 **`offline`**（此时连 UDS 代理套接字也不会挂载进沙箱，且 `seccomp` 直接封禁 `AF_INET`/`AF_INET6`）。
-3. **WSL 底层 `drvfs` 自动挂载与沙箱 `--tmpfs /mnt` 的关系**：
-   - 默认状态下，`--tmpfs /mnt` 确保沙箱内的不可信进程看不到任何 Windows 盘符；但运行在沙箱**外部**（Trust Zone 1）的 `wsl-runner` 守护进程本身以你的普通 Linux 用户身份运行。如果你希望连 WSL 宿主命名空间也彻底卸载 Windows 盘符，可运行 `bash packages/bootstrap/provision-wsl.sh --disable-automount` 将 `/etc/wsl.conf` 设为 `[automount] enabled = false`。
+4. **WSL 底层 `drvfs` 自动挂载、共享配置路径与 `--terminate`**：
+   - 默认状态下，`--tmpfs /mnt` 确保沙箱内的不可信进程看不到任何 Windows 盘符；若需连 WSL 宿主命名空间也彻底卸载 Windows 盘符，可运行 `bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --disable-automount` 后在 Windows 执行单发行版重启 `wsl.exe --terminate <当前发行版名称>`（不伤及其他 WSL 会话）。注意 `/etc/wsl.conf` 与 `%USERPROFILE%\.wslconfig` 与 Windows WSL Settings / WSL Manager 共用，本插件绝不静默修改。
 
 ---
 
@@ -169,33 +196,38 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts:225-283`）：
 
 | 审计重点模块 | 核心源码文件 | 建议重点核查点 |
 | :--- | :--- | :--- |
-| 会话绑定与单目录共享路径校验 | `packages/core/src/binding.ts` | `UID > 0` 强校验；`normalizeSharePathInput` 与 `validateShareEntry` 对 `C:\`/`D:\`/`C:\Windows`/`C:\Users\<User>` 的拒绝逻辑 |
-| `bwrap` VFS 挂载树构造 | `packages/core/src/bwrap-builder.ts` | `--tmpfs /mnt` 与 `/run` 遮蔽；`--remount-ro /` 挂载顺序；Checklist B 只读覆盖与 `.env*` 遮蔽 |
+| 会话绑定、共享路径与设备节点校验 | `packages/core/src/binding.ts` | `UID > 0` 强校验；`validateWorkspaceRoot` / `validateShareEntry` 对 `C:\`/`D:\`/`AppData`/`.dsh`/`.ssh`/`.wslconfig` 拒绝逻辑；`validateDeviceNode` 对 USB/HID/CDC/video/serial 显式白名单 |
+| `bwrap` VFS 挂载树与配置遮蔽 | `packages/core/src/bwrap-builder.ts` | `--tmpfs /mnt` 与 `/run` 遮蔽；`$HOME` 下 `.dsh`/`.config/dsh-wsl-sandbox`/`.ssh` 等 `--tmpfs --remount-ro` 遮蔽；`--remount-ro /` 顺序；Checklist B 与 `.env*` 遮蔽 |
 | 原生 `seccomp-bpf` 字节码 | `packages/core/src/seccomp-bpf.ts` | `OFF_ARCH` / `X32_SYSCALL_BIT` / `OFF_ARG0_HI` 边界校验；`io_uring_*` 与 `AF_VSOCK (40)` 拦截 |
-| 沙箱子进程与 PGID 生命周期 | `packages/wsl-runner/src/proc-manager.ts` | `bpfFd` 继承后立即关闭删除；`placeholderRefs` 0 字节占位计数回收；`kill(-pid)` 信号升级 |
+| 沙箱子进程、多会话隔离与零残留回收 | `packages/wsl-runner/src/proc-manager.ts`<br>`packages/wsl-runner/src/pty-manager.ts`<br>`packages/wsl-runner/src/main.ts` | `bpfFd` 继承后即关即删；`${sessionId}::${terminalId}` 隔离；`/proc/<pid>/stat` PGID 归属校验；子壳 UDS bridge 回收；`spillFd` 幂等关闭；`stdin end/close` + `3s` 硬退出看门狗 |
+| 多发行版 / WSL Manager 发现与零锁传输 | `packages/dsh-plugin/src/wsl-discovery.ts`<br>`packages/dsh-plugin/src/wsl-transport.ts`<br>`scripts/stage-wsl-runner.mjs` | UTF-16LE `wsl.exe -l -v` + 只读 `Lxss` 注册表合并（支持迁移 VHDX）；`isInsideLxssBasePath` 防护；`--cd ~` + 原生 ext4 tar 部署（零 Windows NTFS 锁）；`30s` 心跳 + `shutdown` RPC + `exit` 同步钩子 |
+| 共用 Node 运行时与护盘脱敏日志 | `packages/core/src/node-runtime.ts`<br>`packages/core/src/logger.ts` | `ELECTRON_RUN_AS_NODE=1` 与 `NODE_OPTIONS` 剥离；WSL `/mnt/*` `.exe` 拦截；`2.5s`/`64 KiB` 合并批量落盘（空闲 `0` FD）；`3s` 去重折叠 + `120/10s` 限速；递归密钥脱敏 |
 | 受控文件读写与防软链逃逸 | `packages/wsl-runner/src/fs-service.ts` | `canonicalizeWithinRoot` 祖先链 `realpath`；`atomicWriteNoFollow` 的 `O_NOFOLLOW | O_EXCL` |
-| UDS 代理与防 SSRF / DNS 重绑定 | `packages/core/src/uds-proxy.ts` | `PRIVATE_IPV4_CIDRS`、`::ffff:` IPv4 映射地址与 `dns.lookup` 全记录核验 |
-| 单壳纯净度与方言静态守卫 | `packages/core/src/pwsh-guard.ts`<br>`packages/core/src/bash-ast-guard.ts` | UTF-16LE `-EncodedCommand` / 反引号 / `^` 反混淆；嵌套 `cmd` / `powershell.exe` / UNC 拦截 |
-| 审批单票状态机与防绕过桥接 | `packages/core/src/approval-controller.ts`<br>`packages/dsh-plugin/src/approval-bridge.ts` | `SHA-256` 动作绑定；`usedGrants` 一次性消费；`< 15ms` 合成审批检测；硬件单次降级锁 |
-| DSH Cordis 插件、资源管理器门禁与跨站防护 | `packages/dsh-plugin/src/index.ts`<br>`packages/dsh-plugin/src/web-api.ts` | `getOptionalService` 严格依赖访问；单调 `ctx.tools.guard`；`isSameOriginOrLoopback` 防本地网页 CSRF；`open-explorer` 强制 `shell: false` + 限制在 `backupDir` 内且拦截 `.exe`/`.bat`/`.lnk` 后缀（防 Explorer 任意程序拉起） |
+| UDS 代理与防 SSRF / 隧道零泄漏 | `packages/core/src/uds-proxy.ts` | `PRIVATE_IPV4_CIDRS`、`::ffff:` IPv4 映射地址与 `dns.lookup` 全记录核验；`activeSockets` 全追踪与 `stop()` 快速撕毁 |
+| 单壳纯净度、硬件与驱动守卫 | `packages/core/src/pwsh-guard.ts`<br>`packages/core/src/bash-ast-guard.ts` | UTF-16LE `-EncodedCommand` / 反引号 / `^` 反混淆；嵌套 `cmd` / `powershell.exe` / UNC 拦截；手机 `fastboot`/`adb` 与 Windows `pnputil`/`devcon`/`NetAdapter` 单次审批锁 |
+| 审批单票状态机与防绕过桥接 | `packages/core/src/approval-controller.ts`<br>`packages/dsh-plugin/src/approval-bridge.ts` | `SHA-256` 动作绑定；`usedGrants` 一次性消费；`< 15ms` 合成审批检测；硬件与驱动单次降级锁 |
+| 配置权限加固、插件路由与资源管理器门禁 | `packages/dsh-plugin/src/config-store.ts`<br>`packages/dsh-plugin/src/web-api.ts` | `0700`/`0600`/`0400` + Windows `icacls /inheritance:r`；防 `backupDir` 指向配置目录或 VHDX 路径；`isSameOriginOrLoopback` 防 CSRF；`open-explorer` 无壳白名单 |
 
 ---
 
 ## 7. 内核与沙箱实机一键复现实验指令
 
-审核人拿到仓库后，在任意安装有 `bubblewrap`、`socat`、Node 22+ 与 Python 3 的 Linux 或 WSL 2 环境中，可直接运行以下命令验证真实内核拦截效果：
+审核人拿到仓库后，在任意安装有 `bubblewrap`、`socat`、Node `>=22.19`（或 Node 24 LTS）与 Python 3 的 Linux 或 WSL 2 环境中，可直接运行以下命令验证真实内核拦截、多会话隔离、护盘日志限流与零残留回收效果：
 
 ```bash
-# 1. 运行全量自动化测试套件（含真实 Linux 内核 bwrap + seccomp + UDS 代理 + 并发熔断 + Top-27 插件兼容测试）
+# 1. 运行全量自动化测试套件（59 项测试：同时支持 `npm test`、`node test` 与裸 `node --test`）
 npm test
+node test
 
-# 2. 运行内核隔离与 22 项工具链实机探针（输出人类可读报告或 JSON）
-node dist/packages/bootstrap/src/doctor.js
-node dist/packages/bootstrap/src/doctor.js --json
+# 2. 运行按档位分级的内核隔离、配置遮蔽、USB/驱动能力与 Codex 工具链实机探针
+node dist/packages/bootstrap/src/doctor.js --profile standard
+node dist/packages/bootstrap/src/doctor.js --profile universal --json
 
-# 3. 单独运行真实 Linux 内核沙箱逃逸阻断测试（验证 EROFS、/mnt 遮蔽、io_uring EPERM、AF_VSOCK EPERM、SSRF 阻断）
+# 3. 单独运行真实 Linux 内核沙箱逃逸阻断、多会话隔离与零残留测试
 npm run test:linux-sandbox
 
-# 4. 在 Windows + WSL 2 实机上运行端到端跨界验收脚本
-pwsh -File ./tests/windows-wsl-verify/verify-wsl2.ps1 -Distro Ubuntu-24.04
+# 4. 在 Windows + WSL 2 实机上运行端到端跨界验收脚本（自动探测已安装或 WSL Manager 迁移实例，零 /mnt 依赖）
+pwsh -File ./tests/windows-wsl-verify/verify-wsl2.ps1
 ```
+
+

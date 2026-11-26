@@ -14,6 +14,7 @@ import {
 
                                    
                             
+                            
                                 
                                   
  
@@ -45,6 +46,7 @@ export function resolveConfinedFsPath(
     const candidate = subRel ? posix.join(shareRootReal, subRel) : shareRootReal;
     const resolved = canonicalizeWithinRoot(shareRootReal, candidate, mustExist);
     return {
+      rootReal: shareRootReal,
       realPath: resolved,
       insideShare: true,
       shareWritable: share.mode === 'rw',
@@ -62,6 +64,7 @@ export function resolveConfinedFsPath(
 
   const resolved = canonicalizeWithinRoot(workspaceReal, rawAbs, mustExist);
   return {
+    rootReal: workspaceReal,
     realPath: resolved,
     insideShare: false,
     shareWritable: false,
@@ -107,13 +110,10 @@ function assertWriteAllowed(binding                , res                  , requ
   if (binding.profile !== 'workspace-write') {
     failSandbox('POLICY_BLOCK', `Write denied under ${binding.profile} sandbox mode: ${requestedPath}`);
   }
-  if (res.insideShare) {
-    if (!res.shareWritable) {
-      failSandbox('POLICY_BLOCK', `Share is mounted read-only: ${requestedPath}`);
-    }
-    return;
+  if (res.insideShare && !res.shareWritable) {
+    failSandbox('POLICY_BLOCK', `Share is mounted read-only: ${requestedPath}`);
   }
-  const check = isProtectedWorkspaceWrite(binding.workspaceRoot, res.realPath);
+  const check = isProtectedWorkspaceWrite(res.rootReal, res.realPath);
   if (check.blocked) {
     failSandbox('POLICY_BLOCK', check.reason ?? `Protected path cannot be modified: ${requestedPath}`);
   }

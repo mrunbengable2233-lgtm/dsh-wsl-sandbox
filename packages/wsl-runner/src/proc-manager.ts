@@ -12,6 +12,7 @@ import {
   type ProcExecResult,
   sanitizeSandboxEnv,
 } from '../../core/src/index.ts';
+import { resolveEphemeralRamTmpRoot } from './hygiene.ts';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_GRACE_MS = 2_000;
@@ -36,9 +37,13 @@ const RUNNER_FAILURE_SIGNATURES = [
 
 interface ActiveProc {
   readonly execId: string;
+  readonly sessionId: string;
+  readonly terminalId?: string;
   readonly generation: number;
+  readonly pgid: number | undefined;
   readonly child: ChildProcess;
   readonly killGroup: () => Promise<void>;
+  readonly killGroupSync: () => void;
 }
 
 class BoundedStreamCollector {
@@ -53,6 +58,7 @@ class BoundedStreamCollector {
   private spillFd: number | undefined;
   private spillBytes = 0;
   private spillAborted = false;
+  private finishedResult: CollectedStream | undefined;
 
   constructor(maxBytes: number, spillDir: string, name: string) {
     this.maxBytes = Math.max(1024, maxBytes);
@@ -122,12 +128,15 @@ class BoundedStreamCollector {
       try { fs.closeSync(this.spillFd); } catch { /* ignore */ }
       this.spillFd = undefined;
     }
-    return {
-      text: Buffer.concat(this.chunks).toString('utf8'),
-      truncated: this.truncated,
-      totalBytes: this.totalBytes,
-      spillPath: this.truncated && !this.spillAborted ? this.spillPath : undefined,
-    };
+    if (!this.finishedResult) {
+      this.finishedResult = {
+        text: Buffer.concat(this.chunks).toString('utf8'),
+        truncated: this.truncated,
+        totalBytes: this.totalBytes,
+        spillPath: this.truncated && !this.spillAborted ? this.spillPath : undefined,
+      };
+    }
+    return this.finishedResult;
   }
 }
 
@@ -136,27 +145,57 @@ class BoundedStreamCollector {
  * to the mounted Unix Domain Socket `/run/dsh-proxy/proxy.sock` so standard CLI tools
  * (`curl`, `npm`, `pnpm`, `uv`, `pip`, `git`, `cargo`, `go`) use `HTTP_PROXY`/`HTTPS_PROXY`
  * seamlessly while direct outbound IP access stays kernel-blocked.
+ *
+ * IMPORTANT: Runs `innerCommand` inside a subshell `( ... )` so inner `trap ... EXIT`
+ * handlers (including `ConfinedTerminalManager`'s `__dsh_emit_cwd` trap or user scripts)
+ * can NEVER clobber the outer bridge teardown that terminates `socat`/`node` immediately.
  */
 function wrapCommandWithUdsLoopbackBridge(innerCommand: string): string {
-  // Uses socat when available (fast C binary), otherwise falls back to inline Node TCP<->UDS bridge.
   return [
     '__dsh_proxy_port=$((38000 + ($$ % 10000)))',
     '__dsh_bridge_pid=""',
+    '__dsh_stop_bridge() { if [ -n "$__dsh_bridge_pid" ]; then kill "$__dsh_bridge_pid" 2>/dev/null || true; wait "$__dsh_bridge_pid" 2>/dev/null || true; __dsh_bridge_pid=""; fi; }',
     'if command -v socat >/dev/null 2>&1; then',
-    '  socat "TCP-LISTEN:${__dsh_proxy_port},bind=127.0.0.1,fork,reuseaddr" "UNIX-CONNECT:/run/dsh-proxy/proxy.sock" >/dev/null 2>&1 &',
+    '  socat "TCP-LISTEN:${__dsh_proxy_port},bind=127.0.0.1,fork,reuseaddr" "UNIX-CONNECT:/run/dsh-proxy/proxy.sock" </dev/null >/dev/null 2>&1 &',
     '  __dsh_bridge_pid=$!',
     'else',
-    '  node -e "const n=require(\'node:net\');n.createServer(c=>{const u=n.connect(\'/run/dsh-proxy/proxy.sock\');c.pipe(u);u.pipe(c);c.on(\'error\',()=>u.destroy());u.on(\'error\',()=>c.destroy());}).listen(Number(process.argv[1]),\'127.0.0.1\');" "$__dsh_proxy_port" >/dev/null 2>&1 &',
+    '  node -e "const n=require(\'node:net\');n.createServer(c=>{const u=n.connect(\'/run/dsh-proxy/proxy.sock\');c.pipe(u);u.pipe(c);c.on(\'error\',()=>u.destroy());u.on(\'error\',()=>c.destroy());}).listen(Number(process.argv[1]),\'127.0.0.1\');" "$__dsh_proxy_port" </dev/null >/dev/null 2>&1 &',
     '  __dsh_bridge_pid=$!',
     'fi',
-    'trap \'[ -n "$__dsh_bridge_pid" ] && kill "$__dsh_bridge_pid" 2>/dev/null || true\' EXIT',
+    'trap __dsh_stop_bridge EXIT INT TERM',
     'export HTTP_PROXY="http://127.0.0.1:${__dsh_proxy_port}"',
     'export HTTPS_PROXY="http://127.0.0.1:${__dsh_proxy_port}"',
     'export http_proxy="http://127.0.0.1:${__dsh_proxy_port}"',
     'export https_proxy="http://127.0.0.1:${__dsh_proxy_port}"',
     'sleep 0.05',
+    '(',
     innerCommand,
+    ')',
+    '__dsh_inner_rc=$?',
+    '__dsh_stop_bridge',
+    'exit $__dsh_inner_rc',
   ].join('\n');
+}
+
+/**
+ * Verifies on Linux that `pid` is still the process-group leader we spawned (protecting
+ * against PID reuse signaling an unrelated human terminal or another DSH session).
+ */
+function isOwnedProcessGroupAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  if (process.platform !== 'linux') return true;
+  try {
+    const statText = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const closeParen = statText.lastIndexOf(')');
+    if (closeParen < 0) return false;
+    const fields = statText.slice(closeParen + 2).trim().split(/\s+/);
+    const state = fields[0];
+    const pgrp = Number(fields[2]);
+    if (state === 'Z' || state === 'X') return false;
+    return pgrp === pid;
+  } catch {
+    return false;
+  }
 }
 
 function classifyStderr(
@@ -187,11 +226,17 @@ export class ConfinedProcManager {
   private readonly spillDir: string;
 
   constructor(baseTempDir?: string) {
-    this.runtimeDir = baseTempDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-wsl-runner-'));
+    this.runtimeDir =
+      baseTempDir ?? fs.mkdtempSync(path.join(resolveEphemeralRamTmpRoot(), 'dsh-wsl-runner-'));
     fs.mkdirSync(this.runtimeDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(this.runtimeDir, 'owner.pid'), `${process.pid}\n`, { mode: 0o600 });
     this.emptyMaskFile = path.join(this.runtimeDir, 'empty-mask');
     fs.writeFileSync(this.emptyMaskFile, '', { mode: 0o444 });
     this.spillDir = path.join(this.runtimeDir, 'spills');
+  }
+
+  getRuntimeDir(): string {
+    return this.runtimeDir;
   }
 
   private acquirePlaceholders(paths: readonly string[]): string[] {
@@ -222,8 +267,31 @@ export class ConfinedProcManager {
     }
   }
 
-  getActiveCount(): number {
-    return this.active.size;
+  getActiveCount(sessionId?: string): number {
+    if (!sessionId) return this.active.size;
+    let count = 0;
+    for (const p of this.active.values()) {
+      if (p.sessionId === sessionId) count++;
+    }
+    return count;
+  }
+
+  listActive(sessionId?: string): Array<{
+    readonly execId: string;
+    readonly sessionId: string;
+    readonly terminalId?: string;
+    readonly generation: number;
+    readonly pgid?: number;
+  }> {
+    return Array.from(this.active.values())
+      .filter((p) => !sessionId || p.sessionId === sessionId)
+      .map((p) => ({
+        execId: p.execId,
+        sessionId: p.sessionId,
+        terminalId: p.terminalId,
+        generation: p.generation,
+        pgid: p.pgid,
+      }));
   }
 
   async kill(execId: string): Promise<boolean> {
@@ -233,16 +301,57 @@ export class ConfinedProcManager {
     return true;
   }
 
-  async invalidateGeneration(minValidGeneration: number): Promise<number> {
-    const victims = Array.from(this.active.values()).filter((p) => p.generation < minValidGeneration);
+  async killTerminal(sessionId: string, terminalId: string): Promise<number> {
+    const victims = Array.from(this.active.values()).filter(
+      (p) => p.sessionId === sessionId && p.terminalId === terminalId,
+    );
     await Promise.all(victims.map((v) => v.killGroup()));
     return victims.length;
+  }
+
+  async invalidateGeneration(
+    minValidGeneration: number,
+    scope?: { readonly sessionId?: string; readonly terminalId?: string },
+  ): Promise<number> {
+    const victims = Array.from(this.active.values()).filter((p) => {
+      if (p.generation >= minValidGeneration) return false;
+      if (scope?.sessionId && p.sessionId !== scope.sessionId) return false;
+      if (scope?.terminalId && p.terminalId !== scope.terminalId) return false;
+      return true;
+    });
+    await Promise.all(victims.map((v) => v.killGroup()));
+    return victims.length;
+  }
+
+  cleanupSync(): void {
+    for (const entry of this.active.values()) {
+      entry.killGroupSync();
+    }
+    this.active.clear();
+    const remaining = Array.from(this.placeholderRefs.keys());
+    this.placeholderRefs.clear();
+    for (const p of remaining) {
+      try {
+        const st = fs.lstatSync(p);
+        if (st.isFile() && st.size === 0) fs.unlinkSync(p);
+      } catch {
+        // ignore
+      }
+    }
+    try {
+      if (fs.existsSync(this.emptyMaskFile)) {
+        fs.chmodSync(this.emptyMaskFile, 0o600);
+      }
+    } catch {
+      // ignore
+    }
+    fs.rmSync(this.runtimeDir, { recursive: true, force: true });
   }
 
   async disposeAll(): Promise<void> {
     const all = Array.from(this.active.values());
     await Promise.all(all.map((p) => p.killGroup()));
-    fs.rmSync(this.runtimeDir, { recursive: true, force: true });
+    this.cleanupSync();
   }
 
   async exec(params: ProcExecParams): Promise<ProcExecResult> {
@@ -266,11 +375,24 @@ export class ConfinedProcManager {
       failSandbox('INVALID_ACTION', 'proc.exec requires either command or argv');
     }
 
+    const homeDir = os.homedir() || `/home/${params.binding.username}`;
+    const ownerEnv: Record<string, string> = {
+      ...(params.dshEnv ?? {}),
+      DSH_WSL_SESSION_ID: params.binding.sessionId,
+      DSH_WSL_EXEC_ID: execId,
+    };
+    if (params.ownerRunnerId ?? params.binding.runnerId) {
+      ownerEnv.DSH_WSL_OWNER_RUNNER = params.ownerRunnerId ?? params.binding.runnerId;
+    }
+    if (params.terminalId) {
+      ownerEnv.DSH_WSL_TERMINAL_ID = params.terminalId;
+    }
+
     const sanitizedEnv = sanitizeSandboxEnv({
       baseEnv: process.env,
       extraEnv: params.env,
-      dshEnv: params.dshEnv,
-      homeDir: `/home/${params.binding.username}`,
+      dshEnv: ownerEnv,
+      homeDir,
       cacheRootDir: params.cacheDir,
       mirrorCn: params.mirrorCn,
     });
@@ -301,6 +423,7 @@ export class ConfinedProcManager {
         supportsDisableUserns: params.binding.supportsDisableUserns,
         seccompFd: 3,
         env: sanitizedEnv,
+        homeDir,
         rlimits: params.rlimits,
         usePrlimit: true,
         shares: params.binding.authorizedShares,
@@ -356,15 +479,23 @@ export class ConfinedProcManager {
       });
     });
 
+    const killGroupSync = (): void => {
+      if (exited || child.exitCode !== null) return;
+      const pid = child.pid;
+      if (pid && isOwnedProcessGroupAlive(pid)) {
+        try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+      }
+    };
+
     const killGroup = async (fromTimeout = false): Promise<void> => {
       if (exited || killing) return;
       killing = true;
       if (!fromTimeout && !timedOut) aborted = true;
       const pid = child.pid;
-      if (pid) {
+      if (pid && isOwnedProcessGroupAlive(pid)) {
         try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
         const forceTimer = setTimeout(() => {
-          if (!exited) {
+          if (!exited && child.exitCode === null && isOwnedProcessGroupAlive(pid)) {
             try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
           }
         }, graceMs);
@@ -376,9 +507,13 @@ export class ConfinedProcManager {
 
     this.active.set(execId, {
       execId,
+      sessionId: params.binding.sessionId,
+      terminalId: params.terminalId,
       generation: params.binding.generation,
+      pgid: child.pid,
       child,
       killGroup: () => killGroup(false),
+      killGroupSync,
     });
 
     const timer = setTimeout(() => {
@@ -387,6 +522,7 @@ export class ConfinedProcManager {
         void killGroup(true);
       }
     }, timeoutMs);
+    timer.unref();
 
     try {
       const outcome = await waitClose;
@@ -417,6 +553,8 @@ export class ConfinedProcManager {
       );
     } finally {
       clearTimeout(timer);
+      stdoutCollector.finish();
+      stderrCollector.finish();
       this.active.delete(execId);
       this.releasePlaceholders(acquiredPlaceholders);
     }

@@ -5,6 +5,7 @@ import { failSandbox } from './errors.js';
                                                         
                                                                  
                                                                            
+                                                                   
                                              
 
                                   
@@ -66,7 +67,7 @@ import { failSandbox } from './errors.js';
 
 const VALID_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const VALID_SHARE_ALIAS_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-const ALLOWED_DEVICE_RE = /^\/dev\/(ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/\d{3}\/\d{3})$/;
+const ALLOWED_DEVICE_RE = /^\/dev\/(ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/\d{3}\/\d{3}|hidraw\d+|cdc-wdm\d+|video\d+)$/;
 
 const INTERNAL_DISTRO_PATTERNS = [
   /^docker-desktop$/i,
@@ -134,6 +135,18 @@ export function isPathInside(root        , candidate        )          {
   return normCand === normRoot || normCand.startsWith(normRoot + '/');
 }
 
+const FORBIDDEN_CONFIG_PATH_PATTERNS = [
+  /(?:^|\/)\.dsh(?:\/|$)/i,
+  /(?:^|\/)\.config\/dsh-wsl-sandbox(?:\/|$)/i,
+  /(?:^|\/)\.wslconfig$/i,
+  /(?:^|\/)\.ssh(?:\/|$)/i,
+  /(?:^|\/)\.gnupg(?:\/|$)/i,
+  /(?:^|\/)\.aws(?:\/|$)/i,
+  /(?:^|\/)\.kube(?:\/|$)/i,
+  /(?:^|\/)appdata\/local\/packages(?:\/|$)/i,
+  /(?:^|\/)appdata\/local\/wsl(?:\/|$)/i,
+];
+
 export function validateWorkspaceRoot(linuxPath        , username         )         {
   if (!isSafeAbsoluteLinuxPath(linuxPath)) {
     failSandbox('POLICY_BLOCK', `Invalid Linux workspace path: ${linuxPath}`);
@@ -145,6 +158,9 @@ export function validateWorkspaceRoot(linuxPath        , username         )     
     if (linuxPath.startsWith(prefix)) {
       failSandbox('POLICY_BLOCK', `Workspace root cannot live under protected mount ${prefix}: ${linuxPath}`);
     }
+  }
+  if (FORBIDDEN_CONFIG_PATH_PATTERNS.some((re) => re.test(linuxPath))) {
+    failSandbox('POLICY_BLOCK', `Workspace root cannot point to private config/credential directory: ${linuxPath}`);
   }
   if (username && (linuxPath === `/home/${username}` || linuxPath === '/root')) {
     failSandbox('POLICY_BLOCK', `Entire user home directory cannot be mounted as workspaceRoot: ${linuxPath}`);
@@ -161,10 +177,11 @@ const FORBIDDEN_WINDOWS_MOUNT_PATTERNS = [
   /^\/mnt\/[a-z]\/\$recycle\.bin(?:\/|$)/i,
   /^\/mnt\/[a-z]\/recovery(?:\/|$)/i,
   /^\/mnt\/[a-z]\/users\/[^/]+$/i,
+  /^\/mnt\/[a-z]\/users\/[^/]+\/appdata(?:\/|$)/i,
 ];
 
 /**
- * Converts a Windows folder path (e.g. `D:\Datasets\ESP32` or `"C:/Users/Alice/Downloads/spec"`)
+ * Converts a Windows folder path (e.g. `D:\Datasets\Project` or `"C:/Users/Alice/Downloads/spec"`)
  * or a Linux path into a canonical normalized POSIX path without trailing slash.
  * Rejects UNC paths and bare drive roots (`C:\`, `D:\`) at validation time.
  */
@@ -245,6 +262,7 @@ export function validateShareEntry(share                 )                  {
   if (
     FORBIDDEN_WORKSPACE_ROOTS.has(normalizedSource) ||
     FORBIDDEN_WINDOWS_MOUNT_PATTERNS.some((re) => re.test(normalizedSource)) ||
+    FORBIDDEN_CONFIG_PATH_PATTERNS.some((re) => re.test(normalizedSource)) ||
     normalizedSource.startsWith('/mnt/wslg/distro') ||
     normalizedSource.startsWith('/mnt/wsl/') ||
     normalizedSource.startsWith('/run/WSL') ||
@@ -253,7 +271,10 @@ export function validateShareEntry(share                 )                  {
     normalizedSource.startsWith('/sys') ||
     normalizedSource.startsWith('/dev')
   ) {
-    failSandbox('POLICY_BLOCK', `Refusing to share full drive, user profile root, or protected OS path: ${normalizedSource}`);
+    failSandbox(
+      'POLICY_BLOCK',
+      `Refusing to share full drive, config/credential folder, WSL VHDX storage, or protected OS path: ${normalizedSource}`,
+    );
   }
   if (share.mode !== 'ro' && share.mode !== 'rw') {
     failSandbox('POLICY_BLOCK', `Invalid share mode: ${String(share.mode)}`);
@@ -271,7 +292,7 @@ export function validateDeviceNode(node                      )                  
   if (typeof node.path !== 'string' || !ALLOWED_DEVICE_RE.test(node.path)) {
     failSandbox(
       'POLICY_BLOCK',
-      `Only explicit serial/USB device nodes (/dev/ttyUSB*, /dev/ttyACM*, /dev/bus/usb/NNN/NNN) are allowed: ${node.path}`,
+      `Only explicit USB/serial/HID/CDC/video device nodes (/dev/ttyUSB*, /dev/ttyACM*, /dev/ttyS*, /dev/bus/usb/NNN/NNN, /dev/hidraw*, /dev/cdc-wdm*, /dev/video*) are allowed: ${node.path}`,
     );
   }
   return Object.freeze({ path: node.path, label: node.label });

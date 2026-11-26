@@ -57,6 +57,30 @@ export const DEFAULT_SANDBOX_PATH = [
   '/bin',
 ].join(':');
 
+/**
+ * Builds a clean POSIX `PATH` inside the `bwrap` sandbox that includes user-installed prebuilt
+ * toolchains (`~/.dsh/runtime/bin`, `mise` shims, `uv`/`~/.local/bin`, `cargo`, `bun`, `/usr/local/go/bin`)
+ * while strictly excluding `/mnt/*` Windows host directories.
+ */
+export function buildDefaultSandboxPath(homeDir?: string): string {
+  const cleanHome = homeDir?.trim().replace(/\/+$/, '');
+  if (!cleanHome || !cleanHome.startsWith('/') || cleanHome.startsWith('/mnt/')) {
+    return DEFAULT_SANDBOX_PATH;
+  }
+  return [
+    `${cleanHome}/.dsh/runtime/bin`,
+    `${cleanHome}/.local/share/dsh/node/bin`,
+    `${cleanHome}/.local/share/dsh-wsl-sandbox/toolchains/node/bin`,
+    `${cleanHome}/.local/share/mise/shims`,
+    `${cleanHome}/.local/bin`,
+    `${cleanHome}/.nvm/current/bin`,
+    `${cleanHome}/.volta/bin`,
+    `${cleanHome}/.cargo/bin`,
+    `${cleanHome}/.bun/bin`,
+    DEFAULT_SANDBOX_PATH,
+  ].join(':');
+}
+
 export interface SanitizeEnvOptions {
   readonly baseEnv?: Readonly<Record<string, string | undefined>>;
   readonly extraEnv?: Readonly<Record<string, string | undefined>>;
@@ -70,12 +94,13 @@ export interface SanitizeEnvOptions {
 
 export function sanitizeSandboxEnv(options: SanitizeEnvOptions): Record<string, string> {
   const out: Record<string, string> = {};
+  const fallbackPath = buildDefaultSandboxPath(options.homeDir);
 
   const safePath = options.pathEntries && options.pathEntries.length > 0
     ? options.pathEntries.filter((p) => p.startsWith('/') && !p.startsWith('/mnt/')).join(':')
-    : DEFAULT_SANDBOX_PATH;
+    : fallbackPath;
 
-  out.PATH = safePath || DEFAULT_SANDBOX_PATH;
+  out.PATH = safePath || fallbackPath;
   out.HOME = options.homeDir;
   out.TMPDIR = '/tmp';
   out.TEMP = '/tmp';
@@ -87,7 +112,7 @@ export function sanitizeSandboxEnv(options: SanitizeEnvOptions): Record<string, 
   out.UV_NO_PROGRESS = '1';
   out.COREPACK_ENABLE_DOWNLOAD_PROMPT = '0';
 
-  // Redirect toolchain caches away from read-only real $HOME
+  // Redirect writable toolchain caches away from read-only real $HOME while keeping read-only RUSTUP_HOME
   const cacheBase = options.cacheRootDir || '/tmp/.dsh-cache';
   out.XDG_CACHE_HOME = cacheBase;
   out.UV_CACHE_DIR = `${cacheBase}/uv`;
@@ -97,6 +122,9 @@ export function sanitizeSandboxEnv(options: SanitizeEnvOptions): Record<string, 
   out.GOCACHE = `${cacheBase}/go-build`;
   out.GOMODCACHE = `${cacheBase}/go-mod`;
   out.CARGO_HOME = `${cacheBase}/cargo`;
+  if (options.homeDir.startsWith('/') && !options.homeDir.startsWith('/mnt/')) {
+    out.RUSTUP_HOME = `${options.homeDir.replace(/\/+$/, '')}/.rustup`;
+  }
 
   if (options.mirrorCn) {
     out.npm_config_registry = 'https://registry.npmmirror.com';

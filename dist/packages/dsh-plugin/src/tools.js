@@ -7,8 +7,10 @@ import {
   isPathInside,
                      
                       
+  resolveSharedHostNodeRuntime,
                    
                       
+                        
                           
 } from '../../core/src/index.js';
                                                            
@@ -26,7 +28,18 @@ import { WslTransport } from './wsl-transport.js';
                                           
                               
                                        
+                                     
                                              
+ 
+
+                                     
+                                   
+                                      
+                                      
+                                      
+                                         
+                                         
+                                          
  
 
 function renderExecOutcome(value         )                    {
@@ -91,6 +104,7 @@ export class WslSandboxSessionManager {
                    approvalBridge                ;
                    sessionId        ;
                    allowLinuxDevMode         ;
+                   logger                   ;
                    onStderr                         ;
 
           transport                          ;
@@ -104,11 +118,16 @@ export class WslSandboxSessionManager {
     this.approvalBridge = options.approvalBridge;
     this.sessionId = options.sessionId ?? `dsh-wsl-${randomUUID().slice(0, 8)}`;
     this.allowLinuxDevMode = options.allowLinuxDevMode ?? process.platform === 'linux';
+    this.logger = options.logger;
     this.onStderr = options.onStderr;
 
     this.unsubscribeConfig = this.configStore.onChange((next, prev) => {
       void this.handleConfigChanged(next, prev);
     });
+  }
+
+  getLogger()                               {
+    return this.logger;
   }
 
   getBindingSnapshot()                             {
@@ -119,17 +138,89 @@ export class WslSandboxSessionManager {
     return this.generation;
   }
 
+  isRunnerActive()          {
+    return Boolean(this.transport?.isRunning());
+  }
+
+  getNodeRuntimeSummary()                     {
+    const host = resolveSharedHostNodeRuntime();
+    const runnerInfo = this.transport?.getRunnerNodeInfo();
+    const cfg = this.configStore.get();
+    return {
+      hostNodeVersion: host.nodeVersion,
+      hostNodeExecutable: host.executable,
+      hostSharedWithDsh: host.sharedWithHostProcess,
+      isElectronCarrier: host.isElectronCarrier,
+      configuredWslNodePath: cfg.wslNodePath ?? 'auto',
+      wslNodeVersion: runnerInfo?.nodeVersion ?? null,
+      wslNodeExecPath: runnerInfo?.nodeExecPath ?? null,
+    };
+  }
+
           async handleConfigChanged(next                  , prev                  )                {
+    if (next.logLevel !== prev.logLevel) {
+      this.logger?.setLevel(next.logLevel);
+      if (this.transport?.isRunning()) {
+        await this.transport.setRunnerLogLevel(next.logLevel);
+      }
+    }
+
+    // If ONLY logLevel changed, avoid killing active sandbox terminals/processes unnecessarily!
+    const onlyLogLevelChanged =
+      next.enabled === prev.enabled &&
+      next.transportMode === prev.transportMode &&
+      next.distro === prev.distro &&
+      next.username === prev.username &&
+      next.workspaceRoot === prev.workspaceRoot &&
+      next.runnerPath === prev.runnerPath &&
+      next.wslNodePath === prev.wslNodePath &&
+      next.environmentProfile === prev.environmentProfile &&
+      next.sandboxMode === prev.sandboxMode &&
+      next.approvalPolicyMode === prev.approvalPolicyMode &&
+      next.networkMode === prev.networkMode &&
+      next.upstreamProxy === prev.upstreamProxy &&
+      next.mirrorCn === prev.mirrorCn &&
+      next.cacheMode === prev.cacheMode &&
+      next.enablePwshGuard === prev.enablePwshGuard &&
+      JSON.stringify(next.unmaskedEnvWorkspaces) === JSON.stringify(prev.unmaskedEnvWorkspaces) &&
+      JSON.stringify(next.advanced) === JSON.stringify(prev.advanced);
+
+    if (onlyLogLevelChanged) {
+      this.logger?.log('info', {
+        component: 'config',
+        event: 'config.logLevelChanged',
+        message: `Updated log level to '${next.logLevel}'`,
+        data: { logLevel: next.logLevel },
+      });
+      return;
+    }
+
     this.generation += 1;
     this.binding = undefined;
     this.proxyConfiguredRevision = undefined;
     this.approvalBridge.invalidate(`Configuration changed to ${next.revision}`);
 
+    this.logger?.log('info', {
+      component: 'config',
+      event: 'config.updated',
+      message: `Configuration updated (${next.revision}): distro=${next.distro}, profile=${next.environmentProfile}, mode=${next.sandboxMode}`,
+      sessionId: this.sessionId,
+      data: {
+        revision: next.revision,
+        enabled: next.enabled,
+        distro: next.distro,
+        environmentProfile: next.environmentProfile,
+        sandboxMode: next.sandboxMode,
+        networkMode: next.networkMode,
+      },
+    });
+
     const transportChanged =
       next.transportMode !== prev.transportMode ||
       next.distro !== prev.distro ||
       next.username !== prev.username ||
-      next.runnerPath !== prev.runnerPath;
+      next.runnerPath !== prev.runnerPath ||
+      next.wslNodePath !== prev.wslNodePath;
 
     if (this.transport) {
       if (transportChanged || !next.enabled) {
@@ -137,7 +228,7 @@ export class WslSandboxSessionManager {
         this.transport = undefined;
         await old.dispose().catch(() => {});
       } else {
-        await this.transport.invalidate(this.generation);
+        await this.transport.invalidate(this.generation, { sessionId: this.sessionId });
       }
     }
   }
@@ -152,6 +243,9 @@ export class WslSandboxSessionManager {
         distro: cfg.distro,
         username: cfg.username,
         runnerPath: cfg.runnerPath,
+        nodeExecutable: cfg.wslNodePath,
+        logLevel: cfg.logLevel,
+        logger: this.logger,
         onStderr: this.onStderr,
         onAuthorizeProxyHost: (host, port) => this.authorizeUnknownProxyHost(host, port),
       });
@@ -248,15 +342,27 @@ export class WslSandboxSessionManager {
     this.proxyConfiguredRevision = cfg.revision;
   }
 
-  async invalidateNow(reason = 'Manual invalidation')                  {
+  async invalidateNow(reason = 'Manual invalidation', terminalId         )                  {
     this.generation += 1;
-    this.binding = undefined;
-    this.proxyConfiguredRevision = undefined;
-    this.approvalBridge.invalidate(reason);
+    if (!terminalId) {
+      this.binding = undefined;
+      this.proxyConfiguredRevision = undefined;
+      this.approvalBridge.invalidate(reason);
+    }
     if (this.transport) {
-      return this.transport.invalidate(this.generation);
+      return this.transport.invalidate(this.generation, { sessionId: this.sessionId, terminalId });
     }
     return 0;
+  }
+
+  async killExec(execId        )                   {
+    if (!this.transport?.isRunning()) return false;
+    try {
+      const r = await this.transport.call                     ('proc.kill', { execId }, 5_000);
+      return Boolean(r.killed);
+    } catch {
+      return false;
+    }
   }
 
   async callRpc             (method        , params                         , timeoutMs         )             {
@@ -330,6 +436,13 @@ export function createWslSandboxTools(
     });
 
     if (guard.decision === 'deny') {
+      sessionManager.getLogger()?.log('warn', {
+        component: 'tools',
+        event: 'wslGuard.deny',
+        message: `Blocked ${params.toolName} command at L0 AST/dialect policy: ${guard.reasons.join('; ')}`,
+        sessionId: binding.sessionId,
+        data: { toolName: params.toolName, riskLevel: guard.riskLevel, reasons: guard.reasons },
+      });
       failSandbox(
         'POLICY_BLOCK',
         `WSL command blocked by L0 zero-token AST/dialect policy: ${guard.reasons.join('; ')}`,
@@ -407,7 +520,9 @@ export function createWslSandboxTools(
       ticket.consume();
     }
 
+    const execId = randomUUID();
     const execPayload = {
+      execId,
       binding,
       command: params.command,
       cwd,
@@ -420,26 +535,34 @@ export function createWslSandboxTools(
       mirrorCn: cfg.mirrorCn,
     };
 
-    if (params.terminalId) {
-      return sessionManager.callRpc                    (
-        'term.exec',
-        { ...execPayload, terminalId: params.terminalId },
+    const onAbort = ()       => {
+      void sessionManager.killExec(execId);
+    };
+    meta?.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      if (params.terminalId) {
+        return await sessionManager.callRpc                    (
+          'term.exec',
+          { ...execPayload, terminalId: params.terminalId },
+          (params.timeoutMs ?? 120_000) + 15_000,
+        );
+      }
+
+      return await sessionManager.callRpc                (
+        'proc.exec',
+        execPayload,
         (params.timeoutMs ?? 120_000) + 15_000,
       );
+    } finally {
+      meta?.signal?.removeEventListener('abort', onAbort);
     }
-
-    return sessionManager.callRpc                (
-      'proc.exec',
-      execPayload,
-      (params.timeoutMs ?? 120_000) + 15_000,
-    );
   }
 
   return [
     {
       name: 'wsl_bash',
       description:
-        'Execute a pure POSIX Bash command inside the isolated WSL 2 Linux guest sandbox (bwrap + seccomp-bpf + prlimit + UDS allowlist proxy). Prefer this over Windows pwsh for directory creation, file moves, coding, git, builds, tests, ESP32 compilation, and Linux/Kali tools. Note: cwd is an isolated Linux guest path (separate from Windows host NTFS; if declaring to cc-safety-net, pass --no-cwd-arg).',
+        'Execute a pure POSIX Bash command inside the isolated WSL 2 Linux guest sandbox (bwrap + seccomp-bpf + prlimit + UDS allowlist proxy). Prefer this over Windows pwsh for directory creation, file moves, coding, git, builds, tests, cross-compilation, and Linux CLI tools. Note: cwd is an isolated Linux guest path (separate from Windows host NTFS; if declaring to cc-safety-net, pass --no-cwd-arg).',
       parameters: {
         type: 'object',
         required: ['command'],

@@ -176,7 +176,7 @@ export function renderWslSandboxUiHtml()         {
         <span>WSL 2 沙箱</span>
         <span style="font-size:12.5px;font-weight:400;color:var(--text-secondary)">内核命名空间执行后端、单壳方言防呆与物理硬件单次门禁</span>
       </div>
-      <span class="dsh-wsl-sbx-mono" style="font-size:12px;color:var(--text-secondary)">dsh-wsl-sandbox v0.1.0</span>
+      <span class="dsh-wsl-sbx-mono" style="font-size:12px;color:var(--text-secondary)">dsh-wsl-sandbox v0.2.0</span>
     </div>
 
     <div class="dsh-wsl-sbx-tabs">
@@ -184,12 +184,14 @@ export function renderWslSandboxUiHtml()         {
       <button class="dsh-wsl-sbx-tab" onclick="sbxTab('approvals', this)">审批队列 <span id="tabCnt">(0)</span></button>
       <button class="dsh-wsl-sbx-tab" onclick="sbxTab('settings', this)">基础策略与高级共享</button>
       <button class="dsh-wsl-sbx-tab" onclick="sbxTab('doctor', this)">内核体检</button>
+      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('logs', this)">运行日志</button>
       <button class="dsh-wsl-sbx-tab" onclick="sbxTab('audit', this)">审计明细</button>
     </div>
 
     <div class="dsh-wsl-sbx-tel">
       <span><i class="dsh-wsl-sbx-dot" id="telDot"></i>受控发行版 <b class="dsh-wsl-sbx-mono" id="telDistro">加载中...</b></span>
       <span>工作区 <b class="dsh-wsl-sbx-mono" id="telWs">-</b></span>
+      <span>共用 Node <b class="dsh-wsl-sbx-mono" id="telNode">-</b></span>
       <span>隔离层级 <b id="telIso">bwrap + seccomp + UDS 代理</b></span>
       <span>配置状态 <b id="telSync">已生效</b></span>
     </div>
@@ -264,7 +266,10 @@ export function renderWslSandboxUiHtml()         {
                   <span class="dsh-wsl-sbx-pill" style="color:var(--ok);border-color:rgba(34,197,94,0.35)">沙箱 --tmpfs /mnt 已锁死生效</span>
                 </div>
                 <div style="color:var(--text-secondary);font-size:12px;margin-top:3px">
-                  默认已在内核命名空间层将 AI 可见的 <span class="dsh-wsl-sbx-mono">/mnt</span> 置为空内存盘；可任意指定备份目录，并为每一项原始备份拉起 Windows 原生资源管理器定位文件。
+                  默认已在内核命名空间层将 AI 可见的 <span class="dsh-wsl-sbx-mono">/mnt</span> 及 <span class="dsh-wsl-sbx-mono">~/.dsh</span>/<span class="dsh-wsl-sbx-mono">~/.ssh</span> 等配置目录彻底遮蔽；可任意指定备份目录（只读快照），并为每一项备份拉起 Windows 原生资源管理器定位文件。
+                </div>
+                <div style="color:var(--text-muted);font-size:11.5px;margin-top:3px">
+                  说明：Windows 官方 WSL Settings 与 WSL Manager 均共享同一套 <span class="dsh-wsl-sbx-mono">%USERPROFILE%\.wslconfig</span> 与 <span class="dsh-wsl-sbx-mono">/etc/wsl.conf</span> 路径；本插件默认绝不自动修改原配置，且配置/备份目录仅限当前用户访问。
                 </div>
               </div>
               <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="toggleWslConfCmd()">彻底关闭底层自动挂载指令</button>
@@ -278,19 +283,21 @@ export function renderWslSandboxUiHtml()         {
             <div id="backupItemsBox" style="margin-top:9px"></div>
           </div>
           <div id="wslConfCmdBox" style="display:none;margin-bottom:12px">
-            <pre class="dsh-wsl-sbx-cmd"># 在 WSL 内执行（自动备份原版 /etc/wsl.conf 后关闭自动挂载）：
-bash packages/bootstrap/provision-wsl.sh --disable-automount
+            <pre class="dsh-wsl-sbx-cmd" id="wslConfCmdPre"># 在 WSL 内执行（只读备份原版 /etc/wsl.conf 后关闭自动挂载）：
+bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --disable-automount
 # 如需一键还原原厂 /etc/wsl.conf：
-bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
+bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --restore-configs
+# 在 Windows PowerShell 中仅重启当前发行版（切勿用 wsl --shutdown 以免关掉其他 WSL 会话）：
+wsl.exe --terminate &lt;当前发行版&gt;</pre>
           </div>
 
           <div>
             <div style="font-weight:600;margin-bottom:4px">指定单目录快捷挂载（直接粘贴 Windows 文件夹路径或 Linux 路径 -> /shares/&lt;别名&gt;）</div>
             <div style="color:var(--text-secondary);font-size:12px;margin-bottom:8px">
-              自动将 <span class="dsh-wsl-sbx-mono">D:\Datasets\ESP32</span> 转换为受控挂载点 <span class="dsh-wsl-sbx-mono">/shares/ESP32</span>（默认只读，严禁填入 <span class="dsh-wsl-sbx-mono">C:\</span> 或 <span class="dsh-wsl-sbx-mono">D:\</span> 整盘根目录）。
+              自动将 <span class="dsh-wsl-sbx-mono">D:\Datasets\Project</span> 转换为受控挂载点 <span class="dsh-wsl-sbx-mono">/shares/Project</span>（默认只读，严禁填入 <span class="dsh-wsl-sbx-mono">C:\</span>、整盘根目录或配置/凭证目录）。
             </div>
             <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
-              <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" style="flex:1;min-width:240px" id="qk-path" placeholder="例如 D:\Datasets\ESP32 或 C:\Users\Alice\Downloads\spec" />
+              <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" style="flex:1;min-width:240px" id="qk-path" placeholder="例如 D:\Datasets\Project 或 C:\Users\Alice\Downloads\spec" />
               <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" style="width:150px" id="qk-alias" placeholder="别名(留空自动生成)" />
               <select class="dsh-wsl-sbx-select" style="width:110px" id="qk-mode">
                 <option value="ro">只读 (ro)</option>
@@ -319,21 +326,44 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
       <section class="dsh-wsl-sbx-pane" id="pane-settings">
         <div class="dsh-wsl-sbx-card">
           <div style="margin-bottom:12px;color:var(--text-secondary);font-size:12px">
-            跨系统传文件请使用 Windows 资源管理器左侧「Linux」目录拖拽复制（基础配置严禁挂载 /mnt 全盘）。
+            支持任意已注册的 WSL 2 发行版（Ubuntu 26.04/24.04、Debian、Fedora、Arch 或经 WSL Manager 导入/迁移磁盘的自定义实例）。即便实例从资源管理器左侧「Linux」消失，仍可通过 <span class="dsh-wsl-sbx-mono">wsl.exe</span> 与原生 ext4 Runner 正常运行（基础配置严禁挂载 <span class="dsh-wsl-sbx-mono">/mnt</span> 全盘或配置目录）。
           </div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px;padding:10px 12px;background:var(--bg-inset);border:1px solid var(--border-subtle);border-radius:9px">
+            <span style="font-size:12px;color:var(--text-secondary)">已发现的 WSL 2 实例:</span>
+            <select class="dsh-wsl-sbx-select dsh-wsl-sbx-mono" style="flex:1;min-width:240px" id="in-distro-select" onchange="pickDiscoveredDistro()">
+              <option value="">点击右侧「刷新实例」探测已安装/已迁移的 WSL 2 发行版...</option>
+            </select>
+            <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="refreshDistros(true)">刷新实例</button>
+          </div>
+          <div id="distroMetaHint" style="display:none;margin-bottom:12px;font-size:12px;color:var(--text-secondary)"></div>
           <div class="dsh-wsl-sbx-grid2">
             <div><label>传输模式</label><select class="dsh-wsl-sbx-select" id="in-transport"><option value="wsl">wsl</option><option value="local-linux">local-linux</option></select></div>
-            <div><label>WSL 2 发行版</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-distro" /></div>
+            <div><label>WSL 2 发行版名称</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-distro" placeholder="如 Ubuntu-26.04 / Debian / 自定义导入名" /></div>
+            <div><label>工具链环境档位 (provision / doctor)</label>
+              <select class="dsh-wsl-sbx-select" id="in-profile">
+                <option value="core">core (~350MB: 沙箱基础 + Codex CLI + C/C++ + python3 + Node 24 LTS 共用)</option>
+                <option value="standard">standard (~1.2GB 推荐: + mise/uv/pnpm/yarn/bun/Go/golangci-lint/Rust)</option>
+                <option value="universal">universal (~3.5GB: + clang/bazelisk/Node 22&amp;24/JDK21/Gradle/Ruby/PHP)</option>
+              </select>
+            </div>
             <div><label>Linux 非 root 用户名</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-user" /></div>
             <div><label>工作区根目录 (原生 ext4)</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-ws" /></div>
-            <div><label>Runner 路径</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-runner" /></div>
+            <div><label>Runner 路径 (原生 ext4，零 /mnt 占用)</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-runner" /></div>
             <div><label>审批超时 (ms)</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" type="number" id="in-ttl" /></div>
             <div><label>文件沙箱模式</label><select class="dsh-wsl-sbx-select" id="in-smode"><option value="workspace-write">workspace-write</option><option value="read-only">read-only</option></select></div>
             <div><label>审批策略模式</label><select class="dsh-wsl-sbx-select" id="in-amode"><option value="balanced">balanced</option><option value="strict">strict</option><option value="trust-workspace">trust-workspace</option></select></div>
             <div><label>网络隔离模式</label><select class="dsh-wsl-sbx-select" id="in-nmode"><option value="allowlist-proxy">allowlist-proxy</option><option value="offline">offline</option></select></div>
             <div><label>上游代理 (HTTP/SOCKS5)</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-proxy" /></div>
             <div><label>包缓存策略</label><select class="dsh-wsl-sbx-select" id="in-cmode"><option value="workspace-persistent">workspace-persistent</option><option value="ephemeral-tmp">ephemeral-tmp</option></select></div>
-            <div><label>豁免 .env* 脱敏工作区 (逗号分隔)</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-unmask" /></div>
+            <div><label>运行日志级别 (自动脱敏 · 2.5s 合并写盘)</label>
+              <select class="dsh-wsl-sbx-select" id="in-loglevel">
+                <option value="info">info (默认推荐)</option>
+                <option value="warn">warn (仅告警与错误)</option>
+                <option value="error">error (仅错误)</option>
+                <option value="debug">debug (详细排障)</option>
+              </select>
+            </div>
+            <div style="grid-column:1 / -1"><label>豁免 .env* 脱敏工作区 (逗号分隔)</label><input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="in-unmask" /></div>
           </div>
           <div style="display:flex;gap:8px;margin-top:10px">
             <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="clearCache()">清理 WSL 包缓存</button>
@@ -342,7 +372,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
         </div>
 
         <details class="dsh-wsl-sbx-advanced">
-          <summary>高级风险控制（单目录 /shares 挂载、物理串口/USB 设备透传、靶机网段白名单）</summary>
+          <summary>高级风险控制（单目录 /shares 挂载、物理 USB/串口/HID 设备透传、靶机网段白名单）</summary>
           <div style="margin-top:14px;display:flex;flex-direction:column;gap:14px">
             <div>
               <b>1. 单目录受控挂载 (/shares/&lt;alias&gt;)</b>
@@ -356,8 +386,11 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
             </div>
             <div>
               <b>2. 物理设备节点直通 (强制人工单次 allow-once)</b>
+              <div style="color:var(--text-secondary);font-size:11.5px;margin-top:4px">
+                支持 <span class="dsh-wsl-sbx-mono">/dev/bus/usb/NNN/NNN</span>（手机 ADB/Fastboot/EDL、libusb）、<span class="dsh-wsl-sbx-mono">/dev/hidraw*</span>、<span class="dsh-wsl-sbx-mono">/dev/cdc-wdm*</span>、<span class="dsh-wsl-sbx-mono">/dev/video*</span>、<span class="dsh-wsl-sbx-mono">/dev/ttyUSB*</span>、<span class="dsh-wsl-sbx-mono">/dev/ttyACM*</span>。注意：Windows 免驱网卡或依赖原厂 OEM 驱动的手机 BL 解锁工具若 WSL 2 默认内核无对应驱动模块，建议留在 Windows 侧按单次审批调用原厂驱动。
+              </div>
               <div style="display:flex;gap:8px;margin:8px 0">
-                <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="dev-list" placeholder="/dev/ttyUSB0, /dev/ttyACM0" />
+                <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="dev-list" placeholder="/dev/bus/usb/001/002, /dev/ttyUSB0, /dev/hidraw0" />
                 <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="saveDevices()">保存设备白名单</button>
               </div>
             </div>
@@ -366,9 +399,21 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
               <div class="dsh-wsl-sbx-grid2" style="margin-top:8px">
                 <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="adv-cidrs" placeholder="CIDR 如 192.168.50.0/24" />
                 <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="adv-ports" placeholder="端口 如 8080, 1883" />
-                <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="adv-domains" placeholder="域名 如 dl.espressif.cn" />
+                <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" id="adv-domains" placeholder="自定义域名 如 mirrors.example.com" />
                 <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="saveAdvNet()">保存高级网络</button>
               </div>
+            </div>
+            <div>
+              <b>4. 落盘足迹清单、包缓存清理与一键可逆卸载</b>
+              <div style="font-size:12px;color:var(--text-secondary);margin-top:4px">
+                无需翻查安装日志，实时查看宿主与 WSL 2 侧全部落盘目录体积，一键清空 <span class="dsh-wsl-sbx-mono">~/.cache/dsh-wsl-sandbox</span> 工作区包缓存或移除 <span class="dsh-wsl-sbx-mono">AGENTS.md</span> 注入块。彻底卸载请运行：<span class="dsh-wsl-sbx-mono">.\\packages\\bootstrap\\uninstall-dsh-plugin.ps1 [-DryRun] [-PurgeToolchains]</span>
+              </div>
+              <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px">
+                <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="loadFootprint()">查看落盘足迹清单</button>
+                <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="purgeSandboxCache()">清空沙箱包缓存与残留临时目录</button>
+                <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="removeAgentsMdBlock()">移除工作区 AGENTS.md 注入块</button>
+              </div>
+              <pre id="footprintBox" class="dsh-wsl-sbx-mono" style="display:none;margin-top:8px;padding:10px;background:#0f1012;border:1px solid var(--border-subtle);border-radius:6px;font-size:11.5px;white-space:pre-wrap;max-height:220px;overflow:auto"></pre>
             </div>
           </div>
         </details>
@@ -376,8 +421,37 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
 
       <!-- Doctor -->
       <section class="dsh-wsl-sbx-pane" id="pane-doctor">
-        <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" style="margin-bottom:12px" onclick="runDoc()">执行实时 dsh-wsl-doctor 自检</button>
-        <div id="docBox" class="dsh-wsl-sbx-card">点击上方按钮运行内核隔离与 22 项工具链体检。</div>
+        <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" style="margin-bottom:12px" onclick="runDoc()">按当前配置档位执行 dsh-wsl-doctor 自检</button>
+        <div id="docBox" class="dsh-wsl-sbx-card">点击上方按钮按所选环境档位（core / standard / universal）运行内核隔离与 Codex 工具链体检。</div>
+      </section>
+
+      <!-- Structured Logs -->
+      <section class="dsh-wsl-sbx-pane" id="pane-logs">
+        <div class="dsh-wsl-sbx-card" style="margin-bottom:12px">
+          <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+            <select class="dsh-wsl-sbx-select" style="width:130px" id="log-lvl" onchange="loadLogs()">
+              <option value="debug">全部级别</option>
+              <option value="info" selected>INFO 及以上</option>
+              <option value="warn">WARN 及以上</option>
+              <option value="error">仅 ERROR</option>
+            </select>
+            <select class="dsh-wsl-sbx-select" style="width:145px" id="log-src" onchange="loadLogs()">
+              <option value="all">全部来源</option>
+              <option value="host">宿主机 Host</option>
+              <option value="wsl-runner">WSL Runner</option>
+            </select>
+            <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" style="flex:1;min-width:180px" id="log-q" placeholder="搜索事件名、组件或关键字..." onkeydown="if(event.key==='Enter')loadLogs()" />
+            <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="loadLogs()">刷新</button>
+            <a class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" style="text-decoration:none" href="/wsl-sandbox/api/logs/export" target="_blank">导出 NDJSON</a>
+            <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="clearLogs()">清空日志</button>
+          </div>
+          <div style="font-size:11.5px;color:var(--text-secondary)" class="dsh-wsl-sbx-mono" id="logStatsBar">
+            纯内存环形缓冲读取（零读盘开销） · 2.5s 合并批量落盘 + 重复风暴折叠（保护 SSD 寿命）
+          </div>
+        </div>
+        <div class="dsh-wsl-sbx-card" style="padding:0;overflow-x:auto">
+          <table class="dsh-wsl-sbx-table" id="logsTbl"></table>
+        </div>
       </section>
 
       <!-- Audit -->
@@ -389,54 +463,158 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
 
   <script>
     const H = { 'Content-Type': 'application/json', 'X-DSH-WSL-Client': '1' };
+    let discoveredDistros = [];
+    let currentTab = 'status';
+    function esc(s) {
+      return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
     function msg(t) {
       document.getElementById('noticeMsg').textContent = t;
       document.getElementById('notice').classList.add('is-visible');
     }
     function sbxTab(id, btn) {
+      currentTab = id;
       document.querySelectorAll('.dsh-wsl-sbx-pane').forEach(p => p.classList.toggle('is-active', p.id === 'pane-' + id));
       document.querySelectorAll('.dsh-wsl-sbx-tab').forEach(b => b.classList.toggle('is-active', b === btn));
+      if (id === 'logs') loadLogs();
     }
     async function api(method, url, body) {
       const r = await fetch(url, { method, headers: H, body: body ? JSON.stringify(body) : undefined });
       return r.json();
     }
-    async function loadStatus() {
-      const customBk = (document.getElementById('bk-dir') && document.getElementById('bk-dir').dataset.dirty === '1')
-        ? document.getElementById('bk-dir').value.trim()
-        : '';
+    async function refreshDistros(notify) {
+      const r = await api('GET', '/wsl-sandbox/api/distros');
+      if (!r.ok) return;
+      discoveredDistros = (r.distros || []).filter(d => !d.isInternalContainer);
+      const sel = document.getElementById('in-distro-select');
+      if (!sel) return;
+      if (discoveredDistros.length === 0) {
+        sel.innerHTML = '<option value="">未探测到 Windows WSL 实例（如在纯 Linux 开发模式请直接填写下方名称）</option>';
+      } else {
+        const cur = document.getElementById('in-distro').value.trim();
+        sel.innerHTML = '<option value="">-- 选择已发现的 WSL 发行版 --</option>' + discoveredDistros.map(d => {
+          const tags = ['WSL ' + d.wslVersion, d.state];
+          if (d.isDefault) tags.push('默认');
+          if (d.isCustomDiskLocation) tags.push('已迁移/WSL Manager: ' + d.basePath);
+          const selected = d.name === cur ? ' selected' : '';
+          return '<option value="' + d.name.replace(/"/g, '&quot;') + '"' + selected + '>' + d.name + ' (' + tags.join(' · ') + ')</option>';
+        }).join('');
+      }
+      if (notify) msg('已探测到 ' + discoveredDistros.length + ' 个 WSL 发行版。');
+    }
+    async function pickDiscoveredDistro() {
+      const sel = document.getElementById('in-distro-select');
+      const name = sel ? sel.value : '';
+      if (!name) return;
+      document.getElementById('in-distro').value = name;
+      const meta = discoveredDistros.find(d => d.name === name);
+      const hint = document.getElementById('distroMetaHint');
+      if (meta && hint) {
+        hint.style.display = 'block';
+        hint.textContent = meta.isCustomDiskLocation
+          ? '检测到 WSL Manager / 自定义迁移磁盘路径: ' + meta.basePath + '（即便在 Windows 资源管理器左侧不可见，沙箱依然通过 wsl.exe 与原生 ext4 Runner 正常运行）'
+          : (meta.basePath ? ('磁盘路径: ' + meta.basePath) : '');
+      }
+      const probed = await api('GET', '/wsl-sandbox/api/distros?probeDistro=' + encodeURIComponent(name));
+      if (probed.ok && probed.probedUser) {
+        if (probed.probedUser.uid === 0) {
+          msg('警告: 发行版 ' + name + ' 默认用户为 root (UID 0)，沙箱将拒绝运行，请先配置非 root 用户。');
+        } else {
+          document.getElementById('in-user').value = probed.probedUser.username;
+          document.getElementById('in-ws').value = probed.probedUser.homeDir + '/workspace';
+          document.getElementById('in-runner').value = probed.probedUser.homeDir + '/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js';
+          msg('已自动探测 ' + name + ' 非 root 用户: ' + probed.probedUser.username + '（点击右上角「应用」保存）。');
+        }
+      }
+    }
+    async function refreshBackups() {
+      const bkInput = document.getElementById('bk-dir');
+      const customBk = (bkInput && bkInput.dataset.dirty === '1') ? bkInput.value.trim() : '';
       const bkQuery = customBk ? ('?backupDir=' + encodeURIComponent(customBk)) : '';
-      const [st, ap, au, bk] = await Promise.all([
+      const bk = await api('GET', '/wsl-sandbox/api/wsl-config/backups' + bkQuery);
+      if (!bk || !bk.ok) return;
+      if (bkInput && bkInput.dataset.dirty !== '1' && bk.backupDir) {
+        bkInput.value = bk.backupDir;
+      }
+      const bkItems = bk.items || [];
+      const bkBox = document.getElementById('backupItemsBox');
+      if (bkBox) {
+        bkBox.innerHTML = bkItems.length === 0
+          ? '<span style="color:var(--text-muted);font-size:12px">当前备份目录下暂无快照，点击「立即备份到此目录」生成只读原始 .wslconfig 与 wsl.conf 备份。</span>'
+          : bkItems.map((it) =>
+              '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-subtle)">' +
+              '<div style="min-width:0"><b class="dsh-wsl-sbx-mono">' + esc(it.name) + '</b> <span class="dsh-wsl-sbx-mono" style="color:var(--text-secondary);font-size:11.5px">' + esc(it.explorerPath) + '</span></div>' +
+              '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" data-exp="' + encodeURIComponent(it.explorerPath) + '" onclick="openBackupExplorer(decodeURIComponent(this.dataset.exp), true)">在资源管理器中定位</button>' +
+              '</div>'
+            ).join('');
+      }
+    }
+    async function loadLogs() {
+      const lvl = document.getElementById('log-lvl').value;
+      const src = document.getElementById('log-src').value;
+      const q = document.getElementById('log-q').value.trim();
+      const qs = '?level=' + encodeURIComponent(lvl) + '&source=' + encodeURIComponent(src) + (q ? '&search=' + encodeURIComponent(q) : '') + '&limit=180';
+      const r = await api('GET', '/wsl-sandbox/api/logs' + qs);
+      if (!r.ok) return;
+      const st = r.stats || {};
+      document.getElementById('logStatsBar').textContent =
+        '日志文件: ' + (st.logFilePath || '仅内存模式') +
+        ' · 内存缓存: ' + (st.bufferedCount || 0) + ' 条' +
+        ' · 累计合并落盘: ' + (st.diskFlushCount || 0) + ' 次 (2.5s 批处理防磨损)';
+      const rows = (r.entries || []).slice().reverse();
+      const colorOf = (l) => l === 'error' ? 'var(--danger)' : (l === 'warn' ? 'var(--warn)' : (l === 'info' ? '#60a5fa' : 'var(--text-muted)'));
+      document.getElementById('logsTbl').innerHTML =
+        '<thead><tr><th style="width:155px">时间</th><th style="width:68px">级别</th><th style="width:130px">来源 / 组件</th><th style="width:160px">事件</th><th>详情</th></tr></thead><tbody>' +
+        (rows.length === 0
+          ? '<tr><td colspan="5" style="color:var(--text-secondary);padding:14px">当前筛选条件下暂无运行日志。</td></tr>'
+          : rows.map(e =>
+              '<tr>' +
+              '<td class="dsh-wsl-sbx-mono" style="color:var(--text-secondary);font-size:11.5px">' + esc(String(e.timestamp || '').replace('T', ' ').slice(0, 19)) + '</td>' +
+              '<td class="dsh-wsl-sbx-mono" style="font-weight:600;color:' + colorOf(e.level) + '">' + esc(String(e.level || '').toUpperCase()) + '</td>' +
+              '<td class="dsh-wsl-sbx-mono" style="font-size:11.5px">' + esc(e.source + ':' + e.component) + '</td>' +
+              '<td class="dsh-wsl-sbx-mono" style="font-size:11.5px">' + esc(e.event) + (e.durationMs != null ? ' (' + e.durationMs + 'ms)' : '') + '</td>' +
+              '<td style="word-break:break-word">' + esc(e.message) + (e.data ? ' <span class="dsh-wsl-sbx-mono" style="color:var(--text-muted);font-size:11.5px">' + esc(JSON.stringify(e.data)) + '</span>' : '') + '</td>' +
+              '</tr>'
+            ).join('')) +
+        '</tbody>';
+    }
+    async function clearLogs() {
+      await api('DELETE', '/wsl-sandbox/api/logs');
+      msg('已清空内存与本地轮转日志。');
+      loadLogs();
+    }
+    async function loadStatus() {
+      const [st, ap, au] = await Promise.all([
         api('GET', '/wsl-sandbox/api/status'),
         api('GET', '/wsl-sandbox/api/approvals'),
-        api('GET', '/wsl-sandbox/api/audit'),
-        api('GET', '/wsl-sandbox/api/wsl-config/backups' + bkQuery)
+        api('GET', '/wsl-sandbox/api/audit')
       ]);
       if (!st.ok) return;
       const c = st.config;
-      document.getElementById('telDistro').textContent = c.distro + (c.username ? ' · ' + c.username : '');
+      const nr = st.nodeRuntime || {};
+      document.getElementById('telDistro').textContent = c.distro + (c.username ? ' · ' + c.username : '') + ' · ' + (c.environmentProfile || 'standard');
       document.getElementById('telWs').textContent = c.workspaceRoot;
+      document.getElementById('telNode').textContent = 'Host ' + (nr.hostNodeVersion || '-') + (nr.wslNodeVersion ? (' / WSL ' + nr.wslNodeVersion) : ' (DSH 进程共用)');
       document.getElementById('telSync').textContent = c.enabled ? '已生效' : '已停用';
       document.getElementById('tabCnt').textContent = '(' + (ap.pending || []).length + ')';
       document.getElementById('stPending').textContent = String((ap.pending || []).length);
       document.getElementById('stRules').textContent = String((ap.sessionRules || []).length);
       document.getElementById('stAdv').textContent = c.advanced.shares.length + ' / ' + c.advanced.deviceNodes.length;
 
-      const bkInput = document.getElementById('bk-dir');
-      if (bkInput && bkInput.dataset.dirty !== '1') {
-        bkInput.value = (bk && bk.backupDir) || c.backupDir || '';
+      const cmdPre = document.getElementById('wslConfCmdPre');
+      if (cmdPre) {
+        cmdPre.textContent =
+          '# 在 WSL 内执行（只读备份原版 /etc/wsl.conf 后关闭自动挂载）：\\n' +
+          'bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --disable-automount\\n' +
+          '# 如需一键还原原厂 /etc/wsl.conf：\\n' +
+          'bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --restore-configs\\n' +
+          '# 在 Windows PowerShell 中仅重启当前发行版（切勿用 wsl --shutdown 以免关掉其他 WSL 会话）：\\n' +
+          'wsl.exe --terminate ' + c.distro;
       }
-      const bkItems = (bk && bk.items) || [];
-      const bkBox = document.getElementById('backupItemsBox');
-      if (bkBox) {
-        bkBox.innerHTML = bkItems.length === 0
-          ? '<span style="color:var(--text-muted);font-size:12px">当前备份目录下暂无快照，点击「立即备份到此目录」生成原始 .wslconfig 与 wsl.conf 备份。</span>'
-          : bkItems.map((it, idx) =>
-              '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid var(--border-subtle)">' +
-              '<div style="min-width:0"><b class="dsh-wsl-sbx-mono">' + it.name + '</b> <span class="dsh-wsl-sbx-mono" style="color:var(--text-secondary);font-size:11.5px">' + it.explorerPath + '</span></div>' +
-              '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" data-exp="' + encodeURIComponent(it.explorerPath) + '" onclick="openBackupExplorer(decodeURIComponent(this.dataset.exp), true)">在资源管理器中定位</button>' +
-              '</div>'
-            ).join('');
+
+      const bkInput = document.getElementById('bk-dir');
+      if (bkInput && bkInput.dataset.dirty !== '1' && !bkInput.value) {
+        bkInput.value = c.backupDir || '';
       }
 
       document.getElementById('in-enabled').checked = c.enabled;
@@ -445,6 +623,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
       document.getElementById('in-mirror').checked = c.mirrorCn;
       document.getElementById('in-transport').value = c.transportMode;
       document.getElementById('in-distro').value = c.distro;
+      document.getElementById('in-profile').value = c.environmentProfile || 'standard';
       document.getElementById('in-user').value = c.username || '';
       document.getElementById('in-ws').value = c.workspaceRoot;
       document.getElementById('in-runner').value = c.runnerPath;
@@ -454,6 +633,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
       document.getElementById('in-nmode').value = c.networkMode;
       document.getElementById('in-proxy').value = c.upstreamProxy || '';
       document.getElementById('in-cmode').value = c.cacheMode;
+      document.getElementById('in-loglevel').value = c.logLevel || 'info';
       document.getElementById('in-unmask').value = (c.unmaskedEnvWorkspaces || []).join(', ');
       document.getElementById('dev-list').value = c.advanced.deviceNodes.map(d => d.path).join(', ');
       document.getElementById('adv-cidrs').value = c.advanced.localLabCidrs.join(', ');
@@ -462,7 +642,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
 
       const shareRowsHtml = c.advanced.shares.map(s =>
         '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border-subtle)">' +
-        '<span class="dsh-wsl-sbx-mono">/shares/' + s.alias + ' &lt;- ' + s.sourceLinuxPath + ' (' + s.mode + ')</span>' +
+        '<span class="dsh-wsl-sbx-mono">/shares/' + esc(s.alias) + ' &lt;- ' + esc(s.sourceLinuxPath) + ' (' + esc(s.mode) + ')</span>' +
         '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="delShare(\\'' + s.id + '\\')">取消挂载</button></div>'
       ).join('') || '<span style="color:var(--text-muted);font-size:12px">当前未挂载任何外部目录（所有 Windows 盘符对 AI 完全不可见）</span>';
       document.getElementById('sharesBox').innerHTML = shareRowsHtml;
@@ -471,8 +651,8 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
 
       document.getElementById('pendingBox').innerHTML = (ap.pending || []).map(p =>
         '<div class="dsh-wsl-sbx-card">' +
-        '<div style="display:flex;justify-content:space-between"><b>' + p.summary + '</b><span class="dsh-wsl-sbx-mono" style="color:var(--text-muted)">' + p.requestId + '</span></div>' +
-        '<pre class="dsh-wsl-sbx-cmd">' + (p.command || '') + '</pre>' +
+        '<div style="display:flex;justify-content:space-between"><b>' + esc(p.summary) + '</b><span class="dsh-wsl-sbx-mono" style="color:var(--text-muted)">' + esc(p.requestId) + '</span></div>' +
+        '<pre class="dsh-wsl-sbx-cmd">' + esc(p.command || '') + '</pre>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">' +
         '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" onclick="decide(\\'' + p.requestId + '\\',\\'allow-once\\')">允许一次</button>' +
         '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" ' + (p.touchesPhysicalDevice || !p.allowSessionRuleOption ? 'disabled' : '') + ' onclick="decide(\\'' + p.requestId + '\\',\\'allow-session-rule\\')">' + (p.touchesPhysicalDevice ? '硬件锁死单次' : '允许会话前缀') + '</button>' +
@@ -484,7 +664,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
 
       document.getElementById('rulesBox').textContent = (ap.sessionRules || []).map(r => '[' + r.join(' ') + ']').join('  ') || '暂无缓存前缀规则';
       document.getElementById('auditTbl').innerHTML = '<thead><tr><th>时间</th><th>类型</th><th>摘要</th><th>结果</th></tr></thead><tbody>' +
-        (au.records || []).slice().reverse().map(r => '<tr><td class="dsh-wsl-sbx-mono">' + r.timestamp + '</td><td>' + r.kind + '</td><td>' + r.summary + '</td><td>' + r.outcome + '</td></tr>').join('') + '</tbody>';
+        (au.records || []).slice().reverse().map(r => '<tr><td class="dsh-wsl-sbx-mono">' + esc(r.timestamp) + '</td><td>' + esc(r.kind) + '</td><td>' + esc(r.summary) + '</td><td>' + esc(r.outcome) + '</td></tr>').join('') + '</tbody>';
     }
     async function saveBasic() {
       const r = await api('PUT', '/wsl-sandbox/api/config', {
@@ -494,6 +674,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
         mirrorCn: document.getElementById('in-mirror').checked,
         transportMode: document.getElementById('in-transport').value,
         distro: document.getElementById('in-distro').value.trim(),
+        environmentProfile: document.getElementById('in-profile').value,
         username: document.getElementById('in-user').value.trim() || undefined,
         workspaceRoot: document.getElementById('in-ws').value.trim(),
         runnerPath: document.getElementById('in-runner').value.trim(),
@@ -503,6 +684,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
         networkMode: document.getElementById('in-nmode').value,
         upstreamProxy: document.getElementById('in-proxy').value.trim(),
         cacheMode: document.getElementById('in-cmode').value,
+        logLevel: document.getElementById('in-loglevel').value,
         unmaskedEnvWorkspaces: document.getElementById('in-unmask').value.split(',').map(s => s.trim()).filter(Boolean)
       });
       msg(r.ok ? '基础配置已保存并生效。' : ('保存失败: ' + (r.error && r.error.message)));
@@ -516,7 +698,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
       loadStatus();
     }
     async function clearSessionRules() { await api('DELETE', '/wsl-sandbox/api/session-rules'); msg('已清空会话规则。'); loadStatus(); }
-    async function emergencyKill() { await api('POST', '/wsl-sandbox/api/session/invalidate'); msg('已熔断并清理全部沙箱进程组。'); loadStatus(); }
+    async function emergencyKill() { await api('POST', '/wsl-sandbox/api/session/invalidate'); msg('已仅熔断当前 DSH 会话内的沙箱进程组（不影响其他会话或人工 WSL 终端）。'); loadStatus(); }
     async function clearCache() { await api('POST', '/wsl-sandbox/api/cache/clear'); msg('已清理 WSL 包管理器缓存。'); }
     async function upsertAgents() { const r = await api('POST', '/wsl-sandbox/api/agents-md', {}); msg(r.ok ? ('已更新 ' + r.filePath) : '更新失败'); }
     async function addShare() {
@@ -549,7 +731,8 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
         bkIn.value = r.backupDir || backupDir;
         bkIn.dataset.dirty = '0';
       }
-      msg(r.ok ? ('原始 WSL 配置已备份至: ' + r.backupDir) : ('备份失败: ' + (r.error && r.error.message)));
+      msg(r.ok ? ('只读原始 WSL 配置快照已保存至: ' + r.backupDir) : ('备份失败: ' + (r.error && r.error.message)));
+      await refreshBackups();
       loadStatus();
     }
     async function pickBackupDir() {
@@ -558,6 +741,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
         const bkIn = document.getElementById('bk-dir');
         if (bkIn) { bkIn.value = r.selectedDir; bkIn.dataset.dirty = '0'; }
         msg('已选择备份目录: ' + r.selectedDir);
+        await refreshBackups();
         loadStatus();
       } else if (r.message) {
         msg(r.message);
@@ -582,7 +766,7 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
       const el = document.getElementById('wslConfCmdBox');
       if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
     }
-    async function delShare(id) { await api('DELETE', '/wsl-sandbox/api/advanced/shares/' + encodeURIComponent(id)); msg('已取消挂载并终止旧沙箱进程。'); loadStatus(); }
+    async function delShare(id) { await api('DELETE', '/wsl-sandbox/api/advanced/shares/' + encodeURIComponent(id)); msg('已取消挂载并仅终止当前会话的旧沙箱进程。'); loadStatus(); }
     async function saveDevices() {
       const nodes = document.getElementById('dev-list').value.split(',').map(s => s.trim()).filter(Boolean).map(p => ({ path: p }));
       const r = await api('PUT', '/wsl-sandbox/api/advanced/devices', { deviceNodes: nodes });
@@ -598,20 +782,40 @@ bash packages/bootstrap/provision-wsl.sh --restore-configs</pre>
       msg(r.ok ? '已更新高级网络白名单。' : ('拦截: ' + (r.error && r.error.message)));
       loadStatus();
     }
+    async function loadFootprint() {
+      const box = document.getElementById('footprintBox');
+      box.style.display = 'block';
+      box.textContent = '正在扫描宿主机与 WSL 2 落盘足迹...';
+      const r = await api('GET', '/wsl-sandbox/api/footprint');
+      box.textContent = r.ok ? JSON.stringify({ host: r.host, wsl: r.wsl, uninstallCommands: r.uninstallCommands }, null, 2) : ('读取失败: ' + (r.error && r.error.message));
+    }
+    async function purgeSandboxCache() {
+      const r = await api('POST', '/wsl-sandbox/api/cache/purge', {});
+      msg(r.ok ? ('已清理沙箱缓存目录 (' + (r.clearedEntries || 0) + ' 项) 与孤儿临时目录 (' + ((r.sweptTempDirs && r.sweptTempDirs.length) || 0) + ' 项)。') : ('清理失败: ' + (r.error && r.error.message)));
+    }
+    async function removeAgentsMdBlock() {
+      const r = await api('DELETE', '/wsl-sandbox/api/agents-md', {});
+      msg(r.ok ? ('AGENTS.md 处理结果: ' + r.action + ' (' + r.filePath + ')') : ('移除失败: ' + (r.error && r.error.message)));
+    }
     async function runDoc() {
-      document.getElementById('docBox').textContent = '正在执行内核隔离与工具链自检...';
+      document.getElementById('docBox').textContent = '正在执行内核隔离与当前档位工具链自检...';
       const r = await api('GET', '/wsl-sandbox/api/doctor');
       if (!r.ok || !r.report) { document.getElementById('docBox').textContent = '自检失败'; return; }
       const d = r.report;
       document.getElementById('docBox').innerHTML =
-        '<div><b>总体结论: ' + d.verdict.toUpperCase() + '</b> · 内核 ' + d.os.kernel + ' · bwrap ' + (d.sandbox.bwrapVersion || '缺失') +
+        '<div><b>总体结论: ' + esc(d.verdict.toUpperCase()) + '</b> · 档位 <span class="dsh-wsl-sbx-mono">' + esc(d.selectedProfile || 'standard') + '</span> · 发行版 ' + esc(d.os.distroPrettyName || d.os.platform) +
+        ' · 内核 ' + esc(d.os.kernel) + ' · bwrap ' + esc(d.sandbox.bwrapVersion || '缺失') +
         ' · io_uring=' + d.sandbox.seccompIoUringBlocked + ' · AF_VSOCK=' + d.sandbox.seccompAfVsockBlocked + '</div>' +
         '<table class="dsh-wsl-sbx-table" style="margin-top:10px"><thead><tr><th>工具</th><th>档位</th><th>版本</th><th>状态</th></tr></thead><tbody>' +
-        d.tools.map(t => '<tr><td class="dsh-wsl-sbx-mono">' + t.name + '</td><td>' + t.tier + '</td><td class="dsh-wsl-sbx-mono">' + (t.version || '-') + '</td><td>' + (t.present ? '就绪' : '可选缺失') + '</td></tr>').join('') +
+        d.tools.map(t => '<tr><td class="dsh-wsl-sbx-mono">' + esc(t.name) + '</td><td>' + esc(t.tier) + '</td><td class="dsh-wsl-sbx-mono">' + esc(t.version || '-') + '</td><td>' + (t.present ? '就绪' : '未安装') + '</td></tr>').join('') +
         '</tbody></table>';
     }
-    loadStatus();
-    setInterval(loadStatus, 4000);
+    loadStatus().then(() => { refreshBackups(); refreshDistros(false); });
+    setInterval(function () {
+      if (document.hidden) return;
+      loadStatus();
+      if (currentTab === 'logs') loadLogs();
+    }, 5000);
   </script>
 </body>
 </html>`;

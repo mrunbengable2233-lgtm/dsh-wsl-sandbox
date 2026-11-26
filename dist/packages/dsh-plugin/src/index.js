@@ -1,5 +1,12 @@
+import path from 'node:path';
+import {
+                
+  resolveSharedHostNodeRuntime,
+  RotatingNdjsonSink,
+  StructuredLogger,
+} from '../../core/src/index.js';
 import { ApprovalBridge } from './approval-bridge.js';
-import { ConfigStore,                       } from './config-store.js';
+import { ConfigStore, hardenPrivatePath,                       } from './config-store.js';
 import {                        getOptionalService } from './cordis-types.js';
 import { registerWslPromptSection } from './prompt-injector.js';
 import { registerHostPwshGuardHook } from './pwsh-hook.js';
@@ -19,6 +26,10 @@ export const inject           = [];
                                           
                                
                                    
+                                                                                                                          
+                                 
+                                                                                      
+                                       
                                                      
                               
                                        
@@ -28,6 +39,8 @@ export const inject           = [];
                                   
                            
                                   
+                                
+                                                                       
                                                          
                                                                        
                                       
@@ -35,6 +48,7 @@ export const inject           = [];
                                   
                               
                                                      
+                               
                                                
                                          
                                                             
@@ -44,6 +58,7 @@ export const inject           = [];
                                     
                                           
                                                     
+                                    
                                         
  
 
@@ -53,6 +68,8 @@ function resolveInitialConfig(options                         )                 
   if (options.enabled !== undefined) mutable.enabled = options.enabled;
   if (options.distro ?? options.defaultDistro) mutable.distro = options.distro ?? options.defaultDistro;
   if (options.workspaceRoot !== undefined) mutable.workspaceRoot = options.workspaceRoot;
+  if (options.wslNodePath !== undefined) mutable.wslNodePath = options.wslNodePath;
+  if (options.environmentProfile !== undefined) mutable.environmentProfile = options.environmentProfile;
   if (options.sandboxMode !== undefined) mutable.sandboxMode = options.sandboxMode;
   if (options.approvalPolicyMode !== undefined) mutable.approvalPolicyMode = options.approvalPolicyMode;
   if (options.approvalTimeoutMs !== undefined) mutable.approvalTimeoutMs = options.approvalTimeoutMs;
@@ -60,11 +77,12 @@ function resolveInitialConfig(options                         )                 
   if (options.upstreamProxy !== undefined) mutable.upstreamProxy = options.upstreamProxy;
   if (options.mirrorCn !== undefined) mutable.mirrorCn = options.mirrorCn;
   if (options.cacheMode !== undefined) mutable.cacheMode = options.cacheMode;
+  if (options.logLevel !== undefined) mutable.logLevel = options.logLevel;
   if (options.injectSystemPromptSection !== undefined) {
     mutable.enablePromptInjection = options.injectSystemPromptSection;
   }
   if (options.enableHostPwshGuard !== undefined) {
-    mutable.enablePwshGuard = options.enableHostPwshGuard;
+    mutable.enablePwshGuard = options.enablePwshGuard;
   }
   if (options.advanced !== undefined) {
     mutable.advanced = {
@@ -80,9 +98,6 @@ function resolveInitialConfig(options                         )                 
 
 function registerSafeEffect(ctx                  , cleanup                            )       {
   if (typeof ctx.effect !== 'function') return;
-  // Real `@deepseek-ai/cordis` (`@cordisjs/core` v4) invokes `ctx.effect((ctx) => disposer)` immediately
-  // during plugin mount to obtain the disposer! Lightweight mocks in tests may push `fn` directly.
-  // Detect real Cordis fiber presence (`'fiber' in ctx` or `typeof ctx.inject === 'function'`) vs bare mock:
   if ('fiber' in (ctx          ) || typeof ctx.inject === 'function') {
     ctx.effect(() => () => {
       void cleanup();
@@ -96,17 +111,46 @@ export function apply(
   ctx                  ,
   options                          = {},
 )                         {
+  const persistConfig = options.persistConfig ?? true;
   const configStore = new ConfigStore({
     filePath: options.configPath,
-    persistToDisk: options.persistConfig ?? true,
+    persistToDisk: persistConfig,
     initial: resolveInitialConfig(options),
   });
 
-  const logger = getOptionalService(ctx, 'logger');
+  const hostLoggerService = getOptionalService(ctx, 'logger');
+  const persistLogs = options.persistLogs ?? persistConfig;
+  const logSink = persistLogs
+    ? new RotatingNdjsonSink({
+        logDir: path.join(configStore.getConfigDir(), 'logs'),
+        fileName: 'host.ndjson',
+        maxBytes: 5 * 1024 * 1024,
+        maxFiles: 3,
+        flushIntervalMs: options.logFlushIntervalMs ?? 2500,
+        hardenPath: (target, kind) => hardenPrivatePath(target, kind),
+      })
+    : undefined;
+
+  const logger = new StructuredLogger({
+    source: 'host',
+    level: configStore.get().logLevel,
+    fileSink: logSink,
+    preloadFromDisk: persistLogs,
+    onEntry: (entry) => {
+      if (!hostLoggerService) return;
+      if (entry.level === 'error') {
+        hostLoggerService.error(`[dsh-wsl-sandbox][${entry.component}] ${entry.message}`);
+      } else if (entry.level === 'warn') {
+        hostLoggerService.warn(`[dsh-wsl-sandbox][${entry.component}] ${entry.message}`);
+      }
+    },
+  });
+
   const approvalBridge = new ApprovalBridge({
     getPolicyMode: () => configStore.get().approvalPolicyMode,
     ttlMs: configStore.get().approvalTimeoutMs,
     hostApproval: getOptionalService(ctx, 'approval'),
+    logger,
     bypassInstantThresholdMs: options.bypassInstantThresholdMs,
   });
 
@@ -115,7 +159,8 @@ export function apply(
     approvalBridge,
     sessionId: options.sessionId,
     allowLinuxDevMode: options.allowLinuxDevMode,
-    onStderr: (line) => logger?.warn(`[dsh-wsl-runner] ${line}`),
+    logger,
+    onStderr: (line) => hostLoggerService?.warn(`[dsh-wsl-runner] ${line}`),
   });
 
   const disposers                                    = [];
@@ -133,6 +178,7 @@ export function apply(
         getConfig: () => configStore.get(),
         getBinding: () => sessionManager.ensureBound(),
         approvalBridge,
+        logger,
       });
       registerSafeEffect(toolCtx, () => {
         for (const fn of toolDisposers.splice(0)) fn();
@@ -144,6 +190,7 @@ export function apply(
       getConfig: () => configStore.get(),
       getBinding: () => sessionManager.ensureBound(),
       approvalBridge,
+      logger,
     });
     if (pwshDispose) disposers.push(pwshDispose);
     disposers.push(...registerWslSandboxTools(ctx, sessionManager, configStore, approvalBridge));
@@ -175,16 +222,17 @@ export function apply(
         configStore,
         sessionManager,
         approvalBridge,
+        logger,
       });
       registerSafeEffect(webCtx, () => {
         for (const fn of webDisposers.splice(0)) fn();
       });
     });
     if (getOptionalService(ctx, 'http')) {
-      disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge }));
+      disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge, logger }));
     }
   } else {
-    disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge }));
+    disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge, logger }));
   }
 
   const dispose = async ()                => {
@@ -192,17 +240,42 @@ export function apply(
       await fn();
     }
     await sessionManager.dispose();
+    logger.log('info', {
+      component: 'plugin',
+      event: 'plugin.disposed',
+      message: 'dsh-wsl-sandbox unloaded cleanly (zero residual runners or open file handles)',
+    });
+    logger.dispose();
   };
 
   registerSafeEffect(ctx, dispose);
-  logger?.info(
-    `[dsh-wsl-sandbox] loaded (distro=${configStore.get().distro}, approval=${configStore.get().approvalPolicyMode}, network=${configStore.get().networkMode})`,
+
+  const hostRuntime = resolveSharedHostNodeRuntime();
+  const cfg = configStore.get();
+  logger.log('info', {
+    component: 'plugin',
+    event: 'plugin.loaded',
+    message: `Loaded dsh-wsl-sandbox (distro=${cfg.distro}, profile=${cfg.environmentProfile}, hostNode=${hostRuntime.nodeVersion} sharedWithDsh=${hostRuntime.sharedWithHostProcess})`,
+    data: {
+      distro: cfg.distro,
+      environmentProfile: cfg.environmentProfile,
+      approvalPolicyMode: cfg.approvalPolicyMode,
+      networkMode: cfg.networkMode,
+      hostNodeVersion: hostRuntime.nodeVersion,
+      hostSharedWithDsh: hostRuntime.sharedWithHostProcess,
+      isElectronCarrier: hostRuntime.isElectronCarrier,
+      logFilePath: logger.getLogFilePath() ?? null,
+    },
+  });
+  hostLoggerService?.info(
+    `[dsh-wsl-sandbox] loaded (distro=${cfg.distro}, approval=${cfg.approvalPolicyMode}, network=${cfg.networkMode}, hostNode=${hostRuntime.nodeVersion})`,
   );
 
   return {
     configStore,
     approvalBridge,
     sessionManager,
+    logger,
     dispose,
   };
 }
@@ -210,6 +283,7 @@ export function apply(
 export * from './cordis-types.js';
 export * from './config-store.js';
 export * from './wsl-transport.js';
+export * from './wsl-discovery.js';
 export * from './approval-bridge.js';
 export * from './prompt-injector.js';
 export * from './pwsh-hook.js';
