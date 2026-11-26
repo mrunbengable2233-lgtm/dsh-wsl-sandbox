@@ -117,6 +117,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
     var _bkDir = useState(""), bkDir = _bkDir[0], setBkDir = _bkDir[1];
     var _bkDirty = useState(false), bkDirty = _bkDirty[0], setBkDirty = _bkDirty[1];
     var _bkItems = useState([]), bkItems = _bkItems[0], setBkItems = _bkItems[1];
+    var _distros = useState([]), distros = _distros[0], setDistros = _distros[1];
 
     var reload = useCallback(function () {
       Promise.all([
@@ -145,13 +146,26 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         });
     }, [bkDirty]);
 
+    var loadDistros = useCallback(function (notify) {
+      apiFetch("GET", "/wsl-sandbox/api/distros")
+        .then(function (r) {
+          if (r && r.ok) {
+            var usable = (r.distros || []).filter(function (d) { return !d.isInternalContainer; });
+            setDistros(usable);
+            if (notify) setNotice("已探测到 " + usable.length + " 个 WSL 发行版（含 WSL Manager 迁移实例）。");
+          }
+        })
+        .catch(function () {});
+    }, []);
+
     useEffect(function () {
       reload();
+      loadDistros(false);
       var timer = setInterval(reload, 4000);
       return function () {
         clearInterval(timer);
       };
-    }, [reload]);
+    }, [reload, loadDistros]);
 
     function updateField(k, v) {
       if (!cfg) return;
@@ -160,12 +174,36 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
       setCfg(next);
     }
 
+    function selectDiscoveredDistro(name) {
+      if (!name || !cfg) return;
+      updateField("distro", name);
+      apiFetch("GET", "/wsl-sandbox/api/distros?probeDistro=" + encodeURIComponent(name))
+        .then(function (r) {
+          if (r && r.ok && r.probedUser) {
+            if (r.probedUser.uid === 0) {
+              setNotice("警告: " + name + " 默认用户为 root (UID 0)，请先配置非 root 用户。");
+            } else {
+              var next = Object.assign({}, cfg, {
+                distro: name,
+                username: r.probedUser.username,
+                workspaceRoot: r.probedUser.homeDir + "/workspace",
+                runnerPath: r.probedUser.homeDir + "/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js"
+              });
+              setCfg(next);
+              setNotice("已自动探测 " + name + " 非 root 用户: " + r.probedUser.username + "（点击「应用」生效）。");
+            }
+          }
+        })
+        .catch(function () {});
+    }
+
     function saveConfig() {
       if (!cfg) return;
       apiFetch("PUT", "/wsl-sandbox/api/config", {
         enabled: cfg.enabled,
         transportMode: cfg.transportMode,
         distro: cfg.distro,
+        environmentProfile: cfg.environmentProfile || "standard",
         username: cfg.username || undefined,
         workspaceRoot: cfg.workspaceRoot,
         runnerPath: cfg.runnerPath,
@@ -189,7 +227,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
 
     function killAll() {
       apiFetch("POST", "/wsl-sandbox/api/session/invalidate", {}).then(function () {
-        setNotice("已熔断强杀全部沙箱进程组并清空待审队列。");
+        setNotice("已仅熔断当前 DSH 会话的沙箱进程组（不影响其他会话或人工 WSL 终端）。");
         reload();
       });
     }
@@ -204,11 +242,11 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
     }
 
     function runDoctor() {
-      setNotice("正在执行 WSL 内核与 22 项工具链自检...");
+      setNotice("正在按所选档位执行 WSL 内核与工具链自检...");
       apiFetch("GET", "/wsl-sandbox/api/doctor").then(function (r) {
         if (r && r.ok) {
           setDoc(r.report);
-          setNotice("内核体检已完成: " + String(r.report.verdict || "").toUpperCase());
+          setNotice("内核体检已完成 (" + (r.report.selectedProfile || "standard") + "): " + String(r.report.verdict || "").toUpperCase());
         }
       });
     }
@@ -232,7 +270,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
 
     function revokeShare(id) {
       apiFetch("DELETE", "/wsl-sandbox/api/advanced/shares/" + encodeURIComponent(id)).then(function () {
-        setNotice("已取消挂载并清理旧沙箱进程。");
+        setNotice("已取消挂载并仅清理当前会话的旧沙箱进程。");
         reload();
       });
     }
@@ -243,7 +281,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
           setBkDirty(false);
           setBkDir(r.backupDir || bkDir);
           setBkItems(r.items || []);
-          setNotice("原始 WSL 配置已备份至: " + r.backupDir);
+          setNotice("只读原始 WSL 配置快照已保存至: " + r.backupDir);
         } else {
           setNotice("备份失败: " + ((r && r.error && r.error.message) || ""));
         }
@@ -316,7 +354,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
       h(
         "div",
         { className: "dsh-wsl-native-tel" },
-        h("span", null, "受控发行版 ", h("b", { className: "dsh-wsl-native-mono" }, cfg.distro)),
+        h("span", null, "受控发行版 ", h("b", { className: "dsh-wsl-native-mono" }, cfg.distro + " · " + (cfg.environmentProfile || "standard"))),
         h("span", null, "工作区 ", h("b", { className: "dsh-wsl-native-mono" }, cfg.workspaceRoot)),
         h("span", null, "隔离层级 ", h("b", null, cfg.enabled ? "bwrap + seccomp + 单壳防呆" : "已停用")),
         h("span", null, "配置状态 ", h("b", null, "已生效"))
@@ -415,9 +453,14 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
                   { style: { paddingBottom: "10px", marginBottom: "10px", borderBottom: "1px solid rgba(255,255,255,0.07)" } },
                   h(
                     "div",
-                    { style: { marginBottom: "8px" } },
+                    { style: { marginBottom: "4px" } },
                     h("b", null, "禁用 Windows 全盘挂载 (C:\\ / D:\\) 与原始 WSL 配置备份 · "),
-                    h("span", { style: { color: "#22c55e", fontSize: "12px" } }, "沙箱 --tmpfs /mnt 已锁死开启")
+                    h("span", { style: { color: "#22c55e", fontSize: "12px" } }, "沙箱 --tmpfs /mnt 与配置目录遮蔽已锁死")
+                  ),
+                  h(
+                    "div",
+                    { style: { color: "#9498a3", fontSize: "11.5px", marginBottom: "8px" } },
+                    "WSL Settings 与 WSL Manager 共用 %USERPROFILE%\\.wslconfig 与 /etc/wsl.conf；本插件绝不自动改写原配置，备份以只读权限保存。"
                   ),
                   h(
                     "div",
@@ -444,14 +487,14 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
                         );
                       })
                 ),
-                h("div", { style: { fontWeight: 600, marginBottom: "6px" } }, "指定单目录快捷挂载（直接粘贴 Windows 文件夹如 D:\\Datasets\\ESP32）"),
+                h("div", { style: { fontWeight: 600, marginBottom: "6px" } }, "指定单目录快捷挂载（直接粘贴 Windows 文件夹如 D:\\Datasets\\Project）"),
                 h(
                   "div",
                   { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" } },
                   h("input", {
                     className: "dsh-wsl-native-in dsh-wsl-native-mono",
                     style: { flex: "1", minWidth: "200px" },
-                    placeholder: "D:\\Datasets\\ESP32 或 /mnt/d/...",
+                    placeholder: "D:\\Datasets\\Project 或 /mnt/d/...",
                     value: qPath,
                     onChange: function (e) { setQPath(e.target.value); }
                   }),
@@ -522,13 +565,53 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         tab === "basic"
           ? h(
               "div",
-              { className: "dsh-wsl-native-grid2" },
-              h("div", null, h("div", null, "WSL 发行版"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.distro, onChange: function (e) { updateField("distro", e.target.value); } })),
-              h("div", null, h("div", null, "工作区根目录 (原生 ext4)"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.workspaceRoot, onChange: function (e) { updateField("workspaceRoot", e.target.value); } })),
-              h("div", null, h("div", null, "沙箱模式"), h("select", { className: "dsh-wsl-native-in", value: cfg.sandboxMode, onChange: function (e) { updateField("sandboxMode", e.target.value); } }, h("option", { value: "workspace-write" }, "workspace-write"), h("option", { value: "read-only" }, "read-only"))),
-              h("div", null, h("div", null, "审批策略"), h("select", { className: "dsh-wsl-native-in", value: cfg.approvalPolicyMode, onChange: function (e) { updateField("approvalPolicyMode", e.target.value); } }, h("option", { value: "balanced" }, "balanced"), h("option", { value: "strict" }, "strict"), h("option", { value: "trust-workspace" }, "trust-workspace"))),
-              h("div", null, h("div", null, "网络隔离模式"), h("select", { className: "dsh-wsl-native-in", value: cfg.networkMode, onChange: function (e) { updateField("networkMode", e.target.value); } }, h("option", { value: "allowlist-proxy" }, "allowlist-proxy"), h("option", { value: "offline" }, "offline"))),
-              h("div", null, h("div", null, "上游代理"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.upstreamProxy || "", onChange: function (e) { updateField("upstreamProxy", e.target.value); } }))
+              null,
+              h(
+                "div",
+                { className: "dsh-wsl-native-card", style: { marginBottom: "10px", padding: "10px 12px" } },
+                h("div", { style: { fontSize: "12px", color: "#9498a3", marginBottom: "6px" } }, "支持任意已注册的 WSL 2 发行版（含 Ubuntu 26.04/24.04、Debian、Fedora、Arch 及 WSL Manager 导入/迁移磁盘实例）："),
+                h(
+                  "div",
+                  { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
+                  h(
+                    "select",
+                    {
+                      className: "dsh-wsl-native-in dsh-wsl-native-mono",
+                      style: { flex: "1", minWidth: "220px" },
+                      value: distros.some(function (d) { return d.name === cfg.distro; }) ? cfg.distro : "",
+                      onChange: function (e) { selectDiscoveredDistro(e.target.value); }
+                    },
+                    h("option", { value: "" }, distros.length ? "-- 选择已探测的 WSL 发行版 --" : "未探测到 Windows WSL 实例（可直接手动填写）"),
+                    distros.map(function (d) {
+                      var label = d.name + " (WSL " + d.wslVersion + " · " + d.state + (d.isDefault ? " · 默认" : "") + (d.isCustomDiskLocation ? " · 已迁移" : "") + ")";
+                      return h("option", { key: d.name, value: d.name }, label);
+                    })
+                  ),
+                  h("button", { className: "dsh-wsl-native-btn", onClick: function () { loadDistros(true); } }, "刷新实例")
+                )
+              ),
+              h(
+                "div",
+                { className: "dsh-wsl-native-grid2" },
+                h("div", null, h("div", null, "WSL 发行版"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.distro, onChange: function (e) { updateField("distro", e.target.value); } })),
+                h(
+                  "div",
+                  null,
+                  h("div", null, "工具链环境档位"),
+                  h(
+                    "select",
+                    { className: "dsh-wsl-native-in", value: cfg.environmentProfile || "standard", onChange: function (e) { updateField("environmentProfile", e.target.value); } },
+                    h("option", { value: "core" }, "core (~350MB 基础)"),
+                    h("option", { value: "standard" }, "standard (~1.2GB 推荐)"),
+                    h("option", { value: "universal" }, "universal (~3.5GB 全语言)")
+                  )
+                ),
+                h("div", null, h("div", null, "工作区根目录 (原生 ext4)"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.workspaceRoot, onChange: function (e) { updateField("workspaceRoot", e.target.value); } })),
+                h("div", null, h("div", null, "沙箱模式"), h("select", { className: "dsh-wsl-native-in", value: cfg.sandboxMode, onChange: function (e) { updateField("sandboxMode", e.target.value); } }, h("option", { value: "workspace-write" }, "workspace-write"), h("option", { value: "read-only" }, "read-only"))),
+                h("div", null, h("div", null, "审批策略"), h("select", { className: "dsh-wsl-native-in", value: cfg.approvalPolicyMode, onChange: function (e) { updateField("approvalPolicyMode", e.target.value); } }, h("option", { value: "balanced" }, "balanced"), h("option", { value: "strict" }, "strict"), h("option", { value: "trust-workspace" }, "trust-workspace"))),
+                h("div", null, h("div", null, "网络隔离模式"), h("select", { className: "dsh-wsl-native-in", value: cfg.networkMode, onChange: function (e) { updateField("networkMode", e.target.value); } }, h("option", { value: "allowlist-proxy" }, "allowlist-proxy"), h("option", { value: "offline" }, "offline"))),
+                h("div", { style: { gridColumn: "1 / -1" } }, h("div", null, "上游代理"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.upstreamProxy || "", onChange: function (e) { updateField("upstreamProxy", e.target.value); } }))
+              )
             )
           : null,
         tab === "advanced"

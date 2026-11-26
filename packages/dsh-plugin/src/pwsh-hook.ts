@@ -127,6 +127,21 @@ export function evaluateHostPosixBashOnWindows(command: string): GuardEvaluation
       externalPaths: [],
     };
   }
+  if (
+    /\bpnputil(?:\.exe)?\b[^\n;|&]*(?:\/(?:add-driver|delete-driver|install|enable-device|disable-device|restart-device|remove-device)\b|\s-[adi]\b)|\b(?:devcon(?:\.exe)?\b[^\n;|&]*\b(?:install|update|remove|enable|disable|restart)\b|zadig(?:\.exe)?\b)/i.test(
+      command,
+    )
+  ) {
+    return {
+      decision: 'ask',
+      riskLevel: 'high',
+      reasons: ['Windows driver / PnP device mutation requires manual single-shot approval'],
+      unwrappedCommands: [['pnputil']],
+      touchesPhysicalDevice: true,
+      requiresSessionRuleBlocked: true,
+      externalPaths: [],
+    };
+  }
   return evaluateBashCommand(command, { workspaceRoot: '/host-workspace' });
 }
 

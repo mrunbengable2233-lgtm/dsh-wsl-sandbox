@@ -15,6 +15,7 @@ import {
   type BasicConfigPatch,
   type ConfigStore,
   getDefaultBackupDir,
+  hardenPrivatePath,
   validateBackupDirPath,
 } from './config-store.ts';
 import {
@@ -27,6 +28,7 @@ import {
 import { upsertAgentsMdWslSection } from './prompt-injector.ts';
 import type { WslSandboxSessionManager } from './tools.ts';
 import { renderWslSandboxUiHtml } from './web-ui-entry.ts';
+import { discoverWslDistros, isInsideLxssBasePath, probeWslDistroUser } from './wsl-discovery.ts';
 
 export interface WebApiDeps {
   readonly configStore: ConfigStore;
@@ -343,16 +345,58 @@ export function registerWslSandboxWebApi(ctx: DshCordisContext, deps: WebApiDeps
     });
   });
 
+  add('GET', '/wsl-sandbox/api/distros', (req, res) => {
+    const discovery = discoverWslDistros();
+    const probeDistro = req.query.probeDistro?.trim();
+    const probedUser = probeDistro ? probeWslDistroUser(probeDistro) : null;
+    res.status(200).json({
+      ok: true,
+      ...discovery,
+      probedUser,
+    });
+  });
+
+  add('GET', '/wsl-sandbox/api/processes', async (_req, res) => {
+    try {
+      const info = await deps.sessionManager.callRpc('proc.list', {}, 6_000);
+      res.status(200).json({ ok: true, ...(typeof info === 'object' && info ? info : {}) });
+    } catch {
+      res.status(200).json({ ok: true, active: [], terminals: [] });
+    }
+  });
+
   add('POST', '/wsl-sandbox/api/wsl-config/backup', async (req, res) => {
     const body = (req.body ?? {}) as { backupDir?: string };
     const resolvedBackupDir = resolveEffectiveBackupDir(body.backupDir);
+    if (process.platform === 'win32') {
+      const discovery = discoverWslDistros();
+      const hitDistro = isInsideLxssBasePath(resolvedBackupDir, discovery.distros);
+      if (hitDistro) {
+        failSandbox(
+          'POLICY_BLOCK',
+          `Refusing to use WSL distro '${hitDistro}' VHDX storage directory as backupDir: ${resolvedBackupDir}`,
+        );
+      }
+    }
     if (body.backupDir && body.backupDir.trim() !== '' && body.backupDir.trim() !== deps.configStore.get().backupDir) {
       deps.configStore.updateBasic({ backupDir: resolvedBackupDir });
     }
     const cfg = deps.configStore.get();
     fs.mkdirSync(resolvedBackupDir, { recursive: true, mode: 0o700 });
+    hardenPrivatePath(resolvedBackupDir, 'dir');
 
     const savedFiles: string[] = [];
+    const writeReadOnlyHostBackup = (dest: string, content: string): void => {
+      fs.writeFileSync(dest, content, { mode: 0o400 });
+      hardenPrivatePath(dest, 'readonly-file');
+      savedFiles.push(dest);
+    };
+    const copyReadOnlyHostBackup = (src: string, dest: string): void => {
+      fs.copyFileSync(src, dest);
+      hardenPrivatePath(dest, 'readonly-file');
+      savedFiles.push(dest);
+    };
+
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const wslCfg = path.join(os.homedir(), '.wslconfig');
     const origHostCfg = path.join(resolvedBackupDir, '.wslconfig.orig');
@@ -360,17 +404,14 @@ export function registerWslSandboxWebApi(ctx: DshCordisContext, deps: WebApiDeps
 
     if (fs.existsSync(wslCfg)) {
       if (!fs.existsSync(origHostCfg) && !fs.existsSync(absentHostMarker)) {
-        fs.copyFileSync(wslCfg, origHostCfg);
-        savedFiles.push(origHostCfg);
+        copyReadOnlyHostBackup(wslCfg, origHostCfg);
       }
-      const snap = path.join(resolvedBackupDir, `.wslconfig.${ts}.bak`);
-      fs.copyFileSync(wslCfg, snap);
-      savedFiles.push(snap);
+      copyReadOnlyHostBackup(wslCfg, path.join(resolvedBackupDir, `.wslconfig.${ts}.bak`));
     } else if (!fs.existsSync(origHostCfg) && !fs.existsSync(absentHostMarker)) {
-      fs.writeFileSync(absentHostMarker, `# Host had no %USERPROFILE%\\.wslconfig at initial backup (${ts})\n`, {
-        mode: 0o600,
-      });
-      savedFiles.push(absentHostMarker);
+      writeReadOnlyHostBackup(
+        absentHostMarker,
+        `# Host had no %USERPROFILE%\\.wslconfig at initial backup (${ts})\n# Note: WSL Settings & WSL Manager share %USERPROFILE%\\.wslconfig and /etc/wsl.conf.\n`,
+      );
     }
 
     let wslInternalDir: string | undefined;
@@ -385,32 +426,26 @@ export function registerWslSandboxWebApi(ctx: DshCordisContext, deps: WebApiDeps
       if (typeof wslResult.wslConfContent === 'string') {
         const distroOrig = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig`);
         if (!fs.existsSync(distroOrig)) {
-          fs.writeFileSync(distroOrig, wslResult.wslConfContent, { mode: 0o600 });
-          savedFiles.push(distroOrig);
+          writeReadOnlyHostBackup(distroOrig, wslResult.wslConfContent);
         }
-        const distroSnap = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.${ts}.bak`);
-        fs.writeFileSync(distroSnap, wslResult.wslConfContent, { mode: 0o600 });
-        savedFiles.push(distroSnap);
+        writeReadOnlyHostBackup(path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.${ts}.bak`), wslResult.wslConfContent);
       } else {
         const distroAbsent = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig.absent`);
         if (!fs.existsSync(distroAbsent)) {
-          fs.writeFileSync(distroAbsent, `# ${cfg.distro} had no /etc/wsl.conf at initial backup (${ts})\n`, {
-            mode: 0o600,
-          });
-          savedFiles.push(distroAbsent);
+          writeReadOnlyHostBackup(distroAbsent, `# ${cfg.distro} had no /etc/wsl.conf at initial backup (${ts})\n`);
         }
       }
       if (typeof wslResult.fstabContent === 'string') {
         const fstabOrig = path.join(resolvedBackupDir, `fstab.${cfg.distro}.orig`);
         if (!fs.existsSync(fstabOrig)) {
-          fs.writeFileSync(fstabOrig, wslResult.fstabContent, { mode: 0o600 });
-          savedFiles.push(fstabOrig);
+          writeReadOnlyHostBackup(fstabOrig, wslResult.fstabContent);
         }
       }
       if (typeof wslResult.drvfsMountsContent === 'string') {
-        const mountsSnap = path.join(resolvedBackupDir, `drvfs-mounts.${cfg.distro}.${ts}.txt`);
-        fs.writeFileSync(mountsSnap, wslResult.drvfsMountsContent + '\n', { mode: 0o600 });
-        savedFiles.push(mountsSnap);
+        writeReadOnlyHostBackup(
+          path.join(resolvedBackupDir, `drvfs-mounts.${cfg.distro}.${ts}.txt`),
+          wslResult.drvfsMountsContent + '\n',
+        );
       }
     } catch {
       // Runner offline; host backup still succeeded
@@ -624,13 +659,16 @@ export function registerWslSandboxWebApi(ctx: DshCordisContext, deps: WebApiDeps
     try {
       const report = await deps.sessionManager.callRpc(
         'env.doctor',
-        { upstreamProxy: cfg.upstreamProxy },
+        { upstreamProxy: cfg.upstreamProxy, profile: cfg.environmentProfile },
         25_000,
       );
       res.status(200).json({ ok: true, report });
     } catch {
       const { runDoctor } = await import('../../bootstrap/src/doctor.ts');
-      const report = await runDoctor({ upstreamProxy: cfg.upstreamProxy || undefined });
+      const report = await runDoctor({
+        upstreamProxy: cfg.upstreamProxy || undefined,
+        profile: cfg.environmentProfile,
+      });
       res.status(200).json({ ok: true, report });
     }
   });

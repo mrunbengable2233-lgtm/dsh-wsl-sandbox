@@ -2,14 +2,15 @@
 
 ## 1. Core Strategy (Q18: Laptop-Friendly, Zero Docker / Zero Kernel Build)
 Instead of building multi-GB Docker images or compiling Linux kernels locally on a laptop:
-1. **Distro Acquisition (Official Prebuilt Only)**:
-   - Either reuse an existing WSL 2 Ubuntu 22.04/24.04 or Debian distro, OR install an official clean distro via `wsl.exe --install -d Ubuntu-24.04` (or `wsl.exe --install Ubuntu-24.04 --name dsh-sandbox` on WSL 2.4+ — zero Docker, ~300MB official Microsoft rootfs).
+1. **Distro Acquisition (Official Prebuilt Only, Multi-Distro + WSL Manager Compatible)**:
+   - Dynamically discover existing WSL 2 distros (`wsl.exe -l -v` + read-only `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss\*`), supporting Ubuntu 26.04/24.04/22.04, Debian, Kali, Fedora, Arch, openSUSE, Alpine, AND custom WSL Manager imported/moved VHDX instances (even if hidden from Windows Explorer's left "Linux" sidebar).
+   - If installing fresh, suggest `Ubuntu-26.04` as the current default Ubuntu LTS (`wsl.exe --install -d Ubuntu-26.04`, or any user-selected official distro like `Debian`, `FedoraLinux-42`, `Arch`, `Ubuntu-24.04` — zero Docker, ~300MB official rootfs).
 2. **Agent-Guided Step-by-Step Provisioning (`dsh-wsl-env-setup` Skill + Prompt Injection)**:
    - Ships a dedicated **Setup Skill & Prompt** (`.agents/skills/dsh-wsl-env-setup/SKILL.md` + `packages/bootstrap/prompts/wsl-env-setup.md`).
-   - During initial environment setup, the user invokes the Agent with this Skill/Prompt; the Agent runs **read-only probes first** (`wsl -l -v`, `dsh-wsl-doctor --json`), checks proxy & China mirror preference, asks the user to choose profile (`core` / `standard` / `universal`), and executes **small, idempotent, resumable install steps** (each individually visible and confirmable by the user), finishing with `dsh-wsl-doctor` verification!
-   - **Prebuilt binaries only** (`apt`, official Go tarball, `rustup` binary, `uv` binary, NodeSource/mise prebuilt Node 22) — **NEVER** compiles Python from source via `pyenv` or compiles kernels/LLVM on the user's laptop!
+   - During initial environment setup, the user invokes the Agent with this Skill/Prompt; the Agent runs **read-only probes first** (`wsl -l -v`, `dsh-wsl-doctor --profile <core|standard|universal> --json`), checks proxy & China mirror preference, asks the user to choose profile (`core` / `standard` / `universal`), and executes **small, idempotent, resumable install steps** (each individually visible and confirmable by the user), finishing with `dsh-wsl-doctor --profile <chosen>` verification!
+   - **Prebuilt binaries only** (`apt`/`dnf`/`pacman`/`zypper`/`apk`, official Go tarball, `rustup` binary, `uv` binary, NodeSource/`mise` prebuilt Node 22) — **NEVER** compiles Python from source via `pyenv` or compiles kernels/LLVM on the user's laptop!
 3. **Optional Direct CLI Fallback (`provision-wsl.sh`)**:
-   - The exact same idempotent steps are packaged in `packages/bootstrap/provision-wsl.sh --profile core|standard|universal [--mirror cn] [--proxy http://...] [--step base|cli|python|node|go|rust|extra]` so either the Agent or the user can run single steps or the full profile cleanly.
+   - The exact same idempotent steps are packaged in `packages/bootstrap/provision-wsl.sh --profile core|standard|universal [--mirror cn] [--proxy http://...] [--step base|cli|python|node|go|rust|go-rust|extra]` so either the Agent or the user can run single steps or the full profile cleanly. Selected profile is persisted to `~/.config/dsh-wsl-sandbox/profile.json` (`0600`) and `~/.dsh-wsl-env.sh` (`0600`).
 
 ## 2. Three Selectable Profiles (Aligned with `openai/codex-universal`, Binary-Only Fast Install)
 

@@ -123,9 +123,14 @@ const L3_APPROVAL_PATTERNS: ReadonlyArray<{ re: RegExp; reason: string; physical
   { re: /\b(?:invoke-webrequest|iwr|invoke-restmethod|irm|curl|wget)\b[^\n;]*\|\s*(?:iex|invoke-expression|powershell|pwsh|cmd(?:\.exe)?)\b/i, reason: 'Piping remote download directly into shell/Invoke-Expression requires approval', blockSessionPrefix: true },
   { re: /\bcertutil(?:\.exe)?\b[^\n;|&]*-urlcache\b/i, reason: 'certutil -urlcache download requires approval' },
   { re: /\bbitsadmin(?:\.exe)?\b[^\n;|&]*\/transfer\b/i, reason: 'bitsadmin /transfer download requires approval' },
-  // Physical hardware / USBIP mutating operations (Q13 auto-downgrade to manual allow-once!)
+  // Physical hardware, USBIP, phone Bootloader/ADB/Fastboot/EDL & Windows driver/NIC mutating operations (mandatory manual allow-once!)
   { re: /\busbipd(?:\.exe)?\b[^\n;|&]*\b(?:bind|unbind|attach|detach)\b/i, reason: 'Physical USBIP device bind/attach/detach requires manual single-shot approval', physical: true },
-  { re: /\b(?:esptool(?:\.exe|\.py)?|openocd(?:\.exe)?|avrdude(?:\.exe)?|dfu-util(?:\.exe)?)\b/i, reason: 'Host physical hardware flashing tool requires manual single-shot approval', physical: true },
+  { re: /\bfastboot(?:\.exe)?\b(?![^\n;|&]*\b(?:devices|--version|-V|--help|help)\b)/i, reason: 'Phone Bootloader / fastboot device operation requires manual single-shot approval', physical: true },
+  { re: /\badb(?:\.exe)?\b[^\n;|&]*\b(?:reboot|sideload|install|uninstall|push|root|unroot|remount|disable-verity|enable-verity|shell|backup|restore)\b/i, reason: 'Phone ADB mutating/reboot/flashing operation requires manual single-shot approval', physical: true },
+  { re: /\b(?:esptool(?:\.exe|\.py)?|openocd(?:\.exe)?|avrdude(?:\.exe)?|dfu-util(?:\.exe)?|st-flash(?:\.exe)?|odin\d*(?:\.exe)?|heimdall(?:\.exe)?|qdl(?:\.exe)?|edl(?:\.exe|\.py)?|mtk(?:\.exe|\.py)?|spflashtool(?:\.exe)?|miflash(?:\.exe)?)\b/i, reason: 'Host physical hardware / firmware / Bootloader flashing tool requires manual single-shot approval', physical: true },
+  { re: /\bpnputil(?:\.exe)?\b[^\n;|&]*(?:\/(?:add-driver|delete-driver|install|enable-device|disable-device|restart-device|remove-device|scan-devices)\b|\s-[adi]\b)/i, reason: 'Windows PnP driver installation or device state mutation (pnputil) requires manual single-shot approval', physical: true },
+  { re: /\b(?:devcon(?:\.exe)?\b[^\n;|&]*\b(?:install|update|updateni|remove|enable|disable|restart|dp_add|dp_delete)\b|zadig(?:\.exe)?\b|wdi-simple(?:\.exe)?\b|infdefaultinstall(?:\.exe)?\b)/i, reason: 'Windows USB/WinUSB/device driver mutation tool requires manual single-shot approval', physical: true },
+  { re: /\b(?:enable-pnpdevice|disable-pnpdevice|remove-pnpdevice|enable-netadapter|disable-netadapter|restart-netadapter|set-netadapter[a-z]*|new-netipaddress|set-netipinterface)\b|\bnetsh(?:\.exe)?\b[^\n;|&]*\binterface\s+set\s+interface\b/i, reason: 'Windows PnP device or network adapter (USB NIC) driver/state mutation requires manual single-shot approval', physical: true },
 ];
 
 /**

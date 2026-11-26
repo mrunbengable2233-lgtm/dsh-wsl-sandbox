@@ -28,6 +28,7 @@ export const inject           = [];
                                   
                            
                                   
+                                                                       
                                                          
                                                                        
                                       
@@ -53,6 +54,7 @@ function resolveInitialConfig(options                         )                 
   if (options.enabled !== undefined) mutable.enabled = options.enabled;
   if (options.distro ?? options.defaultDistro) mutable.distro = options.distro ?? options.defaultDistro;
   if (options.workspaceRoot !== undefined) mutable.workspaceRoot = options.workspaceRoot;
+  if (options.environmentProfile !== undefined) mutable.environmentProfile = options.environmentProfile;
   if (options.sandboxMode !== undefined) mutable.sandboxMode = options.sandboxMode;
   if (options.approvalPolicyMode !== undefined) mutable.approvalPolicyMode = options.approvalPolicyMode;
   if (options.approvalTimeoutMs !== undefined) mutable.approvalTimeoutMs = options.approvalTimeoutMs;
@@ -210,6 +212,7 @@ export function apply(
 export * from './cordis-types.js';
 export * from './config-store.js';
 export * from './wsl-transport.js';
+export * from './wsl-discovery.js';
 export * from './approval-bridge.js';
 export * from './prompt-injector.js';
 export * from './pwsh-hook.js';

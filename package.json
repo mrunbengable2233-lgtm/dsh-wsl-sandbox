@@ -61,6 +61,7 @@
     "locale",
     "cordis.patch.yml",
     "scripts/build.mjs",
+    "scripts/stage-wsl-runner.mjs",
     "packages/bootstrap/provision-wsl.sh",
     "packages/bootstrap/templates",
     "packages/bootstrap/prompts",

@@ -49,6 +49,25 @@ export interface RootEntry {
   readonly linkTarget?: string;
 }
 
+export const SENSITIVE_HOME_CONFIG_DIRS = [
+  '.dsh',
+  '.config/dsh-wsl-sandbox',
+  '.ssh',
+  '.gnupg',
+  '.aws',
+  '.kube',
+  '.docker',
+] as const;
+
+export const SENSITIVE_HOME_CREDENTIAL_FILES = [
+  '.git-credentials',
+  '.netrc',
+  '.npmrc',
+  '.pypirc',
+  '.bash_history',
+  '.zsh_history',
+] as const;
+
 export interface BwrapBuildInput {
   readonly argv: readonly string[];
   readonly cwd: string;
@@ -58,6 +77,7 @@ export interface BwrapBuildInput {
   readonly supportsDisableUserns: boolean;
   readonly seccompFd?: number;
   readonly env: Readonly<Record<string, string>>;
+  readonly homeDir?: string;
   readonly rlimits?: Partial<RlimitConfig>;
   readonly usePrlimit?: boolean;
   readonly shares?: readonly AuthorizedShare[];
@@ -83,6 +103,7 @@ export interface BwrapBuildInput {
 export interface BwrapBuildResult {
   readonly bwrapArgs: string[];
   readonly maskedSockets: string[];
+  readonly maskedConfigPaths: string[];
   readonly maskedEnvFiles: string[];
   readonly protectedPaths: string[];
   /** Nonexistent Checklist B paths where bwrap will create a 0-byte mountpoint file; caller cleans up on exit. */
@@ -254,6 +275,36 @@ export function buildBwrapArgs(input: BwrapBuildInput): BwrapBuildResult {
     args.push('--ro-bind', '/dev/null', sock);
   }
 
+  // 4b. Mask private user config & credential directories under $HOME so sandboxed AI has ZERO read/write access
+  //     to plugin config/backups (~/.dsh, ~/.config/dsh-wsl-sandbox) or host credentials (~/.ssh, ~/.aws, etc.).
+  const maskedConfigPaths: string[] = [];
+  const effectiveHome = input.homeDir ?? input.env.HOME;
+  if (effectiveHome && effectiveHome.startsWith('/') && effectiveHome !== '/') {
+    const emptyMask = input.emptyMaskFilePath ?? '/dev/null';
+    for (const relDir of SENSITIVE_HOME_CONFIG_DIRS) {
+      const target = posix.join(effectiveHome, relDir);
+      if (
+        input.workspaceRoot === target ||
+        input.workspaceRoot.startsWith(target + '/') ||
+        (input.cacheDir && (input.cacheDir === target || input.cacheDir.startsWith(target + '/')))
+      ) {
+        continue;
+      }
+      if (lstatKind(target) === 'dir') {
+        args.push('--tmpfs', target);
+        args.push('--remount-ro', target);
+        maskedConfigPaths.push(target);
+      }
+    }
+    for (const relFile of SENSITIVE_HOME_CREDENTIAL_FILES) {
+      const target = posix.join(effectiveHome, relFile);
+      if (lstatKind(target) === 'file') {
+        args.push('--ro-bind', emptyMask, target);
+        maskedConfigPaths.push(target);
+      }
+    }
+  }
+
   // 5. Controlled UDS proxy socket mount inside private `/run/dsh-proxy`
   if (input.networkMode === 'allowlist-proxy' && input.proxySocketHostPath) {
     if (!exists(input.proxySocketHostPath)) {
@@ -385,6 +436,7 @@ export function buildBwrapArgs(input: BwrapBuildInput): BwrapBuildResult {
   return {
     bwrapArgs: args,
     maskedSockets,
+    maskedConfigPaths,
     maskedEnvFiles,
     protectedPaths,
     createdPlaceholders,

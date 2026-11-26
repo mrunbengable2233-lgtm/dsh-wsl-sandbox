@@ -131,6 +131,7 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
     case 'ping':
       return {
         ok: true,
+        pid: process.pid,
         runnerId,
         uptimeMs: Date.now() - startedAt,
         activeProcs: procManager.getActiveCount(),
@@ -192,25 +193,61 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       return fsService.move(p as unknown as { binding: SessionBinding; from: string; to: string });
 
     case 'proc.exec':
-      return procManager.exec(withManagedProxy(p as unknown as ProcExecParams));
+      return procManager.exec(withManagedProxy({ ...(p as unknown as ProcExecParams), ownerRunnerId: runnerId }));
 
     case 'proc.kill':
       return { killed: await procManager.kill(String(p.execId ?? '')) };
 
+    case 'proc.list':
+      return {
+        runnerId,
+        active: procManager.listActive(typeof p.sessionId === 'string' ? p.sessionId : undefined),
+        terminals: termManager.listSessions(typeof p.sessionId === 'string' ? p.sessionId : undefined),
+      };
+
     case 'term.exec': {
       const tp = p as unknown as TerminalExecParams;
-      return termManager.exec({ ...withManagedProxy(tp), terminalId: tp.terminalId });
+      return termManager.exec({ ...withManagedProxy({ ...tp, ownerRunnerId: runnerId }), terminalId: tp.terminalId });
     }
 
     case 'term.reset':
-      return { reset: termManager.reset(String(p.terminalId ?? '')) };
+      return {
+        reset: await termManager.reset(
+          String(p.terminalId ?? ''),
+          typeof p.sessionId === 'string' ? p.sessionId : undefined,
+        ),
+      };
+
+    case 'term.kill': {
+      const sid = String(p.sessionId ?? '');
+      const tid = String(p.terminalId ?? '');
+      if (!sid || !tid) return { killedCount: 0 };
+      const killedCount = await procManager.killTerminal(sid, tid);
+      return { killedCount };
+    }
 
     case 'invalidate': {
       const gen = Number(p.generation ?? Number.MAX_SAFE_INTEGER);
-      termManager.clearAll();
-      managedProxy?.clearSessionAllowedDomains();
-      const killedCount = await procManager.invalidateGeneration(gen);
-      return { killedCount };
+      const sessionId = typeof p.sessionId === 'string' && p.sessionId ? p.sessionId : undefined;
+      const terminalId = typeof p.terminalId === 'string' && p.terminalId ? p.terminalId : undefined;
+      if (sessionId) {
+        termManager.clearSession(sessionId, terminalId);
+      } else if (!terminalId) {
+        termManager.clearAll();
+      }
+      if (!terminalId) {
+        managedProxy?.clearSessionAllowedDomains();
+      }
+      const killedCount = await procManager.invalidateGeneration(gen, { sessionId, terminalId });
+      return { killedCount, scopedSessionId: sessionId ?? null, scopedTerminalId: terminalId ?? null };
+    }
+
+    case 'shutdown': {
+      // Respond cleanly first so host transport knows graceful cleanup completed, then exit
+      setImmediate(() => {
+        void shutdown();
+      });
+      return { ok: true, runnerId, shuttingDown: true };
     }
 
     case 'env.doctor': {
@@ -218,6 +255,7 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       return runDoctor({
         upstreamProxy: typeof p.upstreamProxy === 'string' && p.upstreamProxy ? p.upstreamProxy : undefined,
         strictWsl2: Boolean(p.strictWsl2),
+        profile: typeof p.profile === 'string' ? (p.profile as 'core' | 'standard' | 'universal') : undefined,
       });
     }
 
@@ -246,21 +284,23 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
       let fstabContent: string | null = null;
       let drvfsMountsContent: string | null = null;
 
+      const writeReadOnlyBackup = (dest: string, data: string): void => {
+        fs.writeFileSync(dest, data, { mode: 0o400 });
+        try { fs.chmodSync(dest, 0o400); } catch { /* best effort */ }
+        savedFiles.push(dest);
+      };
+
       if (fs.existsSync('/etc/wsl.conf')) {
         wslConfContent = fs.readFileSync('/etc/wsl.conf', 'utf8');
         const origPath = path.join(backupDir, 'wsl.conf.orig');
         if (!fs.existsSync(origPath) && !fs.existsSync(`${origPath}.absent`)) {
-          fs.writeFileSync(origPath, wslConfContent, { mode: 0o600 });
-          savedFiles.push(origPath);
+          writeReadOnlyBackup(origPath, wslConfContent);
         }
-        const snapPath = path.join(backupDir, `wsl.conf.${ts}.bak`);
-        fs.writeFileSync(snapPath, wslConfContent, { mode: 0o600 });
-        savedFiles.push(snapPath);
+        writeReadOnlyBackup(path.join(backupDir, `wsl.conf.${ts}.bak`), wslConfContent);
       } else {
         const absentPath = path.join(backupDir, 'wsl.conf.orig.absent');
         if (!fs.existsSync(absentPath) && !fs.existsSync(path.join(backupDir, 'wsl.conf.orig'))) {
-          fs.writeFileSync(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`, { mode: 0o600 });
-          savedFiles.push(absentPath);
+          writeReadOnlyBackup(absentPath, `# /etc/wsl.conf absent at initial snapshot (${ts})\n`);
         }
       }
 
@@ -268,12 +308,9 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
         fstabContent = fs.readFileSync('/etc/fstab', 'utf8');
         const origFstab = path.join(backupDir, 'fstab.orig');
         if (!fs.existsSync(origFstab)) {
-          fs.writeFileSync(origFstab, fstabContent, { mode: 0o600 });
-          savedFiles.push(origFstab);
+          writeReadOnlyBackup(origFstab, fstabContent);
         }
-        const snapFstab = path.join(backupDir, `fstab.${ts}.bak`);
-        fs.writeFileSync(snapFstab, fstabContent, { mode: 0o600 });
-        savedFiles.push(snapFstab);
+        writeReadOnlyBackup(path.join(backupDir, `fstab.${ts}.bak`), fstabContent);
       }
 
       if (fs.existsSync('/proc/mounts')) {
@@ -283,9 +320,7 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
             .split('\n')
             .filter((line) => /drvfs|9p|\/mnt\//.test(line))
             .join('\n');
-          const snapMounts = path.join(backupDir, `drvfs-mounts.${ts}.txt`);
-          fs.writeFileSync(snapMounts, drvfsMountsContent + '\n', { mode: 0o600 });
-          savedFiles.push(snapMounts);
+          writeReadOnlyBackup(path.join(backupDir, `drvfs-mounts.${ts}.txt`), drvfsMountsContent + '\n');
         } catch {
           // ignore unreadable /proc/mounts
         }
@@ -328,20 +363,48 @@ async function handleRequest(req: RpcRequest): Promise<unknown> {
   }
 }
 
+let shuttingDown = false;
+
+function cleanupTempArtifactsSync(): void {
+  procManager.cleanupSync();
+  try {
+    fs.rmSync(proxyDir, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+}
+
 async function shutdown(): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  // Hard exit watchdog guarantees the WSL runner can NEVER hang on exit/disable
+  const watchdog = setTimeout(() => {
+    cleanupTempArtifactsSync();
+    process.exit(0);
+  }, 3000);
+  watchdog.unref();
+
   for (const [, cb] of pendingCallbacks) {
     clearTimeout(cb.timer);
     cb.resolve(false);
   }
   pendingCallbacks.clear();
+
   if (managedProxy) {
-    await managedProxy.stop().catch(() => {});
+    const p = managedProxy;
     managedProxy = undefined;
+    await p.stop().catch(() => {});
   }
-  await procManager.disposeAll();
-  fs.rmSync(proxyDir, { recursive: true, force: true });
+  await procManager.disposeAll().catch(() => {});
+  cleanupTempArtifactsSync();
+  clearTimeout(watchdog);
   process.exit(0);
 }
+
+process.on('exit', () => {
+  cleanupTempArtifactsSync();
+});
 
 if (leaseMs > 0) {
   const leaseTimer = setInterval(() => {
@@ -417,6 +480,12 @@ rl.on('line', (line) => {
 rl.on('close', () => {
   void shutdown();
 });
-
+process.stdin.on('end', () => {
+  void shutdown();
+});
+process.stdin.on('close', () => {
+  void shutdown();
+});
+process.on('SIGHUP', () => void shutdown());
 process.on('SIGTERM', () => void shutdown());
 process.on('SIGINT', () => void shutdown());

@@ -292,7 +292,7 @@ describe('plugin-coexistence — dsh-wsl-sandbox + dsh-purge full Cordis coexist
       (err: unknown) => err instanceof SandboxError && err.code === 'POLICY_BLOCK',
     );
 
-    const b64 = Buffer.from('wsl.exe --unregister Ubuntu-24.04', 'utf16le').toString('base64');
+    const b64 = Buffer.from('wsl.exe --unregister Ubuntu-26.04', 'utf16le').toString('base64');
     await assert.rejects(
       () => host.executeTool('pwsh', { command: `powershell -EncodedCommand ${b64}` }),
       (err: unknown) => err instanceof SandboxError && err.code === 'POLICY_BLOCK',

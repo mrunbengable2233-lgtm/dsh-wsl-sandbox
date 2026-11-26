@@ -82,13 +82,17 @@ const KERNEL_PRIV_TOOLS = new Set([
 ]);
 
 const BLOCK_DEV_RE = /^\/dev\/(sd|hd|nvme|mmcblk|vd|xvd|disk|mapper|dm-|md|sr|loop|zram|ram)/;
-const PHYSICAL_DEV_RE = /^\/dev\/(ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/|hidraw\d+|spidev|i2c-)/;
+const PHYSICAL_DEV_RE = /^\/dev\/(ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/|hidraw\d+|cdc-wdm\d+|video\d+|spidev|i2c-)/;
 
 const PHYSICAL_FLASH_TOOLS = new Set([
   'esptool', 'esptool.py', 'openocd', 'avrdude', 'st-flash', 'st-info',
   'dfu-util', 'picotool', 'bossac', 'nrfjprog', 'probe-rs', 'pyocd',
-  'minicom', 'picocom', 'tio', 'usbip', 'usbipd',
+  'minicom', 'picocom', 'tio', 'usbip', 'usbipd', 'usbreset',
+  'heimdall', 'qdl', 'edl', 'mtk', 'rkdeveloptool', 'sunxi-fel',
 ]);
+
+const ADB_READONLY_SUBCMDS = new Set(['devices', 'version', '--version', 'help', 'get-state', 'get-serialno', 'get-devpath']);
+const FASTBOOT_READONLY_SUBCMDS = new Set(['devices', '--version', '-V', 'help', '--help', 'getvar']);
 
 const CWD_CHANGING_CMDS = new Set(['cd', 'chdir', 'popd', 'pushd', 'push-location', 'set-location']);
 
@@ -655,18 +659,44 @@ export function evaluateBashCommand(command        , ctx                  )     
       }
     }
 
-    // Check physical hardware tools (Q13 auto-downgrade)
+    // Check physical hardware tools (mandatory manual single-shot approval)
     if (PHYSICAL_FLASH_TOOLS.has(cmd)) {
       touchesPhysicalDevice = true;
       escalate('ask', 'high', `Physical hardware tool detected (${cmd}); requires manual single-shot approval`);
     }
+    if (cmd === 'fastboot') {
+      const sub = args.find((a) => !a.startsWith('-'))?.toLowerCase() ?? '';
+      if (!sub || !FASTBOOT_READONLY_SUBCMDS.has(sub)) {
+        touchesPhysicalDevice = true;
+        escalate('ask', 'high', `Phone Bootloader / fastboot operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`);
+      }
+    }
+    if (cmd === 'adb') {
+      // Skip common adb global flags (-s <serial>, -d, -e, -H <host>, -P <port>)
+      let idx = 0;
+      while (idx < args.length) {
+        const a = args[idx] ;
+        if (a === '-s' || a === '-t' || a === '-H' || a === '-P' || a === '-L') {
+          idx += 2;
+        } else if (a.startsWith('-')) {
+          idx += 1;
+        } else {
+          break;
+        }
+      }
+      const sub = (args[idx] ?? '').toLowerCase();
+      if (sub && !ADB_READONLY_SUBCMDS.has(sub)) {
+        touchesPhysicalDevice = true;
+        escalate('ask', 'high', `Phone ADB mutating/device operation (${cmd} ${sub}) requires manual single-shot approval`);
+      }
+    }
     if (cmd === 'idf.py' && args.some((a) => /^(flash|monitor|erase-flash|efuse|app-flash)$/i.test(a))) {
       touchesPhysicalDevice = true;
-      escalate('ask', 'high', `ESP-IDF physical device operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`);
+      escalate('ask', 'high', `MCU firmware flashing operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`);
     }
     if ((cmd === 'pio' || cmd === 'platformio') && args.some((a) => a === '--target' || a === 'upload' || a === 'monitor')) {
       touchesPhysicalDevice = true;
-      escalate('ask', 'high', `PlatformIO physical device operation requires manual single-shot approval`);
+      escalate('ask', 'high', `Hardware upload/monitor operation requires manual single-shot approval`);
     }
     for (const a of args) {
       if (PHYSICAL_DEV_RE.test(a)) {

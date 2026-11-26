@@ -28,6 +28,7 @@ export interface WslSandboxPluginOptions {
   readonly defaultDistro?: string;
   readonly distro?: string;
   readonly workspaceRoot?: string;
+  readonly environmentProfile?: WslSandboxConfig['environmentProfile'];
   readonly sandboxMode?: WslSandboxConfig['sandboxMode'];
   readonly approvalPolicyMode?: WslSandboxConfig['approvalPolicyMode'];
   readonly approvalTimeoutMs?: number;
@@ -53,6 +54,7 @@ function resolveInitialConfig(options: WslSandboxPluginOptions): Partial<WslSand
   if (options.enabled !== undefined) mutable.enabled = options.enabled;
   if (options.distro ?? options.defaultDistro) mutable.distro = options.distro ?? options.defaultDistro;
   if (options.workspaceRoot !== undefined) mutable.workspaceRoot = options.workspaceRoot;
+  if (options.environmentProfile !== undefined) mutable.environmentProfile = options.environmentProfile;
   if (options.sandboxMode !== undefined) mutable.sandboxMode = options.sandboxMode;
   if (options.approvalPolicyMode !== undefined) mutable.approvalPolicyMode = options.approvalPolicyMode;
   if (options.approvalTimeoutMs !== undefined) mutable.approvalTimeoutMs = options.approvalTimeoutMs;
@@ -210,6 +212,7 @@ export function apply(
 export * from './cordis-types.ts';
 export * from './config-store.ts';
 export * from './wsl-transport.ts';
+export * from './wsl-discovery.ts';
 export * from './approval-bridge.ts';
 export * from './prompt-injector.ts';
 export * from './pwsh-hook.ts';

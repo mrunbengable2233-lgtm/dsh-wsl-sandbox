@@ -137,7 +137,7 @@ export class WslSandboxSessionManager {
         this.transport = undefined;
         await old.dispose().catch(() => {});
       } else {
-        await this.transport.invalidate(this.generation);
+        await this.transport.invalidate(this.generation, { sessionId: this.sessionId });
       }
     }
   }
@@ -248,15 +248,27 @@ export class WslSandboxSessionManager {
     this.proxyConfiguredRevision = cfg.revision;
   }
 
-  async invalidateNow(reason = 'Manual invalidation')                  {
+  async invalidateNow(reason = 'Manual invalidation', terminalId         )                  {
     this.generation += 1;
-    this.binding = undefined;
-    this.proxyConfiguredRevision = undefined;
-    this.approvalBridge.invalidate(reason);
+    if (!terminalId) {
+      this.binding = undefined;
+      this.proxyConfiguredRevision = undefined;
+      this.approvalBridge.invalidate(reason);
+    }
     if (this.transport) {
-      return this.transport.invalidate(this.generation);
+      return this.transport.invalidate(this.generation, { sessionId: this.sessionId, terminalId });
     }
     return 0;
+  }
+
+  async killExec(execId        )                   {
+    if (!this.transport?.isRunning()) return false;
+    try {
+      const r = await this.transport.call                     ('proc.kill', { execId }, 5_000);
+      return Boolean(r.killed);
+    } catch {
+      return false;
+    }
   }
 
   async callRpc             (method        , params                         , timeoutMs         )             {
@@ -407,7 +419,9 @@ export function createWslSandboxTools(
       ticket.consume();
     }
 
+    const execId = randomUUID();
     const execPayload = {
+      execId,
       binding,
       command: params.command,
       cwd,
@@ -420,26 +434,34 @@ export function createWslSandboxTools(
       mirrorCn: cfg.mirrorCn,
     };
 
-    if (params.terminalId) {
-      return sessionManager.callRpc                    (
-        'term.exec',
-        { ...execPayload, terminalId: params.terminalId },
+    const onAbort = ()       => {
+      void sessionManager.killExec(execId);
+    };
+    meta?.signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      if (params.terminalId) {
+        return await sessionManager.callRpc                    (
+          'term.exec',
+          { ...execPayload, terminalId: params.terminalId },
+          (params.timeoutMs ?? 120_000) + 15_000,
+        );
+      }
+
+      return await sessionManager.callRpc                (
+        'proc.exec',
+        execPayload,
         (params.timeoutMs ?? 120_000) + 15_000,
       );
+    } finally {
+      meta?.signal?.removeEventListener('abort', onAbort);
     }
-
-    return sessionManager.callRpc                (
-      'proc.exec',
-      execPayload,
-      (params.timeoutMs ?? 120_000) + 15_000,
-    );
   }
 
   return [
     {
       name: 'wsl_bash',
       description:
-        'Execute a pure POSIX Bash command inside the isolated WSL 2 Linux guest sandbox (bwrap + seccomp-bpf + prlimit + UDS allowlist proxy). Prefer this over Windows pwsh for directory creation, file moves, coding, git, builds, tests, ESP32 compilation, and Linux/Kali tools. Note: cwd is an isolated Linux guest path (separate from Windows host NTFS; if declaring to cc-safety-net, pass --no-cwd-arg).',
+        'Execute a pure POSIX Bash command inside the isolated WSL 2 Linux guest sandbox (bwrap + seccomp-bpf + prlimit + UDS allowlist proxy). Prefer this over Windows pwsh for directory creation, file moves, coding, git, builds, tests, cross-compilation, and Linux CLI tools. Note: cwd is an isolated Linux guest path (separate from Windows host NTFS; if declaring to cc-safety-net, pass --no-cwd-arg).',
       parameters: {
         type: 'object',
         required: ['command'],

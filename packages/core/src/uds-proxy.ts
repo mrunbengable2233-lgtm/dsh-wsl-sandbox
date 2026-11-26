@@ -532,6 +532,15 @@ export class UdsAllowlistProxy {
     return { socket, via: 'direct' };
   }
 
+  private readonly activeSockets = new Set<net.Socket>();
+
+  private trackSocket(sock: net.Socket): void {
+    this.activeSockets.add(sock);
+    sock.once('close', () => {
+      this.activeSockets.delete(sock);
+    });
+  }
+
   async start(): Promise<void> {
     if (this.server) return;
     const dir = path.dirname(this.socketPath);
@@ -590,6 +599,7 @@ export class UdsAllowlistProxy {
         }
 
         const { socket, via } = await this.openTargetSocket(host, port, Boolean(verdict.isLocalLab));
+        this.trackSocket(socket);
         this.onAllowed?.({ host, port, via });
 
         const reqHeaders: Record<string, string | string[] | undefined> = { ...req.headers };
@@ -621,7 +631,12 @@ export class UdsAllowlistProxy {
       }
     });
 
+    server.on('connection', (sock) => {
+      this.trackSocket(sock);
+    });
+
     server.on('connect', async (req, clientSocket, head) => {
+      this.trackSocket(clientSocket);
       try {
         const authority = req.url ?? '';
         const lastColon = authority.lastIndexOf(':');
@@ -639,6 +654,7 @@ export class UdsAllowlistProxy {
         }
 
         const { socket: upstream, via } = await this.openTargetSocket(host, port, Boolean(verdict.isLocalLab));
+        this.trackSocket(upstream);
         this.onAllowed?.({ host, port, via });
 
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
@@ -650,6 +666,8 @@ export class UdsAllowlistProxy {
 
         upstream.on('error', () => clientSocket.destroy());
         clientSocket.on('error', () => upstream.destroy());
+        upstream.on('close', () => clientSocket.destroy());
+        clientSocket.on('close', () => upstream.destroy());
       } catch (err) {
         clientSocket.write(
           `HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n${err instanceof Error ? err.message : String(err)}\r\n`,
@@ -673,11 +691,39 @@ export class UdsAllowlistProxy {
     this.server = server;
   }
 
+  getActiveSocketCount(): number {
+    return this.activeSockets.size;
+  }
+
   async stop(): Promise<void> {
     const srv = this.server;
     this.server = undefined;
+
+    for (const sock of this.activeSockets) {
+      try {
+        sock.destroy();
+      } catch {
+        // ignore
+      }
+    }
+    this.activeSockets.clear();
+
     if (srv) {
-      await new Promise<void>((resolve) => srv.close(() => resolve()));
+      try {
+        if (typeof srv.closeAllConnections === 'function') {
+          srv.closeAllConnections();
+        }
+      } catch {
+        // ignore
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 500);
+        timer.unref();
+        srv.close(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
     }
     fs.rmSync(this.socketPath, { force: true });
   }

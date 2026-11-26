@@ -349,4 +349,178 @@ describe('linux-sandbox — REAL bwrap + seccomp-bpf + prlimit + UdsAllowlistPro
     const outcome = await longCall;
     assert.equal(outcome.aborted, true);
   });
+
+  it('Negative (Real bwrap Config Masking): hides ~/.config/dsh-wsl-sandbox read/write and blocks outsideFile access', async () => {
+    const cfgDir = path.join(os.homedir(), '.config', 'dsh-wsl-sandbox');
+    const createdCfgDir = !fs.existsSync(cfgDir);
+    const probeFile = path.join(cfgDir, '__dsh_mask_probe.txt');
+    fs.mkdirSync(cfgDir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(cfgDir, 0o700);
+    fs.writeFileSync(probeFile, 'TOP_SECRET_CONFIG_PAYLOAD', { mode: 0o600 });
+
+    try {
+      const r = await transport.call<ProcExecResult>('proc.exec', {
+        binding,
+        cwd: workspaceRoot,
+        mode: 'workspace-write',
+        networkMode: 'offline',
+        command: [
+          `ENTRIES=$(ls -A '${cfgDir}' 2>/dev/null || true)`,
+          `echo "ENTRIES=[$ENTRIES]"`,
+          `if touch '${cfgDir}/evil' 2>/dev/null; then echo "CFG_WRITABLE"; else echo "CFG_RO_BLOCKED"; fi`,
+          `if test -e '${outsideFile}'; then echo "OUTSIDE_VISIBLE"; else echo "OUTSIDE_HIDDEN"; fi`,
+        ].join('\n'),
+      });
+      assert.equal(r.exitCode, 0, `stderr: ${r.stderr.text}`);
+      assert.match(r.stdout.text, /ENTRIES=\[\]/, 'Private config directory MUST appear completely empty inside bwrap');
+      assert.doesNotMatch(r.stdout.text, /__dsh_mask_probe/);
+      assert.match(r.stdout.text, /CFG_RO_BLOCKED/, 'Private config directory MUST be read-only inside bwrap');
+      assert.match(r.stdout.text, /OUTSIDE_HIDDEN/, 'Outside /tmp host file MUST be invisible inside sandbox private /tmp');
+    } finally {
+      fs.rmSync(probeFile, { force: true });
+      if (createdCfgDir) {
+        fs.rmSync(cfgDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it('Isolation (Multi-Session & Multi-Terminal): killing/resetting Session A NEVER kills Session B or clobbers its terminal CWD', async () => {
+    const subA = path.join(workspaceRoot, 'sessA-dir');
+    const subB = path.join(workspaceRoot, 'sessB-dir');
+    fs.mkdirSync(subA, { recursive: true });
+    fs.mkdirSync(subB, { recursive: true });
+
+    const bindingA: SessionBinding = { ...binding, sessionId: 'sess-A', generation: 1 };
+    const bindingB: SessionBinding = { ...binding, sessionId: 'sess-B', generation: 1 };
+
+    // Both sessions share the same terminalId 't1' — their CWDs MUST remain independent!
+    const initA = await transport.call<TerminalExecResult>('term.exec', {
+      binding: bindingA,
+      terminalId: 't1',
+      cwd: workspaceRoot,
+      mode: 'workspace-write',
+      networkMode: 'offline',
+      command: 'cd sessA-dir && pwd',
+    });
+    const initB = await transport.call<TerminalExecResult>('term.exec', {
+      binding: bindingB,
+      terminalId: 't1',
+      cwd: workspaceRoot,
+      mode: 'workspace-write',
+      networkMode: 'offline',
+      command: 'cd sessB-dir && pwd',
+    });
+    assert.equal(initA.cwd, subA);
+    assert.equal(initB.cwd, subB);
+
+    // Launch two concurrent long-running commands across Session A and Session B
+    const procA = transport.call<ProcExecResult>('proc.exec', {
+      binding: bindingA,
+      terminalId: 't1',
+      cwd: subA,
+      mode: 'workspace-write',
+      networkMode: 'offline',
+      timeoutMs: 30_000,
+      command: 'sleep 30',
+    });
+    const procB = transport.call<ProcExecResult>('proc.exec', {
+      binding: bindingB,
+      terminalId: 't1',
+      cwd: subB,
+      mode: 'workspace-write',
+      networkMode: 'offline',
+      timeoutMs: 30_000,
+      command: 'sleep 30',
+    });
+
+    await new Promise((r) => setTimeout(r, 250));
+
+    // Invalidate & reset ONLY Session A
+    const killedA = await transport.invalidate(bindingA.generation + 1, { sessionId: 'sess-A' });
+    assert.equal(killedA, 1, 'Expected ONLY Session A process to be killed');
+    await transport.call('term.reset', { sessionId: 'sess-A', terminalId: 't1' });
+
+    const outcomeA = await procA;
+    assert.equal(outcomeA.aborted, true);
+
+    // Session B MUST still be alive!
+    const listB = await transport.call<{ active: Array<{ sessionId: string }> }>('proc.list', { sessionId: 'sess-B' });
+    assert.equal(listB.active.length, 1, 'Session B process MUST remain alive when Session A is invalidated');
+
+    // Session B terminal 't1' MUST still remember subB even after Session A reset 't1'!
+    const pwdB = await transport.call<TerminalExecResult>('term.exec', {
+      binding: bindingB,
+      terminalId: 't1',
+      cwd: workspaceRoot,
+      mode: 'workspace-write',
+      networkMode: 'offline',
+      command: 'pwd',
+    });
+    assert.equal(pwdB.stdout.text.trim(), subB, 'Session B terminal CWD must be untouched by Session A reset');
+
+    // Now cleanly terminate Session B
+    const killedB = await transport.invalidate(bindingB.generation + 1, { sessionId: 'sess-B' });
+    assert.equal(killedB, 1);
+    const outcomeB = await procB;
+    assert.equal(outcomeB.aborted, true);
+  });
+
+  it('Lifecycle (Zero Leaks): WslTransport.dispose() kills wsl-runner cleanly, removes temp proxy dir, and doctor grades profiles accurately', async () => {
+    const dedicated = new WslTransport({
+      mode: 'local-linux',
+      distro: 'linux-devbox',
+      runnerPath: RUNNER_PATH,
+    });
+
+    try {
+      const ping = await dedicated.call<{ pid: number; runnerId: string }>('ping');
+      assert.ok(Number.isInteger(ping.pid) && ping.pid > 1);
+
+      const proxyCfg = await dedicated.call<{ enabled: boolean; socketPath?: string }>('proxy.configure', {
+        enabled: true,
+        enableInteractiveApproval: false,
+      });
+      assert.equal(proxyCfg.enabled, true);
+      assert.ok(proxyCfg.socketPath);
+      const proxyDir = path.dirname(proxyCfg.socketPath);
+      assert.equal(fs.existsSync(proxyDir), true);
+
+      // Run a command over the UDS loopback bridge (spawns socat/node bridge inside bwrap) to ensure zero leaked bridge
+      const bridgeRun = await dedicated.call<ProcExecResult>('proc.exec', {
+        binding,
+        cwd: workspaceRoot,
+        mode: 'workspace-write',
+        networkMode: 'allowlist-proxy',
+        command: 'echo "BRIDGE_RAN_OK"',
+      });
+      assert.equal(bridgeRun.exitCode, 0, bridgeRun.stderr.text);
+
+      // Graceful dispose -> must terminate runner PID and remove proxyDir!
+      await dedicated.dispose();
+      await new Promise((r) => setTimeout(r, 150));
+
+      let alive = true;
+      try {
+        process.kill(ping.pid, 0);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ESRCH') alive = false;
+      }
+      assert.equal(alive, false, `wsl-runner PID ${ping.pid} must be completely dead after dispose()`);
+      assert.equal(fs.existsSync(proxyDir), false, `Proxy temp directory ${proxyDir} must be deleted after dispose()`);
+
+      // Verify real dsh-wsl-doctor grades selectedProfile accurately
+      const { runDoctor } = await import('../../packages/bootstrap/src/doctor.ts');
+      const coreDoc = await runDoctor({ profile: 'core' });
+      const uniDoc = await runDoctor({ profile: 'universal' });
+      assert.equal(coreDoc.selectedProfile, 'core');
+      assert.equal(uniDoc.selectedProfile, 'universal');
+      assert.equal(coreDoc.sandbox.escapeMaskSelfTest, true);
+      assert.equal(coreDoc.sandbox.configMaskSelfTest, true);
+      assert.equal(coreDoc.sandbox.seccompIoUringBlocked, true);
+      assert.equal(coreDoc.sandbox.seccompAfVsockBlocked, true);
+      assert.ok(coreDoc.hardware.driverNote.includes('USBIP'));
+    } finally {
+      await dedicated.dispose();
+    }
+  });
 });

@@ -1,3 +1,5 @@
+import { spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +8,7 @@ import {
   type AuthorizedDeviceNode,
   type AuthorizedShare,
   type CacheMode,
+  type EnvironmentProfile,
   failSandbox,
   isValidIdentifier,
   type NetworkMode,
@@ -37,6 +40,8 @@ export interface WslSandboxConfig {
   readonly username?: string;
   readonly workspaceRoot: string;
   readonly runnerPath: string;
+  /** Selected Codex-aligned binary toolchain profile (`core` / `standard` / `universal`). */
+  readonly environmentProfile: EnvironmentProfile;
   readonly sandboxMode: SandboxMode;
   readonly approvalPolicyMode: ApprovalPolicyMode;
   readonly networkMode: NetworkMode;
@@ -62,6 +67,7 @@ export type BasicConfigPatch = Partial<
     | 'username'
     | 'workspaceRoot'
     | 'runnerPath'
+    | 'environmentProfile'
     | 'sandboxMode'
     | 'approvalPolicyMode'
     | 'networkMode'
@@ -79,21 +85,64 @@ export type BasicConfigPatch = Partial<
 export type ConfigChangeListener = (next: WslSandboxConfig, prev: WslSandboxConfig) => void;
 
 const VALID_TRANSPORT_MODES = new Set<WslSandboxConfig['transportMode']>(['wsl', 'local-linux']);
+const VALID_ENV_PROFILES = new Set<EnvironmentProfile>(['core', 'standard', 'universal']);
 const VALID_SANDBOX_MODES = new Set<SandboxMode>(['read-only', 'workspace-write']);
 const VALID_APPROVAL_MODES = new Set<ApprovalPolicyMode>(['balanced', 'strict', 'trust-workspace']);
 const VALID_NETWORK_MODES = new Set<NetworkMode>(['allowlist-proxy', 'offline']);
 const VALID_CACHE_MODES = new Set<CacheMode>(['workspace-persistent', 'ephemeral-tmp']);
 
-export function getDefaultConfigPath(dshHome?: string): string {
+export function getDefaultConfigDir(dshHome?: string): string {
   const base = dshHome ?? process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
-  return path.join(base, 'dsh-wsl-sandbox', 'config.json');
+  return path.join(base, 'dsh-wsl-sandbox');
+}
+
+export function getDefaultConfigPath(dshHome?: string): string {
+  return path.join(getDefaultConfigDir(dshHome), 'config.json');
 }
 
 export function getDefaultBackupDir(dshHome?: string): string {
-  const base = dshHome ?? process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
-  return path.join(base, 'dsh-wsl-sandbox', 'backups');
+  return path.join(getDefaultConfigDir(dshHome), 'backups');
 }
 
+/**
+ * Restricts a plugin-owned private directory or file to owner-only access.
+ * On POSIX uses `chmod 0700` / `0600`; on Windows NTFS removes inherited broad `Users`/`Everyone`
+ * read/write ACLs via `icacls /inheritance:r` (NEVER called on `%USERPROFILE%` or WSL Settings paths).
+ */
+export function hardenPrivatePath(targetPath: string, kind: 'dir' | 'file' | 'readonly-file'): void {
+  if (process.platform === 'win32') {
+    const user = process.env.USERNAME;
+    if (user && /^[A-Za-z0-9_.\- ]+$/.test(user)) {
+      const perm = kind === 'dir' ? '(OI)(CI)F' : kind === 'readonly-file' ? 'R' : 'F';
+      const args = [
+        targetPath,
+        '/inheritance:r',
+        '/grant:r',
+        `*S-1-5-18:${kind === 'dir' ? '(OI)(CI)F' : 'F'}`,
+        `${user}:${perm}`,
+      ];
+      spawnSync('icacls.exe', args, { stdio: 'ignore', shell: false, windowsHide: true, timeout: 4000 });
+    }
+    if (kind === 'readonly-file') {
+      spawnSync('attrib.exe', ['+R', targetPath], { stdio: 'ignore', shell: false, windowsHide: true, timeout: 3000 });
+    }
+    return;
+  }
+
+  try {
+    const mode = kind === 'dir' ? 0o700 : kind === 'readonly-file' ? 0o400 : 0o600;
+    fs.chmodSync(targetPath, mode);
+  } catch {
+    // Best-effort on virtual filesystems
+  }
+}
+
+/**
+ * Validates a user-selected backup directory.
+ * Explicitly blocks drive roots, OS system directories, `%USERPROFILE%` / `$HOME` roots
+ * (where WSL Settings & WSL Manager share `.wslconfig`), live plugin config directories,
+ * and Windows WSL VHDX storage paths (`AppData\Local\Packages`, `AppData\Local\wsl`).
+ */
 export function validateBackupDirPath(rawDir: string | undefined): string | undefined {
   if (rawDir === undefined) return undefined;
   let trimmed = rawDir.trim();
@@ -107,21 +156,75 @@ export function validateBackupDirPath(rawDir: string | undefined): string | unde
   if (trimmed.includes('\0')) {
     failSandbox('POLICY_BLOCK', 'Invalid backupDir containing NUL byte');
   }
-  if (/^[A-Za-z]:\\?$/.test(trimmed) || trimmed === '/' || /^([A-Za-z]:\\Windows(\\|$)|\/(etc|proc|sys|dev|boot)(\/|$))/i.test(trimmed)) {
-    failSandbox('POLICY_BLOCK', `Refusing to use drive root or OS system directory as backupDir: ${trimmed}`);
+
+  const slashNorm = trimmed.replace(/\\/g, '/').replace(/\/+$/, '');
+  const lower = slashNorm.toLowerCase();
+
+  // Reject drive roots, OS system directories, Windows user profile roots, and WSL VHDX folders
+  if (
+    /^[a-z]:?$/.test(lower) ||
+    slashNorm === '' ||
+    slashNorm === '/' ||
+    /^[a-z]:\/(windows|program files|program files \(x86\)|programdata)(\/|$)/i.test(slashNorm) ||
+    /^[a-z]:\/users\/[^/]+$/i.test(slashNorm) ||
+    /^[a-z]:\/users\/[^/]+\/appdata\/local\/(packages|wsl)(\/|$)/i.test(slashNorm) ||
+    /^\/(etc|proc|sys|dev|boot|bin|sbin|usr|lib|lib64|var|run|mnt)(\/|$)/i.test(slashNorm) ||
+    /^\/home\/[^/]+$/i.test(slashNorm)
+  ) {
+    failSandbox(
+      'POLICY_BLOCK',
+      `Refusing to use drive root, user profile root (shared with WSL Settings/WSL Manager .wslconfig), OS system dir, or WSL VHDX storage as backupDir: ${trimmed}`,
+    );
   }
+
+  // Reject pointing backupDir directly at live plugin config root (`~/.dsh` or `~/.dsh/dsh-wsl-sandbox` or `~/.config/dsh-wsl-sandbox`)
+  const homeNorm = os.homedir().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const cfgDirNorm = getDefaultConfigDir().replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+  const dshRootNorm = path.dirname(cfgDirNorm);
+  if (
+    lower === homeNorm ||
+    lower === dshRootNorm ||
+    lower === cfgDirNorm ||
+    lower === `${homeNorm}/.config/dsh-wsl-sandbox` ||
+    lower === `${homeNorm}/.ssh` ||
+    lower === `${homeNorm}/.gnupg`
+  ) {
+    failSandbox(
+      'POLICY_BLOCK',
+      `Refusing to place backups directly in live config root (${trimmed}); choose a dedicated backup subdirectory instead.`,
+    );
+  }
+
   return trimmed;
+}
+
+function inferDefaultLinuxUser(): string {
+  if (process.platform !== 'win32') {
+    try {
+      const u = os.userInfo().username;
+      if (u && u !== 'root' && /^[a-z_][a-z0-9_-]{0,31}$/.test(u)) {
+        return u;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return 'dev';
 }
 
 export function createDefaultConfig(overrides?: Partial<WslSandboxConfig>): WslSandboxConfig {
   const isWin = process.platform === 'win32';
+  const defaultUser = inferDefaultLinuxUser();
   const base: WslSandboxConfig = {
     revision: 'rev-1',
     enabled: true,
     transportMode: isWin ? 'wsl' : 'local-linux',
-    distro: 'Ubuntu-24.04',
-    workspaceRoot: '/home/dev/workspace',
-    runnerPath: '/opt/dsh-wsl-sandbox/dist/wsl-runner/src/main.js',
+    // On Windows: defaults to modern Ubuntu-26.04 LTS until installer/discovery binds the user's real distro;
+    // on native Linux devbox: uses WSL_DISTRO_NAME if inside WSL or 'local-linux'.
+    distro: isWin ? 'Ubuntu-26.04' : (process.env.WSL_DISTRO_NAME || 'local-linux'),
+    workspaceRoot: `/home/${defaultUser}/workspace`,
+    runnerPath: `/home/${defaultUser}/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js`,
+    environmentProfile: 'standard',
     sandboxMode: 'workspace-write',
     approvalPolicyMode: 'balanced',
     networkMode: 'allowlist-proxy',
@@ -186,6 +289,10 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
   if (!VALID_TRANSPORT_MODES.has(raw.transportMode)) {
     failSandbox('INVALID_SETUP', `Invalid transportMode: ${String(raw.transportMode)}`);
   }
+  const environmentProfile: EnvironmentProfile = raw.environmentProfile ?? 'standard';
+  if (!VALID_ENV_PROFILES.has(environmentProfile)) {
+    failSandbox('INVALID_SETUP', `Invalid environmentProfile: ${String(environmentProfile)}`);
+  }
   if (!VALID_SANDBOX_MODES.has(raw.sandboxMode)) {
     failSandbox('INVALID_SETUP', `Invalid sandboxMode: ${String(raw.sandboxMode)}`);
   }
@@ -226,6 +333,7 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
 
   return {
     ...raw,
+    environmentProfile,
     upstreamProxy,
     backupDir,
     unmaskedEnvWorkspaces: [...new Set(raw.unmaskedEnvWorkspaces ?? [])],
@@ -246,7 +354,7 @@ function nextRevision(current: string): string {
 }
 
 /**
- * Human-only persistent configuration store (`0600` file permissions).
+ * Human-only persistent configuration store (`0600` on POSIX / owner-only ACL on Windows NTFS).
  * Model tools NEVER receive write access to this store; only authenticated host HTTP routes
  * or host-side initialization may mutate it.
  */
@@ -284,14 +392,32 @@ export class ConfigStore {
 
   private saveAtomic(cfg: WslSandboxConfig): void {
     const dir = path.dirname(this.filePath);
+    const dirExisted = fs.existsSync(dir);
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const tmpPath = `${this.filePath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
-    fs.renameSync(tmpPath, this.filePath);
+    if (!dirExisted) {
+      hardenPrivatePath(dir, 'dir');
+    }
+    const tmpPath = `${this.filePath}.tmp.${process.pid}.${randomBytes(4).toString('hex')}`;
     try {
-      fs.chmodSync(this.filePath, 0o600);
-    } catch {
-      // Best-effort on Windows NTFS
+      fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+      let lastErr: unknown;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          fs.renameSync(tmpPath, this.filePath);
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== 'EPERM' && code !== 'EBUSY') throw err;
+        }
+      }
+      if (lastErr) throw lastErr;
+      hardenPrivatePath(this.filePath, 'file');
+    } finally {
+      if (fs.existsSync(tmpPath)) {
+        try { fs.rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -336,6 +462,7 @@ export class ConfigStore {
       username: patch.username !== undefined ? patch.username : this.config.username,
       workspaceRoot: patch.workspaceRoot ?? this.config.workspaceRoot,
       runnerPath: patch.runnerPath ?? this.config.runnerPath,
+      environmentProfile: patch.environmentProfile ?? this.config.environmentProfile,
       sandboxMode: patch.sandboxMode ?? this.config.sandboxMode,
       approvalPolicyMode: patch.approvalPolicyMode ?? this.config.approvalPolicyMode,
       networkMode: patch.networkMode ?? this.config.networkMode,

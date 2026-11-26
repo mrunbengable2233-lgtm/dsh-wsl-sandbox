@@ -19,7 +19,9 @@ import {
                               
                                    
                                   
+                                                                                                                              
                                   
+                                        
                                                                                    
                                              
  
@@ -30,19 +32,26 @@ import {
                                  
  
 
+const DEFAULT_RUNNER_LEASE_MS = 180_000;
+const DEFAULT_HEARTBEAT_MS = 30_000;
+
 /**
  * Persistent NDJSON RPC transport connecting the DSH Host plugin to `wsl-runner`.
  *
- * Security invariants:
- * - Always uses `shell: false` (never passes untrusted strings to cmd.exe or pwsh).
- * - Zero silent fallback to Windows host execution when WSL is unavailable.
- * - Cleanly rejects all in-flight RPCs on runner EOF/crash and supports bidirectional
- *   `proxy.authorizeHost` approval callbacks.
+ * Lifecycle & leak-prevention invariants:
+ * - Always uses `shell: false` and passes `--cd ~` to `wsl.exe` so the Linux runner NEVER holds
+ *   an open working-directory handle on any Windows NTFS plugin or project folder.
+ * - Sends periodic unref'd `ping` heartbeats paired with `DSH_WSL_RUNNER_LEASE_MS`, plus a
+ *   graceful `shutdown` RPC on `dispose()` and a synchronous `process.once('exit')` failsafe
+ *   so disabling/uninstalling the plugin or exiting DSH leaves ZERO orphan processes or locks.
+ * - Never executes `wsl.exe --shutdown` or kills unrelated `wsl.exe` / user terminal sessions.
  */
 export class WslTransport {
                    options                     ;
           child                                            ;
           rl                                ;
+          heartbeatTimer                            ;
+          processExitHook                          ;
                    inFlight = new Map                      ();
           disposed = false;
 
@@ -57,15 +66,31 @@ export class WslTransport {
     return Boolean(this.child && !this.child.killed && this.child.exitCode === null);
   }
 
+  getChildPid()                     {
+    return this.child?.pid;
+  }
+
+          clearHeartbeatAndExitHook()       {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+    if (this.processExitHook) {
+      process.off('exit', this.processExitHook);
+      this.processExitHook = undefined;
+    }
+  }
+
   async ensureStarted()                {
     if (this.disposed) {
       failSandbox('BACKEND_UNAVAILABLE', 'WslTransport has been disposed');
     }
     if (this.isRunning()) return;
 
+    const leaseMs = this.options.runnerLeaseMs ?? DEFAULT_RUNNER_LEASE_MS;
     const env                    = { ...process.env };
-    if (this.options.runnerLeaseMs && this.options.runnerLeaseMs > 0) {
-      env.DSH_WSL_RUNNER_LEASE_MS = String(this.options.runnerLeaseMs);
+    if (leaseMs > 0) {
+      env.DSH_WSL_RUNNER_LEASE_MS = String(leaseMs);
     }
 
     let command        ;
@@ -73,7 +98,8 @@ export class WslTransport {
 
     if (this.options.mode === 'wsl') {
       command = this.options.wslExecutable ?? 'wsl.exe';
-      args = ['-d', this.options.distro];
+      // `--cd ~` prevents wsl.exe from inheriting the Windows host CWD on NTFS (zero Windows folder lock!)
+      args = ['-d', this.options.distro, '--cd', '~'];
       if (this.options.username) {
         args.push('-u', this.options.username);
       }
@@ -92,12 +118,26 @@ export class WslTransport {
 
     this.child = child;
 
+    const onProcessExit = ()       => {
+      try {
+        if (!child.killed && child.exitCode === null) {
+          try { child.stdin.destroy(); } catch { /* ignore */ }
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
+        }
+      } catch {
+        // ignore
+      }
+    };
+    this.processExitHook = onProcessExit;
+    process.once('exit', onProcessExit);
+
     child.stderr.on('data', (chunk        ) => {
       const text = chunk.toString('utf8').trim();
       if (text) this.options.onStderr?.(text);
     });
 
     const rejectAll = (reason        )       => {
+      this.clearHeartbeatAndExitHook();
       for (const [id, call] of this.inFlight) {
         clearTimeout(call.timer);
         call.reject(new SandboxError('BACKEND_UNAVAILABLE', reason));
@@ -153,6 +193,15 @@ export class WslTransport {
         );
       }
     });
+
+    if (leaseMs > 0) {
+      const interval = Math.max(2000, Math.min(this.options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS, Math.floor(leaseMs / 3)));
+      this.heartbeatTimer = setInterval(() => {
+        if (!this.isRunning()) return;
+        void this.call('ping', {}, 5_000).catch(() => {});
+      }, interval);
+      this.heartbeatTimer.unref();
+    }
   }
 
           async handleRunnerCallback(cb                    )                {
@@ -216,10 +265,21 @@ export class WslTransport {
     });
   }
 
-  async invalidate(minValidGeneration        )                  {
+  async invalidate(
+    minValidGeneration        ,
+    scope                                                                ,
+  )                  {
     if (!this.isRunning()) return 0;
     try {
-      const res = await this.call                         ('invalidate', { generation: minValidGeneration }, 10_000);
+      const res = await this.call                         (
+        'invalidate',
+        {
+          generation: minValidGeneration,
+          sessionId: scope?.sessionId,
+          terminalId: scope?.terminalId,
+        },
+        10_000,
+      );
       return res.killedCount;
     } catch {
       return 0;
@@ -227,8 +287,33 @@ export class WslTransport {
   }
 
   async dispose()                {
+    if (this.disposed) return;
     this.disposed = true;
+    this.clearHeartbeatAndExitHook();
+
     const child = this.child;
+
+    // 1. Send graceful shutdown RPC first so in-WSL runner closes proxy sockets, kills owned PGIDs,
+    //    and deletes /tmp/dsh-wsl-* cleanly before stdio closes.
+    if (child && !child.killed && child.exitCode === null && child.stdin.writable) {
+      try {
+        const id = randomUUID();
+        const frame             = { id, method: 'shutdown', params: {} };
+        await new Promise      ((resolve) => {
+          const t = setTimeout(resolve, 1200);
+          t.unref();
+          this.inFlight.set(id, {
+            resolve: () => { clearTimeout(t); resolve(); },
+            reject: () => { clearTimeout(t); resolve(); },
+            timer: t,
+          });
+          child.stdin.write(JSON.stringify(frame) + '\n', () => {});
+        });
+      } catch {
+        // Proceed to EOF / signal teardown
+      }
+    }
+
     this.child = undefined;
     this.rl?.close();
     this.rl = undefined;
@@ -258,7 +343,7 @@ export class WslTransport {
         try {
           child.stdin.end();
         } catch {
-          child.kill('SIGTERM');
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
         }
       });
     }

@@ -7,6 +7,7 @@ import {
 import type { ConfinedProcManager } from './proc-manager.ts';
 
 interface TerminalSessionState {
+  readonly sessionId: string;
   readonly terminalId: string;
   cwd: string;
   readonly env: Record<string, string>;
@@ -14,11 +15,15 @@ interface TerminalSessionState {
 
 const CWD_MARKER = '__DSH_WSL_TERM_CWD__=';
 
+function makeKey(sessionId: string, terminalId: string): string {
+  return `${sessionId}::${terminalId}`;
+}
+
 /**
  * Controlled stateful WSL terminal manager (`wsl_terminal`).
- * Keeps per-terminal working directory continuity strictly within `workspaceRoot`
- * while executing every single command inside a fresh `bwrap + seccomp + prlimit` sandbox.
- * Never exposes any human interactive terminal PTY or stdin to the model.
+ * Isolates per-session & per-terminal state by `(sessionId, terminalId)` so invalidating
+ * or resetting one session/terminal NEVER clobbers another session's CWD or processes.
+ * Executes every command inside a fresh `bwrap + seccomp + prlimit` sandbox.
  */
 export class ConfinedTerminalManager {
   private readonly procManager: ConfinedProcManager;
@@ -28,23 +33,55 @@ export class ConfinedTerminalManager {
     this.procManager = procManager;
   }
 
-  reset(terminalId: string): boolean {
-    return this.sessions.delete(terminalId);
+  async reset(terminalId: string, sessionId?: string): Promise<boolean> {
+    let deleted = false;
+    if (sessionId) {
+      deleted = this.sessions.delete(makeKey(sessionId, terminalId));
+      await this.procManager.killTerminal(sessionId, terminalId);
+      return deleted;
+    }
+    for (const [key, st] of this.sessions) {
+      if (st.terminalId === terminalId) {
+        this.sessions.delete(key);
+        await this.procManager.killTerminal(st.sessionId, st.terminalId);
+        deleted = true;
+      }
+    }
+    return deleted;
+  }
+
+  clearSession(sessionId: string, terminalId?: string): number {
+    let cleared = 0;
+    for (const [key, st] of this.sessions) {
+      if (st.sessionId !== sessionId) continue;
+      if (terminalId && st.terminalId !== terminalId) continue;
+      this.sessions.delete(key);
+      cleared += 1;
+    }
+    return cleared;
   }
 
   clearAll(): void {
     this.sessions.clear();
   }
 
+  listSessions(sessionId?: string): Array<{ readonly sessionId: string; readonly terminalId: string; readonly cwd: string }> {
+    return Array.from(this.sessions.values())
+      .filter((s) => !sessionId || s.sessionId === sessionId)
+      .map((s) => ({ sessionId: s.sessionId, terminalId: s.terminalId, cwd: s.cwd }));
+  }
+
   async exec(params: TerminalExecParams): Promise<TerminalExecResult> {
-    let state = this.sessions.get(params.terminalId);
+    const key = makeKey(params.binding.sessionId, params.terminalId);
+    let state = this.sessions.get(key);
     if (!state) {
       state = {
+        sessionId: params.binding.sessionId,
         terminalId: params.terminalId,
         cwd: params.cwd || params.binding.cwd,
         env: {},
       };
-      this.sessions.set(params.terminalId, state);
+      this.sessions.set(key, state);
     }
 
     const effectiveCwd = isPathInside(params.binding.workspaceRoot, state.cwd)
@@ -60,6 +97,7 @@ export class ConfinedTerminalManager {
 
     const result = await this.procManager.exec({
       ...params,
+      terminalId: params.terminalId,
       command: wrapped,
       argv: undefined,
       cwd: effectiveCwd,

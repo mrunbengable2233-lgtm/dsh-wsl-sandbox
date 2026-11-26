@@ -29,7 +29,7 @@ function makeBinding(overrides?: Partial<SessionBinding>): SessionBinding {
     sessionId: 'sess-unit-1',
     backend: 'wsl',
     wslVersion: 2,
-    distribution: 'Ubuntu-24.04',
+    distribution: 'Ubuntu-26.04',
     uid: 1000,
     username: 'dev',
     arch: 'x86_64',
@@ -50,32 +50,60 @@ function makeBinding(overrides?: Partial<SessionBinding>): SessionBinding {
 }
 
 describe('core/binding — SessionBinding & path validation', () => {
-  it('rejects forbidden system, home, and /mnt workspace roots', () => {
-    for (const bad of ['/', '/etc', '/mnt', '/mnt/c', '/mnt/c/Users/foo', '/run/WSL', '/tmp', '/home/dev']) {
-      assert.throws(() => validateWorkspaceRoot(bad, 'dev'), SandboxError);
+  it('rejects forbidden system, home, /mnt, and live config/credential workspace roots', () => {
+    for (const bad of [
+      '/',
+      '/etc',
+      '/mnt',
+      '/mnt/c',
+      '/mnt/c/Users/foo',
+      '/run/WSL',
+      '/tmp',
+      '/home/dev',
+      '/home/dev/.dsh',
+      '/home/dev/.config/dsh-wsl-sandbox',
+      '/home/dev/.ssh',
+      '/home/dev/.gnupg',
+    ]) {
+      assert.throws(() => validateWorkspaceRoot(bad, 'dev'), SandboxError, `Expected reject for: ${bad}`);
     }
     assert.equal(validateWorkspaceRoot('/home/dev/project', 'dev'), '/home/dev/project');
   });
 
-  it('validates single-directory shares and rejects system/mnt shares', () => {
-    assert.throws(
-      () => validateShareEntry({ id: 's1', alias: 'win', sourceLinuxPath: '/mnt/c', mode: 'ro' }),
-      SandboxError,
-    );
-    assert.throws(
-      () => validateShareEntry({ id: 's1', alias: 'root', sourceLinuxPath: '/', mode: 'ro' }),
-      SandboxError,
-    );
+  it('validates single-directory shares and rejects system, /mnt root, and config/credential shares', () => {
+    for (const bad of [
+      '/mnt/c',
+      '/',
+      '/home/dev/.dsh',
+      '/home/dev/.config/dsh-wsl-sandbox',
+      '/home/dev/.ssh',
+      'C:\\Users\\Alice\\.wslconfig',
+      'C:\\Users\\Alice\\AppData\\Local\\Packages\\CanonicalGroupLimited',
+      'C:\\Users\\Alice\\AppData\\Local\\wsl\\vhdx',
+    ]) {
+      assert.throws(
+        () => validateShareEntry({ id: 's1', alias: 'bad', sourceLinuxPath: bad, mode: 'ro' }),
+        SandboxError,
+        `Expected reject for share path: ${bad}`,
+      );
+    }
     const ok = validateShareEntry({ id: 's1', alias: 'assets', sourceLinuxPath: '/home/dev/assets', mode: 'ro' });
     assert.equal(ok.alias, 'assets');
   });
 
-  it('validates physical device nodes strictly (Q13)', () => {
-    assert.equal(validateDeviceNode({ path: '/dev/ttyUSB0' }).path, '/dev/ttyUSB0');
-    assert.equal(validateDeviceNode({ path: '/dev/ttyACM1' }).path, '/dev/ttyACM1');
-    assert.equal(validateDeviceNode({ path: '/dev/bus/usb/001/004' }).path, '/dev/bus/usb/001/004');
-    for (const bad of ['/dev/sda', '/dev/sda1', '/dev/nvme0n1', '/dev/kvm', '/dev/mem', '/dev/tty']) {
-      assert.throws(() => validateDeviceNode({ path: bad }), SandboxError);
+  it('validates physical device nodes strictly across USB, HID, CDC, video, and serial nodes', () => {
+    for (const okPath of [
+      '/dev/ttyUSB0',
+      '/dev/ttyACM1',
+      '/dev/bus/usb/001/004',
+      '/dev/hidraw0',
+      '/dev/cdc-wdm0',
+      '/dev/video0',
+    ]) {
+      assert.equal(validateDeviceNode({ path: okPath }).path, okPath);
+    }
+    for (const bad of ['/dev/sda', '/dev/sda1', '/dev/nvme0n1', '/dev/kvm', '/dev/mem', '/dev/tty', '/dev/net/tun']) {
+      assert.throws(() => validateDeviceNode({ path: bad }), SandboxError, `Expected reject for device: ${bad}`);
     }
   });
 
@@ -227,18 +255,35 @@ describe('core/bash-ast-guard — zero-token Bash lexer/AST guard', () => {
     assert.equal(gitForce.decision, 'ask');
   });
 
-  it('marks physical device tools and /dev/ttyUSB* for manual allow-once (Q13)', () => {
-    const flash = evaluateBashCommand('esptool.py --port /dev/ttyUSB0 write_flash 0x1000 app.bin', ctx);
-    assert.equal(flash.decision, 'ask');
-    assert.equal(flash.touchesPhysicalDevice, true);
-    assert.equal(flash.suggestedPrefix, undefined);
+  it('marks physical device tools, phone Bootloader/ADB mutators, and USB/HID/serial nodes for manual allow-once', () => {
+    // Read-only phone enumeration passes cleanly
+    assert.equal(evaluateBashCommand('adb devices', ctx).decision, 'allow');
+    assert.equal(evaluateBashCommand('fastboot devices', ctx).decision, 'allow');
+
+    for (const cmd of [
+      'esptool.py --port /dev/ttyUSB0 write_flash 0x1000 app.bin',
+      'fastboot flashing unlock',
+      'adb -s ABC123 reboot bootloader',
+      'adb sideload ota.zip',
+      'qdl prog_firehose.elf rawprogram0.xml',
+      'cat /dev/hidraw0',
+    ]) {
+      const res = evaluateBashCommand(cmd, ctx);
+      assert.equal(res.decision, 'ask', `Expected ask for: ${cmd}`);
+      assert.equal(res.touchesPhysicalDevice, true, `Expected touchesPhysicalDevice for: ${cmd}`);
+      assert.equal(res.suggestedPrefix, undefined, `Expected no session prefix for: ${cmd}`);
+    }
   });
 });
 
-describe('core/pwsh-guard — complete Windows PowerShell/CMD guard (Q15 + Q13)', () => {
-  it('allows read-only host hardware inspection (usbipd list, Get-PnpDevice)', () => {
+describe('core/pwsh-guard — complete Windows PowerShell/CMD guard (Single-Shell + Physical Hardware/Drivers)', () => {
+  it('allows read-only host hardware, NIC, and driver inspection', () => {
     assert.equal(evaluatePwshCommand('usbipd list').decision, 'allow');
     assert.equal(evaluatePwshCommand('Get-PnpDevice -Class Ports').decision, 'allow');
+    assert.equal(evaluatePwshCommand('Get-NetAdapter').decision, 'allow');
+    assert.equal(evaluatePwshCommand('pnputil /enum-drivers').decision, 'allow');
+    assert.equal(evaluatePwshCommand('adb devices').decision, 'allow');
+    assert.equal(evaluatePwshCommand('fastboot devices').decision, 'allow');
   });
 
   it('blocks L0 destructive cmdlets, Defender tampering, and WSL config tampering', () => {
@@ -249,7 +294,7 @@ describe('core/pwsh-guard — complete Windows PowerShell/CMD guard (Q15 + Q13)'
       'vssadmin delete shadows /all',
       'reg save HKLM\\SAM sam.hiv',
       'Set-Content $env:USERPROFILE\\.wslconfig "[wsl2]"',
-      'wsl.exe --unregister Ubuntu-24.04',
+      'wsl.exe --unregister Ubuntu-26.04',
       'wsl -u root id',
     ];
     for (const cmd of l0) {
@@ -271,11 +316,16 @@ describe('core/pwsh-guard — complete Windows PowerShell/CMD guard (Q15 + Q13)'
     assert.equal(wslBypass.decision, 'ask');
   });
 
-  it('downgrades usbipd bind/attach/detach and host flashers to manual allow-once (Q13)', () => {
+  it('downgrades usbipd, phone Bootloader/ADB, and Windows driver/USB-NIC mutations to manual allow-once', () => {
     for (const cmd of [
       'usbipd bind --busid 1-4',
       'usbipd attach --wsl --busid 1-4',
       'usbipd detach --busid 1-4',
+      'fastboot.exe flashing unlock',
+      'adb.exe reboot bootloader',
+      'pnputil /add-driver C:\\Drivers\\usb_nic.inf /install',
+      'devcon.exe update C:\\Drivers\\android_winusb.inf USB\\VID_18D1',
+      'Disable-NetAdapter -Name "USB Ethernet" -Confirm:$false',
       'esptool.exe --port COM3 flash_id',
     ]) {
       const res = evaluatePwshCommand(cmd);
@@ -352,7 +402,7 @@ describe('core/approval-controller — concurrent, hash-bound, single-use & Q13 
 
     const action = {
       kind: 'physical-device' as const,
-      summary: 'Attach ESP32',
+      summary: 'Attach USB device',
       command: 'usbipd attach --wsl --busid 1-2',
       canonicalArgv: ['usbipd', 'attach', '--wsl', '--busid', '1-2'],
       reasons: ['physical device'],
@@ -460,6 +510,54 @@ describe('core/uds-proxy — SSRF defense, localLabPorts & upstream HTTP proxy c
       await proxy.stop();
       await new Promise<void>((r) => labServer.close(() => r()));
       await new Promise<void>((r) => upstreamProxy.close(() => r()));
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('tears down live CONNECT tunnels promptly on stop() with zero leaked sockets or leftover socket file', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-proxy-leak-'));
+    const sockPath = path.join(tmpDir, 'proxy.sock');
+    const tcpTarget = net.createServer((sock) => {
+      sock.on('error', () => {});
+      // Keep connection open indefinitely until torn down
+    });
+    await new Promise<void>((resolve) => tcpTarget.listen(0, '127.0.0.1', resolve));
+    const targetPort = (tcpTarget.address() as net.AddressInfo).port;
+
+    const proxy = new UdsAllowlistProxy({
+      socketPath: sockPath,
+      localLabPorts: [targetPort],
+    });
+    await proxy.start();
+
+    let clientSock: net.Socket | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const req = http.request({
+          socketPath: sockPath,
+          method: 'CONNECT',
+          path: `127.0.0.1:${targetPort}`,
+        });
+        req.on('connect', (res, socket) => {
+          assert.equal(res.statusCode, 200);
+          clientSock = socket;
+          socket.on('error', () => {});
+          resolve();
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      assert.ok(proxy.getActiveSocketCount() >= 2, 'Expected live client + upstream tunnel sockets tracked');
+      const t0 = Date.now();
+      await proxy.stop();
+      const elapsed = Date.now() - t0;
+      assert.ok(elapsed < 1000, `proxy.stop() hung with live CONNECT tunnel (${elapsed}ms)`);
+      assert.equal(proxy.getActiveSocketCount(), 0);
+      assert.equal(fs.existsSync(sockPath), false, 'UDS socket file must be unlinked on stop()');
+    } finally {
+      clientSock?.destroy();
+      await new Promise<void>((r) => tcpTarget.close(() => r()));
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });

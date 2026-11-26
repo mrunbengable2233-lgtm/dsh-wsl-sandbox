@@ -1,6 +1,6 @@
 ---
 name: dsh-wsl-env-setup
-description: "Laptop-friendly, zero-Docker, zero-kernel-build Agent workflow to provision and verify a WSL 2 sandbox environment for DeepSeek Harness (dsh-wsl-sandbox). Probes existing WSL 2 distros, guides the user through choosing a Codex-aligned profile (core/standard/universal) plus China mirrors or upstream proxy, runs small idempotent binary-only setup steps under human approval, and verifies with dsh-wsl-doctor. Use when initializing, repairing, or upgrading the WSL 2 sandbox environment."
+description: "Laptop-friendly, zero-Docker, zero-kernel-build Agent workflow to provision and verify a WSL 2 sandbox environment for DeepSeek Harness (dsh-wsl-sandbox). Dynamically probes existing WSL 2 distros (including Ubuntu 26.04/24.04, Debian, Fedora, Arch, and WSL Manager imported/moved VHDX instances), guides the user through choosing a Codex-aligned profile (core/standard/universal) plus China mirrors or upstream proxy, stages the runner into native ext4 (zero /mnt lock), runs small idempotent binary-only setup steps under human approval, and verifies with dsh-wsl-doctor. Use when initializing, repairing, or upgrading the WSL 2 sandbox environment."
 ---
 
 # DSH WSL 2 Sandbox Environment Setup (Agent-Guided, Zero-Docker / Zero-Kernel-Build)
@@ -9,43 +9,48 @@ description: "Laptop-friendly, zero-Docker, zero-kernel-build Agent workflow to 
 
 ## Non-Negotiable Safety Rules
 
-1. **NEVER build Docker images or compile Linux kernels / Python-from-source (`pyenv`)** on the user's laptop. Use official prebuilt WSL 2 distros and prebuilt binaries (`apt`, NodeSource/`mise`, Astral `uv`, official Go tarball, `rustup --profile minimal`) only.
-2. **NEVER silently edit `/etc/wsl.conf`, `/etc/fstab`, or `%USERPROFILE%\.wslconfig`**. Only inspect them read-only and print advisory notices if suboptimal (e.g., WSL 1 detected).
-3. **NEVER use `root` as the runtime sandbox user**. Verify a non-root UID (`uid > 0`) exists and is configured as the default WSL user.
-4. **Ask once before installing**: Always run Phase 1 read-only probes first, present the exact plan (distro, profile, mirror/proxy, estimated disk footprint), and wait for user confirmation before running any install command.
+1. **NEVER build Docker images or compile Linux kernels / Python-from-source (`pyenv`)** on the user's laptop. Support ANY modern WSL 2 distro (Ubuntu 26.04/24.04/22.04, Debian, Kali, Fedora, Arch, openSUSE, Alpine, or custom WSL Manager imported/moved VHDX instances) and install prebuilt binaries only (`apt`/`dnf`/`pacman`/`zypper`/`apk`, NodeSource/`mise`, Astral `uv`, official Go tarball, `golangci-lint`, `rustup --profile minimal`).
+2. **NEVER silently edit `/etc/wsl.conf`, `/etc/fstab`, or `%USERPROFILE%\.wslconfig`**, and **NEVER recommend `wsl.exe --shutdown`**: Windows WSL Settings and WSL Manager share those exact config paths; keep backups read-only (`0400`/`+R`) in owner-only directories, and always target single distros with `wsl.exe --terminate <Distro>` so other WSL sessions are never killed.
+3. **NEVER lock host Windows folders via `/mnt`**: Always pass `--cd ~` to `wsl.exe` and stage the runner + provisioner into native WSL ext4 (`$HOME/.local/share/dsh-wsl-sandbox/runner/`) via `node scripts/stage-wsl-runner.mjs --distro <Distro>`.
+4. **NEVER use `root` as the runtime sandbox user**: Verify a non-root UID (`uid > 0`) is configured as the default WSL user.
+5. **Ask once before installing**: Always run Phase 1 read-only probes first, present the exact plan (distro, profile, mirror/proxy, estimated disk footprint), and wait for user confirmation before running any install command.
 
 ## Phase 1: Read-Only Discovery (No Changes)
 
-1. Enumerate installed WSL distros & versions (exclude internal container distros like `docker-desktop`):
+1. Enumerate installed WSL distros & custom moved VHDX paths (exclude internal container distros like `docker-desktop`):
    ```powershell
    wsl.exe -l -v
+   Get-ChildItem HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss | ForEach-Object { Get-ItemProperty $_.PSPath | Select-Object DistributionName, BasePath, Version }
    ```
+   > Even if a WSL Manager imported/moved distro does not appear in Windows Explorer's left "Linux" sidebar, it remains fully registered here and works cleanly over `wsl.exe --cd ~`.
 2. Probe the target WSL 2 distro read-only:
    ```powershell
-   wsl.exe -d <distro> -- sh -c 'id; uname -r; uname -m; command -v bwrap prlimit socat node python3 git rg fdfind fd jq uv go cargo mise || true'
+   wsl.exe -d <distro> --cd ~ -- sh -c 'id; head -n 3 /etc/os-release 2>/dev/null; uname -r; uname -m; command -v bwrap prlimit socat node python3 git rg fdfind fd jq uv go cargo mise || true'
    ```
 3. Present options and confirm once with the user:
-   - **Target distro**: reuse an existing WSL 2 Ubuntu/Debian distro, OR install a fresh official distro (`wsl.exe --install Ubuntu-24.04 --name dsh-sandbox` on WSL 2.4+, or `wsl.exe --install -d Ubuntu-24.04`).
-   - **Profile tier**: `core` (~350MB) / `standard` (~1.2GB, recommended) / `universal` (~3.5GB, binary-only).
-   - **China network acceleration**: `--mirror cn` (Tsinghua APT/PyPI, `npmmirror`, `goproxy.cn`, `rsproxy.cn`) and/or `--proxy http://<host>:<port>`.
+   - **Target distro**: reuse an existing WSL 2 distro (including WSL Manager moved instances), OR install a fresh official distro (`wsl.exe --install -d Ubuntu-26.04` [current Ubuntu default], or `Ubuntu-24.04`, `Debian`, `FedoraLinux-42`, `Arch`, `kali-linux`).
+   - **Profile tier** (enforced across every step & persisted in `~/.config/dsh-wsl-sandbox/profile.json`):
+     - `core` (~350MB, ~2 min): sandbox base + Codex CLI + C/C++ base + system `python3` + Node 22 LTS.
+     - `standard` (~1.2GB, recommended): `core` + `ccache`/`protobuf`/`libpq`/`libxml2` + `mise` + `uv`/`pytest`/`ruff`/`mypy`/`pyright`/`black` + `pnpm`/`yarn`/`bun`/`typescript`/`eslint`/`prettier` + Go + `golangci-lint` + Rust minimal (`rustfmt`, `clippy`).
+     - `universal` (~3.5GB, binary-only): `standard` + prebuilt `clang`/`clang-format`/`clang-tidy` + `bazelisk` + `mise` Node 20/22/24 + `poetry`/`isort` + OpenJDK 21 + `maven` + `gradle` + `ruby` + `php-cli` + `composer`.
+   - **China network acceleration**: `--mirror cn` (Tsinghua APT/PyPI, `UV_PYTHON_INSTALL_MIRROR`, `npmmirror`, `goproxy.cn`, `rsproxy.cn`) and/or `--proxy http://<host>:<port>`.
 
-## Phase 2: Step-by-Step Idempotent Provisioning (Under Human Approval)
+## Phase 2: Native ext4 Staging & Step-by-Step Idempotent Provisioning
 
-Execute in clean, resumable stages via `provision-wsl.sh` (or explicit per-stage commands):
-- **Step A (`base`)**: `bubblewrap`, `util-linux`, `socat`, Codex CLI tools (`git`, `git-lfs`, `rg`, `fd-find` + `/usr/local/bin/fd` symlink, `jq`, `sqlite3`, `rsync`, `zip`/`unzip`, `xz-utils`, `universal-ctags`, `inotify-tools`, `moreutils`, `gawk`, `tree`, `file`, `patch`), C/C++ base (`build-essential`, `pkg-config`, `cmake`, `ninja-build`, `libssl-dev`, `zlib1g-dev`, `libffi-dev`, `libsqlite3-dev`), `python3` + `python3-venv`.
-- **Step B (`node`)**: Prebuilt Node 22 LTS (mandatory for `wsl-runner`); for `standard`/`universal`: `pnpm`, `yarn`, prebuilt `bun`, `typescript`, `eslint`, `prettier`.
-- **Step C (`python`)**: Astral **`uv`** prebuilt binary + `uv tool install ruff pytest mypy pyright black` (`standard`/`universal`).
-- **Step D (`go-rust`)**: Prebuilt Go tarball + `golangci-lint`, prebuilt Rust stable via `rustup --profile minimal --component rustfmt --component clippy` (`standard`/`universal`).
-- **Step E (`extra`)**: `apt` prebuilt `clang`, `clang-format`, `clang-tidy`, `openjdk-21-jdk-headless`, `maven`, `gradle`, `ruby`, `php-cli`, `composer`, `bazelisk` (`universal` only).
-
+Stage into native WSL ext4 first (works even with `[automount] enabled = false` and moved WSL Manager instances):
+```powershell
+.\packages\bootstrap\install-dsh-plugin.ps1 -Distro <distro> -Profile <core|standard|universal> -Mirror <global|cn> -Provision
+```
+Or run individual resumable steps inside WSL (`--step all|base|cli|node|python|go|rust|go-rust|extra`):
 ```bash
-bash packages/bootstrap/provision-wsl.sh --profile <core|standard|universal> [--mirror cn] [--proxy http://...]
+bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh \
+  --profile <core|standard|universal> [--mirror cn] [--proxy http://...] [--step all|base|cli|node|python|go|rust|extra]
 ```
 
 ## Phase 3: Mandatory Verification Gate (`dsh-wsl-doctor`)
 
 ```bash
-node packages/bootstrap/src/doctor.ts --json
+node ~/.local/share/dsh-wsl-sandbox/runner/dist/packages/bootstrap/src/doctor.js --strict-wsl2 --profile <core|standard|universal> --json
 ```
 
-All hard gates MUST pass (`os.isWsl2`, `user.nonRoot`, `sandbox.unprivilegedUserns`, `sandbox.seccompIoUringBlocked`, `sandbox.seccompAfVsockBlocked`, `sandbox.escapeMaskSelfTest`). If Ubuntu 24.04 AppArmor blocks unprivileged userns, report the exact AppArmor `bwrap` profile remediation command for human approval — NEVER bypass confinement.
+All hard gates MUST pass (`os.isWsl2`, `user.nonRoot`, `sandbox.unprivilegedUserns`, `sandbox.seccompIoUringBlocked`, `sandbox.seccompAfVsockBlocked`, `sandbox.escapeMaskSelfTest`, `sandbox.configMaskSelfTest`, `sandbox.configDirPermsOk`). If Ubuntu AppArmor blocks unprivileged userns, report the exact AppArmor `bwrap` profile remediation command for human approval — NEVER bypass confinement.
