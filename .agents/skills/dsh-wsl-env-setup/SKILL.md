@@ -30,9 +30,9 @@ description: "Laptop-friendly, zero-Docker, zero-kernel-build Agent workflow to 
 3. Present options and confirm once with the user:
    - **Target distro**: reuse an existing WSL 2 distro (including WSL Manager moved instances), OR install a fresh official distro (`wsl.exe --install -d Ubuntu-26.04` [current Ubuntu default], or `Ubuntu-24.04`, `Debian`, `FedoraLinux-42`, `Arch`, `kali-linux`).
    - **Profile tier** (enforced across every step & persisted in `~/.config/dsh-wsl-sandbox/profile.json`):
-     - `core` (~350MB, ~2 min): sandbox base + Codex CLI + C/C++ base + system `python3` + Node 22 LTS.
+     - `core` (~350MB, ~2 min): sandbox base + Codex CLI + C/C++ base + system `python3` + shared Linux Node `>=22` (or fresh prebuilt **Node 24 Active LTS**).
      - `standard` (~1.2GB, recommended): `core` + `ccache`/`protobuf`/`libpq`/`libxml2` + `mise` + `uv`/`pytest`/`ruff`/`mypy`/`pyright`/`black` + `pnpm`/`yarn`/`bun`/`typescript`/`eslint`/`prettier` + Go + `golangci-lint` + Rust minimal (`rustfmt`, `clippy`).
-     - `universal` (~3.5GB, binary-only): `standard` + prebuilt `clang`/`clang-format`/`clang-tidy` + `bazelisk` + `mise` Node 20/22/24 + `poetry`/`isort` + OpenJDK 21 + `maven` + `gradle` + `ruby` + `php-cli` + `composer`.
+     - `universal` (~3.5GB, binary-only): `standard` + prebuilt `clang`/`clang-format`/`clang-tidy` + `bazelisk` + `mise` Node 22/24 LTS (default `node@24`) + `poetry`/`isort` + OpenJDK 21 + `maven` + `gradle` + `ruby` + `php-cli` + `composer`.
    - **China network acceleration**: `--mirror cn` (Tsinghua APT/PyPI, `UV_PYTHON_INSTALL_MIRROR`, `npmmirror`, `goproxy.cn`, `rsproxy.cn`) and/or `--proxy http://<host>:<port>`.
 
 ## Phase 2: Native ext4 Staging & Step-by-Step Idempotent Provisioning

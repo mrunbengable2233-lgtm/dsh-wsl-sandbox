@@ -1,37 +1,45 @@
-# `dsh-wsl-sandbox` 本地安装、多发行版与 WSL Manager 兼容、配置备份与 npm 托管指南
+# `dsh-wsl-sandbox` 本地安装、多发行版与 WSL Manager 兼容、配置备份与发布指南
 
-本指南面向日常使用者与仓库维护者，提供 **零 Docker、零内核编译、零 `/mnt` 文件夹占用** 的本地安装流程，覆盖 **Ubuntu 26.04/24.04/Debian/Fedora/Arch 多发行版自动探测、WSL Manager 迁移磁盘兼容、三档环境配置（`core`/`standard`/`universal`）、只读配置备份还原、单发行版 `--terminate` 隔离** 以及发布到 **npm / GitHub** 的完整步骤。
+> **如果你是第一次接触命令行、PowerShell 7 UTF-8 配置、WSL 2 或源码编译的新手**，请优先阅读保姆级教程：[`docs/BEGINNER-BUILD-AND-DEPLOY.zh.md`](./docs/BEGINNER-BUILD-AND-DEPLOY.zh.md)。  
+> **如需让 AI 批量生成危险命令测试集进行门禁红队压测**，请参阅：[`docs/AI-DANGEROUS-COMMAND-FUZZING-GUIDE.zh.md`](./docs/AI-DANGEROUS-COMMAND-FUZZING-GUIDE.zh.md)。
+
+本指南面向日常使用者与仓库维护者，提供 **零 Docker、零内核编译、零 `/mnt` 文件夹占用、与 DSH 共用 Node 运行时** 的本地安装流程，覆盖 **Ubuntu 26.04/24.04/Debian/Fedora/Arch 多发行版自动探测、WSL Manager 迁移磁盘兼容、三档环境配置（`core`/`standard`/`universal`）、只读配置备份还原、SSD 友好型合并刷盘日志** 以及发布到 **GitHub PR / npm** 的完整步骤。
 
 ---
 
 ## 一、Windows 10/11 + WSL 2 本地快速安装（2 步完成）
 
-> **前置条件**：Windows 10 (21H2+) 或 Windows 11，已启用 WSL 2（支持任意已注册的 WSL 2 发行版：默认推荐 `Ubuntu-26.04`，也完全支持 `Ubuntu-24.04`、`Debian`、`Fedora`、`Arch`、`kali-linux` 以及通过 **WSL Manager** 导入/迁移 VHDX 磁盘的自定义实例），宿主机 Node.js `>= 22.18.0`。
+> **前置条件**：Windows 10 (21H2+) 或 Windows 11，推荐先安装 **PowerShell 7 (`pwsh.exe`)** 并持久化 UTF-8 编码为默认首选终端（见 [`docs/BEGINNER-BUILD-AND-DEPLOY.zh.md` 第二节](./docs/BEGINNER-BUILD-AND-DEPLOY.zh.md)），已启用 WSL 2（支持任意已注册的 WSL 2 发行版：默认推荐 `Ubuntu-26.04`，也完全支持 `Ubuntu-24.04`、`Debian`、`Fedora`、`Arch`、`kali-linux` 以及通过 **WSL Manager** 导入/迁移 VHDX 磁盘的自定义实例）。
+>
+> **关于 Node.js 版本（直接与 DSH 共用，无需重复安装）**：
+> - 本插件声明 `"engines": { "node": "^22.19.0 || >=24.0.0" }`，与 `@deepseek-ai/dsh@0.2.2-rc.5`（内置 Node `>=24.9.0`）及其他现代 DSH 插件完全对齐。
+> - **Windows 宿主侧**：插件直接在 DSH 进程内运行，子进程与安装脚本自动复用 DSH 自带的 Node 载体（`process.execPath` / Electron 下自动携带 `ELECTRON_RUN_AS_NODE=1`，若使用预编译包甚至可直接走 Windows 自带 `tar.exe` 零 Node 安装部署）。
+> - **WSL 2 Linux 侧**：自动发现并共用 `~/.dsh/runtime/bin`、`mise`、`nvm`、`fnm`、`volta` 或 `/usr/bin` 下任意已安装的 Linux Node（`>=22`）；仅在全新无 Node 环境下自动安装预编译 **Node 24 Active LTS**（拒绝跨界调用 `/mnt/c/.../node.exe`）。
 
 ### 第 1 步：运行交互式 Windows 安装与环境建置向导（零硬编码）
 
 在仓库根目录的 Windows PowerShell 中直接执行（无需手写发行版名或 Linux 用户名）：
 
 ```powershell
-# 自动探测已注册的 WSL 2 实例（含 WSL Manager 迁移磁盘实例），引导选择 core/standard/universal 档位，
+# 自动探测已注册的 WSL 2 实例（含 WSL Manager 迁移磁盘实例），先检测并补齐 bwrap/prlimit/socat/node，
 # 自动只读备份原有 .wslconfig 与 /etc/wsl.conf，将 Runner 部署到 WSL 原生 ext4（零 /mnt 锁占用），
-# 并按所选档位执行 provision-wsl.sh + dsh-wsl-doctor 闭环体检：
+# 验证就绪后再写入 config.json 并执行 dsh-wsl-doctor 闭环体检：
 .\packages\bootstrap\install-dsh-plugin.ps1 -Provision -Mirror cn -UpsertAgentsMd
 ```
 
 > **支持哪些非交互 / 自定义参数？**
 > - 指定已有发行版（包括 WSL Manager 自定义名称）：`-Distro MyMovedDebian`
 > - 指定三档工具链配置（严格按 spec 生效并持久化到 `~/.config/dsh-wsl-sandbox/profile.json`）：
->   - `-Profile core`（~350MB，约 2 分钟）：`bwrap`/`prlimit`/`socat` + Codex 高频 CLI + C/C++ 基础 + `python3` + Node 22 LTS
+>   - `-Profile core`（~350MB，约 2 分钟）：`bwrap`/`prlimit`/`socat` + Codex 高频 CLI + C/C++ 基础 + `python3` + 共用 Linux Node `>=22`（全新环境默认安装 **Node 24 Active LTS**）
 >   - `-Profile standard`（~1.2GB，默认推荐）：`core` + `ccache`/`protobuf`/`libpq`/`libxml2` + `mise` + `uv`/`pytest`/`ruff`/`mypy`/`pyright`/`black` + `pnpm`/`yarn`/`bun`/`typescript`/`eslint`/`prettier` + Go + `golangci-lint` + Rust 最小化套件
->   - `-Profile universal`（~3.5GB，纯预编译）：`standard` + `clang`/`bazelisk` + `mise` Node 20/22/24 + `poetry`/`isort` + OpenJDK 21 + `maven`/`gradle` + `ruby` + `php-cli`/`composer`
+>   - `-Profile universal`（~3.5GB，纯预编译）：`standard` + `clang`/`bazelisk` + `mise` Node 22/24 LTS（默认 `node@24`）+ `poetry`/`isort` + OpenJDK 21 + `maven`/`gradle` + `ruby` + `php-cli`/`composer`
 > - 使用上游代理：`-Proxy http://127.0.0.1:7890`
 > - 仅备份原有 WSL 配置到任意自定义目录：`-BackupOnly -BackupDir "D:\Backups\WSL-Orig" -OpenBackupFolder`
 > - 如尚未安装任何 WSL 2 发行版，向导会提示可选的官方发行版列表（默认推荐 `Ubuntu-26.04`，也可选择 `Ubuntu-24.04`、`Debian`、`FedoraLinux-42`、`Arch`、`kali-linux` 等）。
 
 如果你已经在 WSL 内，也可以随时直接按需运行单步幂等脚本与体检：
 ```bash
-# 支持 --step all|base|cli|node|python|go|rust|go-rust|extra
+# 支持 --step all|base|cli|node|python|go|rust|go-rust|extra （升级已有 Node 22 到 24 可加 --upgrade-node）
 bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --profile standard --mirror cn
 node ~/.local/share/dsh-wsl-sandbox/runner/dist/packages/bootstrap/src/doctor.js --strict-wsl2 --profile standard
 ```
@@ -39,9 +47,9 @@ node ~/.local/share/dsh-wsl-sandbox/runner/dist/packages/bootstrap/src/doctor.js
 ### 第 2 步：在 DeepSeek Harness (DSH) 中注册插件
 
 ```powershell
-# 注册到 DSH（按你使用的模式选择 web 或 desktop）：
-dsh plugin --profile web add .\dsh-wsl-sandbox-0.1.0.tgz
-dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.1.0.tgz
+# 注册到 DSH（按你使用的模式选择 web 或 desktop，也可直接在 DSH Desktop 插件设置中导入 .tgz 或源码目录）：
+dsh plugin --profile web add .\dsh-wsl-sandbox-0.2.0.tgz
+dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.2.0.tgz
 ```
 
 - 启动 DSH 后打开 **设置（Settings） -> WSL 2 沙箱**（原生挂载 `settings.section`，与 `dsh-purge`、`dshmarket`、`cc-safety-net` 等 Top 27 插件零冲突共存）。
@@ -49,7 +57,7 @@ dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.1.0.tgz
 
 ---
 
-## 二、WSL Manager 迁移实例、配置文件夹权限隔离与物理硬件/驱动说明
+## 二、WSL Manager 迁移实例、配置隔离、物理硬件驱动与 SSD 友好型日志系统
 
 ### 1. WSL Manager 导入/导出与磁盘迁移兼容（零资源管理器依赖、零文件夹占用）
 - 使用 **WSL Manager** 等工具导入/导出并迁移 VHDX 磁盘到 `D:\WSL` / `E:\WSL` 后，该实例常会从 Windows 资源管理器左侧「Linux」导航栏消失，但仍正常注册在 `wsl.exe -l -v` 与 `HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss` 注册表项下。
@@ -82,22 +90,34 @@ dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.1.0.tgz
   - 手机解 Bootloader / 原厂线刷工具（依赖 Windows WinUSB/OEM 驱动）或 Windows 免驱但缺少 Linux/WSL 2 `.ko` 驱动模块的 USB 网卡，建议直接留在 Windows 宿主侧调用原厂驱动（`fastboot`/`adb`/`pnputil`/`NetAdapter` 等变更操作均受本插件 L3 硬件单次审批锁保护，绝不自动放行）。
   - 仅依赖用户态 `libusb`（`/dev/bus/usb/NNN/NNN`）或内核已有驱动的设备，可通过 `usbipd attach --wsl` 挂载进 WSL 2 并按节点显式放行。
 
+### 6. SSD 友好型合并刷盘结构化日志系统（保护固态硬盘寿命、零句柄锁）
+- 日志位置：`%USERPROFILE%\.dsh\dsh-wsl-sandbox\logs\host.ndjson`（可在控制台 **「运行日志」** 标签页实时筛选、导出、清空或切换 `debug|info|warn|error` 级别）。
+- **五大护盘设计**：
+  1. **内存合并批量刷盘（`2.5s` / `64 KiB`）**：日志先进入内存缓冲区，最多每 `2.5 秒` 合并成单次 `open -> write -> close` 原子批量写入，杜绝每条日志触发一次小块随机写放大。
+  2. **空闲零文件句柄占用**：平时不持有任何打开的文件描述符（`0` open FD），随时卸载插件或删除目录均不报 Windows 文件夹占用。
+  3. **重复风暴折叠（`3s` 窗口）与写盘硬限流（`120 条/10s`）**：高频相同告警自动折叠为 1 条主记录 + 1 条汇总计数，极端 `debug` 洪峰下严格限制磁盘写入速率。
+  4. **单边落盘 + 滚动限额（`5 MiB × 3`）**：WSL Runner 日志通过内存管道汇总至宿主统一落盘，不在 WSL `ext4.vhdx` 虚拟磁盘内二次写文件；总日志体积硬上限 `15 MiB`。
+  5. **全内存查询与敏感信息脱敏**：Web UI 轮询 `/wsl-sandbox/api/logs` 100% 从内存环形缓冲区返回（**`0` 次磁盘读取**，切到后台标签页自动暂停轮询），并自动脱敏 `API_KEY`、`TOKEN`、`Bearer`、`sk-...`、`ghp_...` 等密钥。
+
 ---
 
-## 三、通过 GitHub Desktop 或命令行推送到 GitHub 公开仓库
+## 三、通过 GitHub Desktop 或命令行提交独立版本 PR（`release/v0.2.0` -> `main`）
 
-### 方式 1：GitHub Desktop 零命令直接推送（推荐）
+### 方式 1：GitHub Desktop 零命令创建 PR（推荐）
 1. 解压 `dsh-wsl-sandbox-github-desktop.zip` 到本地目录。
 2. 打开 **GitHub Desktop** -> `File` -> `Add local repository...` -> 选择解压出来的 `dsh-wsl-sandbox` 文件夹。
-3. 确认顶部显示 `Push origin`（基于 `origin/main` 干净 fast-forward 提交），直接点击 **`Push origin`** 即可完成推送。
+3. 顶部当前分支已自动切好在独立分支 **`release/v0.2.0`**（基于线上 `origin/main` 分叉，无任何冲突）：
+   - 点击顶部 **`Publish branch`** 推送 `release/v0.2.0` 分支；
+   - 紧接着点击 **`Preview Pull Request` / `Create Pull Request`**，即可在 GitHub 网页一键发起 `release/v0.2.0 -> main` 的独立版本 PR。
 
-### 方式 2：使用 `dsh-wsl-sandbox-main.bundle`
+### 方式 2：使用 `dsh-wsl-sandbox-v0.2.0.bundle` 命令行推送分支提 PR
 ```zsh
-git clone dsh-wsl-sandbox-main.bundle dsh-wsl-sandbox
-cd dsh-wsl-sandbox
-git checkout -B main
+git clone dsh-wsl-sandbox-v0.2.0.bundle dsh-wsl-sandbox-pr
+cd dsh-wsl-sandbox-pr
+git checkout release/v0.2.0
 git remote set-url origin https://github.com/mrunbengable2233-lgtm/dsh-wsl-sandbox.git
-git push -u origin main
+git push -u origin release/v0.2.0
+# 推送后打开提示的 GitHub Pull Request 链接点击 Create pull request 即可
 ```
 
 ---
@@ -115,3 +135,4 @@ npm publish --access public
 dsh plugin --profile web add dsh-wsl-sandbox
 dsh plugin --profile desktop add dsh-wsl-sandbox
 ```
+

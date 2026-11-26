@@ -8,10 +8,10 @@
 
 你现在负责在用户的 Windows 笔记本上，为 `dsh-wsl-sandbox` 插件配置一个安全、轻快、可验证的 WSL 2 沙盒环境。严格遵守以下 6 条红线：
 
-1. **禁止重构建**：绝不在笔记本上构建 Docker 镜像、绝不编译 Linux 内核、绝不使用 `pyenv` 源码编译 Python。一律使用任意已注册的 WSL 2 发行版（Ubuntu 26.04/24.04/22.04、Debian、Fedora、Arch、openSUSE、Alpine，以及通过 WSL Manager 导入/迁移磁盘的自定义实例）+ 预编译二进制包（系统包管理器、预编译 Node 22、Astral `uv`、官方 Go tarball、`rustup --profile minimal`）。
+1. **禁止重构建**：绝不在笔记本上构建 Docker 镜像、绝不编译 Linux 内核、绝不使用 `pyenv` 源码编译 Python。一律使用任意已注册的 WSL 2 发行版（Ubuntu 26.04/24.04/22.04、Debian、Fedora、Arch、openSUSE、Alpine，以及通过 WSL Manager 导入/迁移磁盘的自定义实例）+ 预编译二进制包（系统包管理器、优先复用已有 Linux Node `>=22` 或安装预编译 Node 24 Active LTS、Astral `uv`、官方 Go tarball、`rustup --profile minimal`）。
 2. **先探测、后确认、再安装**：先执行只读探测（同时检查 `wsl.exe -l -v` 与只读 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*`，确保能识别经 WSL Manager 导入/迁移 VHDX 且从资源管理器左侧消失的实例），向用户展示发现结果和计划安装的档位、体积与镜像/代理方案，**获得用户明确确认后**才执行安装命令。
 3. **禁止私改共享系统配置 & 禁止使用 `wsl --shutdown`**：Windows 官方 **WSL Settings** 与第三方 **WSL Manager** 共享同一套 `/etc/wsl.conf` 与 `%USERPROFILE%\.wslconfig`。严禁自动修改它们；任何配置备份以只读权限 (`0400`/`+R`) 保存到受保护目录（严禁指向 `%USERPROFILE%`、`~/.dsh` 或 VHDX `BasePath`）。如确需重启目标发行版，一律只用 `wsl.exe --terminate <目标发行版>`，**严禁使用 `wsl.exe --shutdown`** 以免关掉其他 WSL 会话！
-4. **原生 ext4 落地（零 `/mnt` 依赖、零 Windows 文件夹占用）**：使用 `node scripts/stage-wsl-runner.mjs --distro <目标发行版>` 将 Runner 与安装脚本部署到 WSL 原生 `$HOME/.local/share/dsh-wsl-sandbox/runner/`，既兼容 `[automount] enabled = false`，又避免卸载/禁用插件时出现不可解除的文件夹占用。
+4. **原生 ext4 落地（零 `/mnt` 依赖、零 Windows 文件夹占用）**：使用 `node scripts/stage-wsl-runner.mjs --distro <目标发行版>`（或脚本内置免安装复用宿主 DSH Node / `tar.exe` 通道）将 Runner 与安装脚本部署到 WSL 原生 `$HOME/.local/share/dsh-wsl-sandbox/runner/`，既兼容 `[automount] enabled = false`，又避免卸载/禁用插件时出现不可解除的文件夹占用。
 5. **必须非 root 运行**：确认目标发行版存在并默认使用非 root 普通用户（`uid > 0`），绝不以 `root` 作为日常沙盒执行身份。
 6. **以 `dsh-wsl-doctor --profile <所选档位>` 实测为准**：安装完成后必须运行 `dsh-wsl-doctor --strict-wsl2 --profile <所选档位> --json`，逐项核验 `WSL 2`、`uid > 0`、`bwrap`、`unprivileged userns`、`seccomp`（`AF_VSOCK` & `io_uring` EPERM）、`/mnt` 与 `~/.dsh`/`~/.config/dsh-wsl-sandbox` 遮蔽自检全绿后才宣告完成；如遇 AppArmor 限制无特权 userns，禁止降级裸跑，给出精确修复命令请用户确认。
 
@@ -26,9 +26,9 @@
 3. 向用户确认 3 个选项：
    - **目标发行版**：复用现有任意 WSL 2 发行版（含 WSL Manager 迁移实例），还是安装干净的官方新发行版（默认推荐 `Ubuntu-26.04`，也可选 `Ubuntu-24.04`、`Debian`、`FedoraLinux-42`、`Arch`、`kali-linux` 等）？
    - **环境档位（真正按档位安装并持久化到 `profile.json`）**：
-     - `core`（~350MB，约 2 分钟）：`bwrap` + `prlimit` + `socat` + Codex 高频 CLI（`git`/`rg`/`fd`/`jq`/`sqlite3`/`rsync`/`ctags` 等）+ C/C++ 基础 + `python3` + Node 22。
+     - `core`（~350MB，约 2 分钟）：`bwrap` + `prlimit` + `socat` + Codex 高频 CLI（`git`/`rg`/`fd`/`jq`/`sqlite3`/`rsync`/`ctags` 等）+ C/C++ 基础 + `python3` + 共用已有 Linux Node `>=22`（若无则装 Node 24 Active LTS）。
      - `standard`（~1.2GB，推荐）：`core` + `ccache`/`protobuf`/`libpq`/`libxml2` + `mise` + `uv`/`pytest`/`ruff`/`mypy`/`pyright`/`black` + `pnpm`/`yarn`/`bun`/`typescript`/`eslint`/`prettier` + Go/`golangci-lint` + Rust（`rustc`/`cargo`/`rustfmt`/`clippy`）。
-     - `universal`（~3.5GB，纯预编译二进制）：`standard` + `clang`/`clang-format`/`clang-tidy` + `bazelisk` + `mise` Node 20/22/24 + `poetry`/`isort` + OpenJDK 21 + `maven`/`gradle` + `ruby` + `php-cli`/`composer`。
+     - `universal`（~3.5GB，纯预编译二进制）：`standard` + `clang`/`clang-format`/`clang-tidy` + `bazelisk` + `mise` Node 22/24 LTS（默认 `node@24`）+ `poetry`/`isort` + OpenJDK 21 + `maven`/`gradle` + `ruby` + `php-cli`/`composer`。
    - **国内网络加速**：是否开启 `--mirror cn`（清华 APT/PyPI、`UV_PYTHON_INSTALL_MIRROR`、`npmmirror`、`goproxy.cn`、`rsproxy.cn`），以及是否需要透传宿主机本地代理（例如 `http://127.0.0.1:7890`）？
 
 #### 第二步：原生 ext4 部署与分步幂等安装（每步可断点续跑）

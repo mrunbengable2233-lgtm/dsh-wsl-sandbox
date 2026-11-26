@@ -8,7 +8,7 @@ Instead of building multi-GB Docker images or compiling Linux kernels locally on
 2. **Agent-Guided Step-by-Step Provisioning (`dsh-wsl-env-setup` Skill + Prompt Injection)**:
    - Ships a dedicated **Setup Skill & Prompt** (`.agents/skills/dsh-wsl-env-setup/SKILL.md` + `packages/bootstrap/prompts/wsl-env-setup.md`).
    - During initial environment setup, the user invokes the Agent with this Skill/Prompt; the Agent runs **read-only probes first** (`wsl -l -v`, `dsh-wsl-doctor --profile <core|standard|universal> --json`), checks proxy & China mirror preference, asks the user to choose profile (`core` / `standard` / `universal`), and executes **small, idempotent, resumable install steps** (each individually visible and confirmable by the user), finishing with `dsh-wsl-doctor --profile <chosen>` verification!
-   - **Prebuilt binaries only** (`apt`/`dnf`/`pacman`/`zypper`/`apk`, official Go tarball, `rustup` binary, `uv` binary, NodeSource/`mise` prebuilt Node 22) — **NEVER** compiles Python from source via `pyenv` or compiles kernels/LLVM on the user's laptop!
+   - **Prebuilt binaries only** (`apt`/`dnf`/`pacman`/`zypper`/`apk`, official Go tarball, `rustup` binary, `uv` binary, NodeSource/`mise` prebuilt Node 24 Active LTS — reusing any existing Linux Node `>=22` without duplicate installs) — **NEVER** compiles Python from source via `pyenv` or compiles kernels/LLVM on the user's laptop!
 3. **Optional Direct CLI Fallback (`provision-wsl.sh`)**:
    - The exact same idempotent steps are packaged in `packages/bootstrap/provision-wsl.sh --profile core|standard|universal [--mirror cn] [--proxy http://...] [--step base|cli|python|node|go|rust|go-rust|extra]` so either the Agent or the user can run single steps or the full profile cleanly. Selected profile is persisted to `~/.config/dsh-wsl-sandbox/profile.json` (`0600`) and `~/.dsh-wsl-env.sh` (`0600`).
 
@@ -21,7 +21,7 @@ Instead of building multi-GB Docker images or compiling Linux kernels locally on
 | **C/C++ Build** | `build-essential`, `pkg-config`, `cmake`, `ninja-build`, `libssl-dev`, `zlib1g-dev`, `libffi-dev`, `libsqlite3-dev` | `core` + `ccache`, `protobuf-compiler`, `libpq-dev`, `libxml2-dev` | `standard` + `clang`, `clang-format`, `clang-tidy` (apt prebuilt, NO source build), `bazelisk` |
 | **Version Manager** | — | `mise` (apt/prebuilt binary) | `mise` |
 | **Python (Binary-Only, NO pyenv compile!)** | System `python3` (3.12) + `python3-venv` | `core` + **`uv`** (handles fast prebuilt multi-Python downloads when needed!), `pytest`, `ruff`, `mypy`, `pyright`, `black` (installed via `uv tool install`) | `standard` + `poetry`, `isort` |
-| **Node / TS** | Node.js 22 LTS (prebuilt binary via NodeSource or `mise`) | Node 22 + `pnpm`, `yarn` (corepack), `bun`, `typescript`, `eslint`, `prettier` | Node 20/22/24 prebuilt via `mise` + full tools |
+| **Node / TS (Shared Runtime)** | Reuses existing Linux Node `>=22` or installs prebuilt **Node.js 24 Active LTS** (NodeSource/`mise`) | Shared Node `>=22` / 24 LTS + `pnpm`, `yarn` (corepack), `bun`, `typescript`, `eslint`, `prettier` | Prebuilt Node 22 + 24 LTS via `mise` (default `node@24`) + full tools |
 | **Go / Rust** | — | Prebuilt Go latest + `golangci-lint`; prebuilt Rust stable (`rustup --profile minimal` + `rustfmt` + `clippy`) | `standard` |
 | **Extended (Prebuilt Only)** | — | — | OpenJDK 21 (`openjdk-21-jdk-headless`) + `maven` + `gradle`, `ruby`, `php-cli` + `composer` |
 
