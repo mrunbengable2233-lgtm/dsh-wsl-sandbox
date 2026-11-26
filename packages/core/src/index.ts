@@ -9,3 +9,5 @@ export * from './pwsh-guard.ts';
 export * from './approval-controller.ts';
 export * from './uds-proxy.ts';
 export * from './protocol.ts';
+export * from './logger.ts';
+export * from './node-runtime.ts';

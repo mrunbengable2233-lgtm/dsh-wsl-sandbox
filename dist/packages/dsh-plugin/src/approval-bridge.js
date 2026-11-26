@@ -10,7 +10,9 @@ import {
                                
   failSandbox,
                       
+                        
 } from '../../core/src/index.js';
+                                                     
                                                                               
 
                                    
@@ -37,9 +39,11 @@ import {
  
 
                                         
-                                                   
+                                                    
+                                     
                           
                                              
+                                     
                                                                                                            
                                              
                                                              
@@ -67,6 +71,7 @@ export class ApprovalBridge {
                    controller                    ;
                    getPolicyMode                          ;
           hostApproval                     ;
+                   logger                   ;
                    bypassInstantThresholdMs        ;
                    onPendingAdded                                   ;
                    onPendingResolved                                                                          ;
@@ -75,15 +80,31 @@ export class ApprovalBridge {
                    requestMeta = new Map                              ();
 
   constructor(options                       ) {
-    this.getPolicyMode = options.getPolicyMode;
+    this.getPolicyMode =
+      options.getPolicyMode ??
+      (options.configStore ? () => options.configStore .get().approvalPolicyMode : () => 'balanced');
     this.hostApproval = options.hostApproval;
+    this.logger = options.logger;
     this.bypassInstantThresholdMs = options.bypassInstantThresholdMs ?? 15;
     this.onPendingAdded = options.onPendingAdded;
     this.onPendingResolved = options.onPendingResolved;
 
     this.controller = new ApprovalController({
-      ttlMs: options.ttlMs ?? 60_000,
-      onAudit: options.onAudit,
+      ttlMs: options.ttlMs ?? options.configStore?.get().approvalTimeoutMs ?? 60_000,
+      onAudit: (rec) => {
+        options.onAudit?.(rec);
+        const outcome = String(rec.outcome ?? 'unknown');
+        this.logger?.log(outcome.startsWith('allowed') ? 'info' : 'warn', {
+          component: 'approval',
+          event: 'approval.audit',
+          message: `Approval ${outcome} for ${rec.kind}: ${rec.summary}`,
+          data: {
+            requestId: rec.requestId,
+            kind: rec.kind,
+            outcome,
+          },
+        });
+      },
       reviewer: (envelope) => this.reviewEnvelope(envelope),
     });
   }
@@ -348,6 +369,20 @@ export class ApprovalBridge {
         },
       });
 
+      this.logger?.log(routedViaFallback ? 'warn' : 'info', {
+        component: 'approval',
+        event: routedViaFallback ? 'approval.bypassCaught' : 'approval.queued',
+        message: routedViaFallback
+          ? `Caught unverified/bypassed host approval; routed '${item.summary}' to independent human queue`
+          : `Queued '${item.summary}' for human approval`,
+        sessionId: envelope.binding.sessionId,
+        data: {
+          requestId: item.requestId,
+          kind: item.kind,
+          touchesPhysicalDevice: item.touchesPhysicalDevice,
+          routedViaFallback,
+        },
+      });
       this.onPendingAdded?.(item);
     });
   }

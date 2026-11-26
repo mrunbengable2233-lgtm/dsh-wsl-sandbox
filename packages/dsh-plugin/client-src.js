@@ -24,6 +24,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
     tabBasic: "基础策略",
     tabAdvanced: "共享与硬件",
     tabDoctor: "内核体检",
+    tabLogs: "运行日志",
     tabAudit: "审计明细",
     offlineHint: "当前宿主未挂载 HTTP 控制面（如纯离线 Desktop 模式），配置存储于 ~/.dsh/dsh-wsl-sandbox/config.json。"
   };
@@ -40,6 +41,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
     tabBasic: "Basic Policy",
     tabAdvanced: "Shares & Hardware",
     tabDoctor: "WSL Doctor",
+    tabLogs: "Logs",
     tabAudit: "Audit Log",
     offlineHint: "HTTP control surface not mounted on this host; config is persisted at ~/.dsh/dsh-wsl-sandbox/config.json."
   };
@@ -105,9 +107,14 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
   function WslSandboxSection() {
     var _tab = useState("status"), tab = _tab[0], setTab = _tab[1];
     var _cfg = useState(null), cfg = _cfg[0], setCfg = _cfg[1];
+    var _nodeRt = useState(null), nodeRt = _nodeRt[0], setNodeRt = _nodeRt[1];
     var _pending = useState([]), pending = _pending[0], setPending = _pending[1];
     var _rules = useState([]), rules = _rules[0], setRules = _rules[1];
     var _audit = useState([]), audit = _audit[0], setAudit = _audit[1];
+    var _logs = useState([]), logs = _logs[0], setLogs = _logs[1];
+    var _logStats = useState(null), logStats = _logStats[0], setLogStats = _logStats[1];
+    var _logLvl = useState("info"), logLvl = _logLvl[0], setLogLvl = _logLvl[1];
+    var _logQ = useState(""), logQ = _logQ[0], setLogQ = _logQ[1];
     var _doc = useState(null), doc = _doc[0], setDoc = _doc[1];
     var _notice = useState(""), notice = _notice[0], setNotice = _notice[1];
     var _unavail = useState(false), unavail = _unavail[0], setUnavail = _unavail[1];
@@ -119,24 +126,44 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
     var _bkItems = useState([]), bkItems = _bkItems[0], setBkItems = _bkItems[1];
     var _distros = useState([]), distros = _distros[0], setDistros = _distros[1];
 
+    var loadBackups = useCallback(function () {
+      apiFetch("GET", "/wsl-sandbox/api/wsl-config/backups")
+        .then(function (r) {
+          if (r && r.ok) {
+            setBkItems(r.items || []);
+            if (!bkDirty && r.backupDir) setBkDir(r.backupDir);
+          }
+        })
+        .catch(function () {});
+    }, [bkDirty]);
+
+    var loadLogs = useCallback(function () {
+      var qs = "?level=" + encodeURIComponent(logLvl) + (logQ ? "&search=" + encodeURIComponent(logQ) : "") + "&limit=150";
+      apiFetch("GET", "/wsl-sandbox/api/logs" + qs)
+        .then(function (r) {
+          if (r && r.ok) {
+            setLogs(r.entries || []);
+            setLogStats(r.stats || null);
+          }
+        })
+        .catch(function () {});
+    }, [logLvl, logQ]);
+
     var reload = useCallback(function () {
       Promise.all([
         apiFetch("GET", "/wsl-sandbox/api/status"),
         apiFetch("GET", "/wsl-sandbox/api/approvals"),
-        apiFetch("GET", "/wsl-sandbox/api/audit"),
-        apiFetch("GET", "/wsl-sandbox/api/wsl-config/backups")
+        apiFetch("GET", "/wsl-sandbox/api/audit")
       ])
         .then(function (res) {
           if (res[0] && res[0].ok) {
             setUnavail(false);
             setCfg(res[0].config);
+            setNodeRt(res[0].nodeRuntime || null);
             setPending((res[1] && res[1].pending) || []);
             setRules((res[1] && res[1].sessionRules) || []);
             setAudit((res[2] && res[2].records) || []);
-            if (res[3] && res[3].ok) {
-              setBkItems(res[3].items || []);
-              if (!bkDirty) setBkDir(res[3].backupDir || res[0].config.backupDir || "");
-            }
+            if (!bkDirty && !bkDir && res[0].config.backupDir) setBkDir(res[0].config.backupDir);
           } else {
             setUnavail(true);
           }
@@ -144,7 +171,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         .catch(function () {
           setUnavail(true);
         });
-    }, [bkDirty]);
+    }, [bkDirty, bkDir]);
 
     var loadDistros = useCallback(function (notify) {
       apiFetch("GET", "/wsl-sandbox/api/distros")
@@ -160,12 +187,21 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
 
     useEffect(function () {
       reload();
+      loadBackups();
       loadDistros(false);
-      var timer = setInterval(reload, 4000);
+      var timer = setInterval(function () {
+        if (typeof document !== "undefined" && document.hidden) return;
+        reload();
+        if (tab === "logs") loadLogs();
+      }, 5000);
       return function () {
         clearInterval(timer);
       };
-    }, [reload, loadDistros]);
+    }, [reload, loadBackups, loadDistros, tab, loadLogs]);
+
+    useEffect(function () {
+      if (tab === "logs") loadLogs();
+    }, [tab, loadLogs]);
 
     function updateField(k, v) {
       if (!cfg) return;
@@ -214,6 +250,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         upstreamProxy: cfg.upstreamProxy || "",
         mirrorCn: Boolean(cfg.mirrorCn),
         cacheMode: cfg.cacheMode,
+        logLevel: cfg.logLevel || "info",
         enablePwshGuard: Boolean(cfg.enablePwshGuard),
         enablePromptInjection: Boolean(cfg.enablePromptInjection),
         unmaskedEnvWorkspaces: cfg.unmaskedEnvWorkspaces || [],
@@ -294,10 +331,18 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
           setBkDirty(false);
           setBkDir(r.selectedDir);
           setNotice("已选择自定义备份目录: " + r.selectedDir);
+          loadBackups();
           reload();
         } else if (r && r.message) {
           setNotice(r.message);
         }
+      });
+    }
+
+    function clearAllLogs() {
+      apiFetch("DELETE", "/wsl-sandbox/api/logs").then(function () {
+        setNotice("已清空内存与本地轮转日志。");
+        loadLogs();
       });
     }
 
@@ -338,6 +383,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
           ["basic", "基础策略"],
           ["advanced", "共享与硬件"],
           ["doctor", "内核体检"],
+          ["logs", "运行日志"],
           ["audit", "审计明细"]
         ].map(function (pair) {
           return h(
@@ -356,6 +402,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         { className: "dsh-wsl-native-tel" },
         h("span", null, "受控发行版 ", h("b", { className: "dsh-wsl-native-mono" }, cfg.distro + " · " + (cfg.environmentProfile || "standard"))),
         h("span", null, "工作区 ", h("b", { className: "dsh-wsl-native-mono" }, cfg.workspaceRoot)),
+        h("span", null, "共用 Node ", h("b", { className: "dsh-wsl-native-mono" }, "Host " + ((nodeRt && nodeRt.hostNodeVersion) || "-") + ((nodeRt && nodeRt.wslNodeVersion) ? (" / WSL " + nodeRt.wslNodeVersion) : " (DSH 进程共用)"))),
         h("span", null, "隔离层级 ", h("b", null, cfg.enabled ? "bwrap + seccomp + 单壳防呆" : "已停用")),
         h("span", null, "配置状态 ", h("b", null, "已生效"))
       ),
@@ -610,7 +657,20 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
                 h("div", null, h("div", null, "沙箱模式"), h("select", { className: "dsh-wsl-native-in", value: cfg.sandboxMode, onChange: function (e) { updateField("sandboxMode", e.target.value); } }, h("option", { value: "workspace-write" }, "workspace-write"), h("option", { value: "read-only" }, "read-only"))),
                 h("div", null, h("div", null, "审批策略"), h("select", { className: "dsh-wsl-native-in", value: cfg.approvalPolicyMode, onChange: function (e) { updateField("approvalPolicyMode", e.target.value); } }, h("option", { value: "balanced" }, "balanced"), h("option", { value: "strict" }, "strict"), h("option", { value: "trust-workspace" }, "trust-workspace"))),
                 h("div", null, h("div", null, "网络隔离模式"), h("select", { className: "dsh-wsl-native-in", value: cfg.networkMode, onChange: function (e) { updateField("networkMode", e.target.value); } }, h("option", { value: "allowlist-proxy" }, "allowlist-proxy"), h("option", { value: "offline" }, "offline"))),
-                h("div", { style: { gridColumn: "1 / -1" } }, h("div", null, "上游代理"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.upstreamProxy || "", onChange: function (e) { updateField("upstreamProxy", e.target.value); } }))
+                h(
+                  "div",
+                  null,
+                  h("div", null, "运行日志级别 (2.5s 合并落盘)"),
+                  h(
+                    "select",
+                    { className: "dsh-wsl-native-in", value: cfg.logLevel || "info", onChange: function (e) { updateField("logLevel", e.target.value); } },
+                    h("option", { value: "info" }, "info (默认推荐)"),
+                    h("option", { value: "warn" }, "warn (仅告警)"),
+                    h("option", { value: "error" }, "error (仅错误)"),
+                    h("option", { value: "debug" }, "debug (排障)")
+                  )
+                ),
+                h("div", null, h("div", null, "上游代理"), h("input", { className: "dsh-wsl-native-in dsh-wsl-native-mono", value: cfg.upstreamProxy || "", onChange: function (e) { updateField("upstreamProxy", e.target.value); } }))
               )
             )
           : null,
@@ -630,6 +690,65 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
               doc
                 ? h("pre", { className: "dsh-wsl-native-in dsh-wsl-native-mono", style: { maxHeight: "300px", overflow: "auto" } }, JSON.stringify(doc, null, 2))
                 : null
+            )
+          : null,
+        tab === "logs"
+          ? h(
+              "div",
+              null,
+              h(
+                "div",
+                { className: "dsh-wsl-native-card", style: { marginBottom: "10px" } },
+                h(
+                  "div",
+                  { style: { display: "flex", gap: "8px", flexWrap: "wrap", marginBottom: "8px" } },
+                  h(
+                    "select",
+                    {
+                      className: "dsh-wsl-native-in",
+                      style: { width: "130px" },
+                      value: logLvl,
+                      onChange: function (e) { setLogLvl(e.target.value); }
+                    },
+                    h("option", { value: "debug" }, "全部级别"),
+                    h("option", { value: "info" }, "INFO 及以上"),
+                    h("option", { value: "warn" }, "WARN 及以上"),
+                    h("option", { value: "error" }, "仅 ERROR")
+                  ),
+                  h("input", {
+                    className: "dsh-wsl-native-in dsh-wsl-native-mono",
+                    style: { flex: "1", minWidth: "180px" },
+                    placeholder: "过滤事件或关键字...",
+                    value: logQ,
+                    onChange: function (e) { setLogQ(e.target.value); }
+                  }),
+                  h("button", { className: "dsh-wsl-native-btn", onClick: loadLogs }, "刷新"),
+                  h("a", { className: "dsh-wsl-native-btn", style: { textDecoration: "none" }, href: "/wsl-sandbox/api/logs/export", target: "_blank", rel: "noreferrer" }, "导出 NDJSON"),
+                  h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-out-red", onClick: clearAllLogs }, "清空日志")
+                ),
+                h(
+                  "div",
+                  { className: "dsh-wsl-native-mono", style: { fontSize: "11.5px", color: "#9498a3" } },
+                  "纯内存读取零读盘 · 累计合并落盘 " + ((logStats && logStats.diskFlushCount) || 0) + " 次 · 文件: " + ((logStats && logStats.logFilePath) || "内存模式")
+                )
+              ),
+              h(
+                "div",
+                { className: "dsh-wsl-native-card", style: { maxHeight: "340px", overflow: "auto" } },
+                logs.length === 0
+                  ? h("div", { style: { color: "#9498a3" } }, "暂无匹配日志。")
+                  : logs.slice().reverse().map(function (e) {
+                      var col = e.level === "error" ? "#e06c65" : (e.level === "warn" ? "#f59e0b" : (e.level === "info" ? "#60a5fa" : "#9498a3"));
+                      return h(
+                        "div",
+                        { key: e.seq, className: "dsh-wsl-native-mono", style: { padding: "5px 0", borderBottom: "1px solid rgba(255,255,255,0.05)", fontSize: "12px" } },
+                        h("span", { style: { color: "#9498a3" } }, String(e.timestamp || "").replace("T", " ").slice(0, 19) + " "),
+                        h("span", { style: { color: col, fontWeight: 600 } }, "[" + String(e.level || "").toUpperCase() + "] "),
+                        h("span", { style: { color: "#9498a3" } }, e.source + ":" + e.component + " (" + e.event + ") "),
+                        h("span", null, e.message)
+                      );
+                    })
+              )
             )
           : null,
         tab === "audit"

@@ -159,6 +159,7 @@ function evaluateByKind(kind               , command        )                   
                                              
                                                      
                                           
+                                                                       
  
 
 /**
@@ -188,6 +189,12 @@ export function registerHostPwshGuardHook(
 
       const verdict = evaluateByKind(kind, command);
       if (verdict?.decision === 'deny') {
+        options.logger?.log('warn', {
+          component: 'pwsh-guard',
+          event: 'pwshGuard.deny',
+          message: `Blocked host shell '${toolName}' at L0 monotonic guard: ${verdict.reasons.join('; ')}`,
+          data: { toolName, kind, riskLevel: verdict.riskLevel, reasons: verdict.reasons },
+        });
         return {
           reason: `Host shell command blocked by dsh-wsl-sandbox policy: ${verdict.reasons.join('; ')}`,
           info: {
@@ -235,6 +242,12 @@ export function registerHostPwshGuardHook(
         }
 
         if (verdict.decision === 'deny') {
+          options.logger?.log('warn', {
+            component: 'pwsh-guard',
+            event: 'pwshGuard.deny',
+            message: `Blocked host shell '${toolName}' at L0 pre-execute: ${verdict.reasons.join('; ')}`,
+            data: { toolName, kind, riskLevel: verdict.riskLevel, reasons: verdict.reasons },
+          });
           const message = `Host shell command blocked by dsh-wsl-sandbox L0 policy: ${verdict.reasons.join('; ')}`;
           if (isRealDshExec) {
             return {

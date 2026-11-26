@@ -1,0 +1,22 @@
+# Keep working-tree bytes identical across Windows (core.autocrlf=true), WSL 2, and macOS
+# so extracting the repository archive on Windows leaves a 100% clean `git status` and
+# prevents CRLF from ever breaking `/usr/bin/env bash` scripts inside WSL 2.
+* text=auto eol=lf
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.ts text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.md text eol=lf
+*.ini text eol=lf
+*.svg text eol=lf
+
+# Binary archives
+*.tgz binary
+*.gz binary
+*.zip binary
+*.bundle binary

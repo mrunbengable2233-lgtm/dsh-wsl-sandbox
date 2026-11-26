@@ -11,11 +11,14 @@ import {
   type EnvironmentProfile,
   failSandbox,
   isValidIdentifier,
+  isValidLogLevel,
+  type LogLevel,
   type NetworkMode,
   parseIpv4Cidr,
   type SandboxMode,
   validateDeviceNode,
   validateShareEntry,
+  validateWslNodeExecutable,
   validateWorkspaceRoot,
 } from '../../core/src/index.ts';
 
@@ -40,6 +43,8 @@ export interface WslSandboxConfig {
   readonly username?: string;
   readonly workspaceRoot: string;
   readonly runnerPath: string;
+  /** Optional custom Linux Node binary inside WSL ('auto' shares DSH/mise/nvm/system Node). */
+  readonly wslNodePath?: string;
   /** Selected Codex-aligned binary toolchain profile (`core` / `standard` / `universal`). */
   readonly environmentProfile: EnvironmentProfile;
   readonly sandboxMode: SandboxMode;
@@ -48,6 +53,8 @@ export interface WslSandboxConfig {
   readonly upstreamProxy: string;
   readonly mirrorCn: boolean;
   readonly cacheMode: CacheMode;
+  /** Structured logging level (`debug` | `info` | `warn` | `error`, default `info`). */
+  readonly logLevel: LogLevel;
   readonly approvalTimeoutMs: number;
   readonly enablePwshGuard: boolean;
   readonly enablePromptInjection: boolean;
@@ -67,6 +74,7 @@ export type BasicConfigPatch = Partial<
     | 'username'
     | 'workspaceRoot'
     | 'runnerPath'
+    | 'wslNodePath'
     | 'environmentProfile'
     | 'sandboxMode'
     | 'approvalPolicyMode'
@@ -74,6 +82,7 @@ export type BasicConfigPatch = Partial<
     | 'upstreamProxy'
     | 'mirrorCn'
     | 'cacheMode'
+    | 'logLevel'
     | 'approvalTimeoutMs'
     | 'enablePwshGuard'
     | 'enablePromptInjection'
@@ -102,6 +111,10 @@ export function getDefaultConfigPath(dshHome?: string): string {
 
 export function getDefaultBackupDir(dshHome?: string): string {
   return path.join(getDefaultConfigDir(dshHome), 'backups');
+}
+
+export function getDefaultLogDir(dshHome?: string): string {
+  return path.join(getDefaultConfigDir(dshHome), 'logs');
 }
 
 /**
@@ -212,6 +225,24 @@ function inferDefaultLinuxUser(): string {
   return 'dev';
 }
 
+function resolveDefaultRunnerPath(isWin: boolean, defaultUser: string): string {
+  const stagedPath = `/home/${defaultUser}/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js`;
+  if (isWin) return stagedPath;
+  if (fs.existsSync(stagedPath)) return stagedPath;
+
+  const localCandidates = [
+    path.resolve(import.meta.dirname, '../../wsl-runner/src/main.js'),
+    path.resolve(import.meta.dirname, '../../../dist/packages/wsl-runner/src/main.js'),
+    path.resolve(import.meta.dirname, '../../wsl-runner/src/main.ts'),
+  ];
+  for (const candidate of localCandidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return stagedPath;
+}
+
 export function createDefaultConfig(overrides?: Partial<WslSandboxConfig>): WslSandboxConfig {
   const isWin = process.platform === 'win32';
   const defaultUser = inferDefaultLinuxUser();
@@ -223,7 +254,8 @@ export function createDefaultConfig(overrides?: Partial<WslSandboxConfig>): WslS
     // on native Linux devbox: uses WSL_DISTRO_NAME if inside WSL or 'local-linux'.
     distro: isWin ? 'Ubuntu-26.04' : (process.env.WSL_DISTRO_NAME || 'local-linux'),
     workspaceRoot: `/home/${defaultUser}/workspace`,
-    runnerPath: `/home/${defaultUser}/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js`,
+    runnerPath: resolveDefaultRunnerPath(isWin, defaultUser),
+    wslNodePath: 'auto',
     environmentProfile: 'standard',
     sandboxMode: 'workspace-write',
     approvalPolicyMode: 'balanced',
@@ -231,6 +263,7 @@ export function createDefaultConfig(overrides?: Partial<WslSandboxConfig>): WslS
     upstreamProxy: '',
     mirrorCn: false,
     cacheMode: 'workspace-persistent',
+    logLevel: 'info',
     approvalTimeoutMs: 60_000,
     enablePwshGuard: true,
     enablePromptInjection: true,
@@ -305,10 +338,15 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
   if (!VALID_CACHE_MODES.has(raw.cacheMode)) {
     failSandbox('INVALID_SETUP', `Invalid cacheMode: ${String(raw.cacheMode)}`);
   }
+  const logLevel: LogLevel = raw.logLevel ?? 'info';
+  if (!isValidLogLevel(logLevel)) {
+    failSandbox('INVALID_SETUP', `Invalid logLevel: ${String(logLevel)}`);
+  }
   if (!Number.isSafeInteger(raw.approvalTimeoutMs) || raw.approvalTimeoutMs < 1000 || raw.approvalTimeoutMs > 600_000) {
     failSandbox('INVALID_SETUP', `Invalid approvalTimeoutMs: ${raw.approvalTimeoutMs}`);
   }
 
+  const wslNodePath = validateWslNodeExecutable(raw.wslNodePath);
   const upstreamProxy = validateUpstreamProxy(raw.upstreamProxy ?? '');
   const shares = (raw.advanced?.shares ?? []).map(validateShareEntry);
   const deviceNodes = (raw.advanced?.deviceNodes ?? []).map(validateDeviceNode);
@@ -333,7 +371,9 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
 
   return {
     ...raw,
+    wslNodePath,
     environmentProfile,
+    logLevel,
     upstreamProxy,
     backupDir,
     unmaskedEnvWorkspaces: [...new Set(raw.unmaskedEnvWorkspaces ?? [])],
@@ -372,6 +412,18 @@ export class ConfigStore {
     this.filePath = options?.filePath ?? getDefaultConfigPath();
     this.persistToDisk = options?.persistToDisk ?? true;
     this.config = this.loadOrInit(options?.initial);
+  }
+
+  getConfigFilePath(): string {
+    return this.filePath;
+  }
+
+  getConfigDir(): string {
+    return path.dirname(this.filePath);
+  }
+
+  isPersistent(): boolean {
+    return this.persistToDisk;
   }
 
   private loadOrInit(initial?: Partial<WslSandboxConfig>): WslSandboxConfig {
@@ -462,6 +514,7 @@ export class ConfigStore {
       username: patch.username !== undefined ? patch.username : this.config.username,
       workspaceRoot: patch.workspaceRoot ?? this.config.workspaceRoot,
       runnerPath: patch.runnerPath ?? this.config.runnerPath,
+      wslNodePath: patch.wslNodePath !== undefined ? patch.wslNodePath : this.config.wslNodePath,
       environmentProfile: patch.environmentProfile ?? this.config.environmentProfile,
       sandboxMode: patch.sandboxMode ?? this.config.sandboxMode,
       approvalPolicyMode: patch.approvalPolicyMode ?? this.config.approvalPolicyMode,
@@ -469,6 +522,7 @@ export class ConfigStore {
       upstreamProxy: patch.upstreamProxy !== undefined ? patch.upstreamProxy : this.config.upstreamProxy,
       mirrorCn: patch.mirrorCn ?? this.config.mirrorCn,
       cacheMode: patch.cacheMode ?? this.config.cacheMode,
+      logLevel: patch.logLevel ?? this.config.logLevel,
       approvalTimeoutMs: patch.approvalTimeoutMs ?? this.config.approvalTimeoutMs,
       enablePwshGuard: patch.enablePwshGuard ?? this.config.enablePwshGuard,
       enablePromptInjection: patch.enablePromptInjection ?? this.config.enablePromptInjection,

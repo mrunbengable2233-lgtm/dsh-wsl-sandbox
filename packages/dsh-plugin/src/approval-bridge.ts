@@ -10,7 +10,9 @@ import {
   type ApprovedExecutionTicket,
   failSandbox,
   type SessionBinding,
+  type StructuredLogger,
 } from '../../core/src/index.ts';
+import type { ConfigStore } from './config-store.ts';
 import type { DshApprovalService, DshCordisContext } from './cordis-types.ts';
 
 export interface PendingQueueItem {
@@ -37,9 +39,11 @@ interface WaitingDecision {
 }
 
 export interface ApprovalBridgeOptions {
-  readonly getPolicyMode: () => ApprovalPolicyMode;
+  readonly getPolicyMode?: () => ApprovalPolicyMode;
+  readonly configStore?: ConfigStore;
   readonly ttlMs?: number;
   readonly hostApproval?: DshApprovalService;
+  readonly logger?: StructuredLogger;
   /** Minimum elapsed ms to treat a host approval without `humanVerified` as genuine interactive review. */
   readonly bypassInstantThresholdMs?: number;
   readonly onPendingAdded?: (item: PendingQueueItem) => void;
@@ -67,6 +71,7 @@ export class ApprovalBridge {
   private readonly controller: ApprovalController;
   private readonly getPolicyMode: () => ApprovalPolicyMode;
   private hostApproval?: DshApprovalService;
+  private readonly logger?: StructuredLogger;
   private readonly bypassInstantThresholdMs: number;
   private readonly onPendingAdded?: (item: PendingQueueItem) => void;
   private readonly onPendingResolved?: (requestId: string, decision: ApprovalDecisionKind | 'aborted') => void;
@@ -75,15 +80,31 @@ export class ApprovalBridge {
   private readonly requestMeta = new Map<string, BridgeRequestOptions>();
 
   constructor(options: ApprovalBridgeOptions) {
-    this.getPolicyMode = options.getPolicyMode;
+    this.getPolicyMode =
+      options.getPolicyMode ??
+      (options.configStore ? () => options.configStore!.get().approvalPolicyMode : () => 'balanced');
     this.hostApproval = options.hostApproval;
+    this.logger = options.logger;
     this.bypassInstantThresholdMs = options.bypassInstantThresholdMs ?? 15;
     this.onPendingAdded = options.onPendingAdded;
     this.onPendingResolved = options.onPendingResolved;
 
     this.controller = new ApprovalController({
-      ttlMs: options.ttlMs ?? 60_000,
-      onAudit: options.onAudit,
+      ttlMs: options.ttlMs ?? options.configStore?.get().approvalTimeoutMs ?? 60_000,
+      onAudit: (rec) => {
+        options.onAudit?.(rec);
+        const outcome = String(rec.outcome ?? 'unknown');
+        this.logger?.log(outcome.startsWith('allowed') ? 'info' : 'warn', {
+          component: 'approval',
+          event: 'approval.audit',
+          message: `Approval ${outcome} for ${rec.kind}: ${rec.summary}`,
+          data: {
+            requestId: rec.requestId,
+            kind: rec.kind,
+            outcome,
+          },
+        });
+      },
       reviewer: (envelope) => this.reviewEnvelope(envelope),
     });
   }
@@ -348,6 +369,20 @@ export class ApprovalBridge {
         },
       });
 
+      this.logger?.log(routedViaFallback ? 'warn' : 'info', {
+        component: 'approval',
+        event: routedViaFallback ? 'approval.bypassCaught' : 'approval.queued',
+        message: routedViaFallback
+          ? `Caught unverified/bypassed host approval; routed '${item.summary}' to independent human queue`
+          : `Queued '${item.summary}' for human approval`,
+        sessionId: envelope.binding.sessionId,
+        data: {
+          requestId: item.requestId,
+          kind: item.kind,
+          touchesPhysicalDevice: item.touchesPhysicalDevice,
+          routedViaFallback,
+        },
+      });
       this.onPendingAdded?.(item);
     });
   }
