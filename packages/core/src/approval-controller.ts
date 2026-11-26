@@ -93,15 +93,33 @@ interface PendingEntry {
   readonly generation: number;
 }
 
+const NON_CACHEABLE_APPROVAL_KINDS = new Set<ApprovalActionKind>([
+  'external-path',
+  'sandbox-escalation',
+  'network-access',
+  'physical-device',
+]);
+
 function canonicalStringify(value: unknown): string {
+  if (value === undefined || typeof value === 'function' || typeof value === 'symbol') {
+    return 'null';
+  }
+  if (typeof value === 'bigint') {
+    return JSON.stringify(`${value.toString()}n`);
+  }
   if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
+    return JSON.stringify(value) ?? 'null';
   }
   if (Array.isArray(value)) {
     return '[' + value.map(canonicalStringify).join(',') + ']';
   }
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
+  const keys = Object.keys(record)
+    .filter((k) => {
+      const v = record[k];
+      return v !== undefined && typeof v !== 'function' && typeof v !== 'symbol';
+    })
+    .sort();
   return '{' + keys.map((k) => JSON.stringify(k) + ':' + canonicalStringify(record[k])).join(',') + '}';
 }
 
@@ -212,8 +230,8 @@ export class ApprovalController {
   }
 
   private matchesSessionPrefix(action: ApprovalAction): boolean {
-    // Physical hardware operations NEVER auto-match session rules (Q13)
-    if (action.touchesPhysicalDevice || action.kind === 'physical-device') {
+    // High-risk escalation kinds and physical hardware NEVER auto-match session rules
+    if (action.touchesPhysicalDevice || NON_CACHEABLE_APPROVAL_KINDS.has(action.kind)) {
       return false;
     }
     const prefix = action.suggestedPrefix;
@@ -285,7 +303,7 @@ export class ApprovalController {
 
     const allowSessionRuleOption =
       !action.touchesPhysicalDevice &&
-      action.kind !== 'physical-device' &&
+      !NON_CACHEABLE_APPROVAL_KINDS.has(action.kind) &&
       Boolean(action.suggestedPrefix && action.suggestedPrefix.length > 0 && !isBannedPrefix(action.suggestedPrefix));
 
     const controller = new AbortController();
@@ -331,6 +349,7 @@ export class ApprovalController {
       timedOut = true;
       controller.abort(new Error('REVIEW_TIMEOUT'));
     }, this.ttlMs);
+    timer.unref?.();
 
     let answer: ApprovalDecisionResponse | typeof abortedReason;
     try {

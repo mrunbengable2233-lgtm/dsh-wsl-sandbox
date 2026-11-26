@@ -1,6 +1,8 @@
 import {
   evaluateBashCommand,
   evaluatePwshCommand,
+  evaluatePwshCommandWithSystemAst,
+  extractBashNonProseTargets,
   failSandbox,
                        
   isSandboxError,
@@ -85,64 +87,117 @@ function extractShellCommand(input         )                     {
   return undefined;
 }
 
+const HOST_WSL_UNC_RE = /(?:\\\\|\/\/)(?:[?.][\\/]unc[\\/])?wsl(?:\$|\.localhost)(?:[\\/]|$)/i;
+const HOST_WSL_CONFIG_RE = /(?:^|[\\/])(?:\.wslconfig|etc[\\/]wsl\.conf|etc[\\/]fstab)$/i;
+
 /**
  * Evaluates a host POSIX Bash tool (`win_bash` / `ops_bash`) using POSIX Bash AST parsing +
  * host-side WSL escape & physical USBIP checks (never PowerShell syntax linting!).
  */
 export function evaluateHostPosixBashOnWindows(command        )                  {
-  if (/(?:\\\\|\/\/)wsl(?:\$|\.localhost)(?:\\|\/)/i.test(command)) {
-    return {
-      decision: 'deny',
-      riskLevel: 'critical',
-      code: 'POLICY_BLOCK',
-      reasons: [
+  const base = evaluateBashCommand(command, { workspaceRoot: '/host-workspace' });
+  const targets = extractBashNonProseTargets(command);
+
+  const reasons = [...base.reasons];
+  let decision                           = base.decision;
+  let riskLevel                                            = base.riskLevel;
+  let touchesPhysicalDevice = base.touchesPhysicalDevice;
+  let requiresSessionRuleBlocked = base.requiresSessionRuleBlocked;
+
+  const escalate = (
+    nextDecision                ,
+    nextRisk                                  ,
+    reason        ,
+  )       => {
+    if (!reasons.includes(reason)) reasons.push(reason);
+    requiresSessionRuleBlocked = true;
+    if (nextDecision === 'deny') {
+      decision = 'deny';
+      riskLevel = 'critical';
+    } else if (decision !== 'deny') {
+      decision = 'ask';
+      const order = { safe: 0, elevated: 1, high: 2, critical: 3 };
+      if (order[nextRisk] > order[riskLevel]) riskLevel = nextRisk;
+    }
+  };
+
+  for (const candidate of [...targets.nonProseArgs, ...targets.redirectionTargets]) {
+    if (HOST_WSL_UNC_RE.test(candidate)) {
+      escalate(
+        'deny',
+        'critical',
         'Accessing WSL filesystem via Windows UNC share (\\\\wsl$\\ or \\\\wsl.localhost\\) from host shell bypasses bwrap read-only locks and is forbidden',
-      ],
-      unwrappedCommands: [],
-      touchesPhysicalDevice: false,
-      requiresSessionRuleBlocked: true,
-      externalPaths: [],
-    };
+      );
+    }
+    if (HOST_WSL_CONFIG_RE.test(candidate)) {
+      escalate('deny', 'critical', 'Modifying .wslconfig / wsl.conf / fstab from host shell is forbidden');
+    }
   }
-  if (/\.wslconfig\b/i.test(command)) {
-    return {
-      decision: 'deny',
-      riskLevel: 'critical',
-      code: 'POLICY_BLOCK',
-      reasons: ['Modifying .wslconfig from host shell is forbidden'],
-      unwrappedCommands: [],
-      touchesPhysicalDevice: false,
-      requiresSessionRuleBlocked: true,
-      externalPaths: [],
-    };
+
+  for (const argv of base.unwrappedCommands) {
+    const head = (argv[0] ?? '').replace(/^.*\//, '').toLowerCase();
+    const args = argv.slice(1);
+    if (head === 'wsl' || head === 'wsl.exe' || head === 'bash.exe') {
+      let hasAdminOrRoot = false;
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i] .toLowerCase();
+        if (
+          a === '--import' ||
+          a === '--unregister' ||
+          a === '--shutdown' ||
+          a === '--set-default' ||
+          a === '--terminate' ||
+          a === '--mount' ||
+          a === '--user=root' ||
+          ((a === '-u' || a === '--user') && args[i + 1]?.toLowerCase() === 'root')
+        ) {
+          hasAdminOrRoot = true;
+          break;
+        }
+      }
+      if (hasAdminOrRoot) {
+        escalate(
+          'deny',
+          'critical',
+          'Managing/destroying WSL distributions or spawning root shell via wsl.exe from host shell is forbidden',
+        );
+      } else {
+        escalate(
+          'ask',
+          'high',
+          'Invoking wsl/wsl.exe/bash.exe from host POSIX shell bypasses the WSL sandbox; use wsl_bash or approve explicitly',
+        );
+      }
+    }
+
+    if (head === 'pnputil' || head === 'pnputil.exe') {
+      const joined = args.join(' ');
+      if (/\/(?:add-driver|delete-driver|install|enable-device|disable-device|restart-device|remove-device)\b|(?:^|\s)-[adi]\b/i.test(joined)) {
+        touchesPhysicalDevice = true;
+        escalate('ask', 'high', 'Windows driver / PnP device mutation requires manual single-shot approval');
+      }
+    } else if (head === 'devcon' || head === 'devcon.exe') {
+      if (args.some((a) => /^(?:install|update|remove|enable|disable|restart)$/i.test(a))) {
+        touchesPhysicalDevice = true;
+        escalate('ask', 'high', 'Windows driver / PnP device mutation requires manual single-shot approval');
+      }
+    } else if (head === 'zadig' || head === 'zadig.exe') {
+      touchesPhysicalDevice = true;
+      escalate('ask', 'high', 'Windows driver / PnP device mutation requires manual single-shot approval');
+    }
   }
-  if (/\busbipd(?:\.exe)?\b[^\n;|&]*\b(?:bind|unbind|attach|detach)\b/i.test(command)) {
-    return {
-      decision: 'ask',
-      riskLevel: 'high',
-      reasons: ['Physical USBIP device bind/attach/detach requires manual single-shot approval'],
-      unwrappedCommands: [['usbipd']],
-      touchesPhysicalDevice: true,
-      requiresSessionRuleBlocked: true,
-      externalPaths: [],
-    };
-  }
-  if (
-    /\bpnputil(?:\.exe)?\b[^\n;|&]*(?:\/(?:add-driver|delete-driver|install|enable-device|disable-device|restart-device|remove-device)\b|\s-[adi]\b)|\b(?:devcon(?:\.exe)?\b[^\n;|&]*\b(?:install|update|remove|enable|disable|restart)\b|zadig(?:\.exe)?\b)/i.test(
-      command,
-    )
-  ) {
-    return {
-      decision: 'ask',
-      riskLevel: 'high',
-      reasons: ['Windows driver / PnP device mutation requires manual single-shot approval'],
-      unwrappedCommands: [['pnputil']],
-      touchesPhysicalDevice: true,
-      requiresSessionRuleBlocked: true,
-      externalPaths: [],
-    };
-  }
-  return evaluateBashCommand(command, { workspaceRoot: '/host-workspace' });
+
+  return {
+    decision,
+    riskLevel,
+    code: decision === 'deny' ? 'POLICY_BLOCK' : undefined,
+    reasons,
+    unwrappedCommands: base.unwrappedCommands,
+    touchesPhysicalDevice,
+    requiresSessionRuleBlocked,
+    suggestedPrefix: requiresSessionRuleBlocked ? undefined : base.suggestedPrefix,
+    externalPaths: base.externalPaths,
+  };
 }
 
 function evaluateByKind(kind               , command        )                              {
@@ -153,6 +208,40 @@ function evaluateByKind(kind               , command        )                   
     return evaluateHostPosixBashOnWindows(command);
   }
   return undefined;
+}
+
+async function evaluateByKindAsync(kind               , command        )                                       {
+  if (kind === 'pwsh-dialect') {
+    return evaluatePwshCommandWithSystemAst(command);
+  }
+  if (kind === 'host-posix-bash') {
+    return evaluateHostPosixBashOnWindows(command);
+  }
+  return undefined;
+}
+
+function createHostFallbackBinding(cfg                  )                 {
+  return Object.freeze({
+    sessionId: 'host-pwsh-fallback',
+    backend: 'wsl',
+    wslVersion: 2,
+    distribution: cfg.distro || 'Ubuntu-26.04',
+    uid: 1000,
+    username: cfg.username || 'host',
+    arch: process.arch === 'arm64' ? 'aarch64' : 'x86_64',
+    workspaceRoot: cfg.workspaceRoot || '/home/host/workspace',
+    cwd: cfg.workspaceRoot || '/home/host/workspace',
+    profile: cfg.sandboxMode,
+    revision: cfg.revision,
+    generation: 0,
+    runnerId: 'host-fallback',
+    sandboxReady: true,
+    enforcement: 'partial',
+    supportsDisableUserns: false,
+    probedSockets: Object.freeze([]),
+    authorizedShares: Object.freeze([]),
+    authorizedDevices: Object.freeze([]),
+  });
 }
 
                                   
@@ -175,6 +264,19 @@ export function registerHostPwshGuardHook(
   options                 ,
 )                           {
   const disposers                    = [];
+  let cachedFallbackBinding                            ;
+
+  const getHostBindingOrFallback = async ()                          => {
+    try {
+      return await options.getBinding();
+    } catch {
+      const cfg = options.getConfig();
+      if (!cachedFallbackBinding || cachedFallbackBinding.revision !== cfg.revision) {
+        cachedFallbackBinding = createHostFallbackBinding(cfg);
+      }
+      return cachedFallbackBinding;
+    }
+  };
 
   // 1. Monotonic `ctx.tools.guard` for L0 + Single-Shell Purity + Dialect Alignment
   if (ctx.tools?.guard) {
@@ -236,7 +338,7 @@ export function registerHostPwshGuardHook(
           return passThrough();
         }
 
-        const verdict = evaluateByKind(kind, command);
+        const verdict = await evaluateByKindAsync(kind, command);
         if (!verdict || verdict.decision === 'allow') {
           return passThrough();
         }
@@ -265,7 +367,7 @@ export function registerHostPwshGuardHook(
 
         // `ask` -> route through ApprovalBridge
         try {
-          const binding = await options.getBinding();
+          const binding = await getHostBindingOrFallback();
           const ticket = await options.approvalBridge.requestApproval(
             binding,
             {

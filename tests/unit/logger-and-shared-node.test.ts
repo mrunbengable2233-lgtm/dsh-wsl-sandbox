@@ -313,15 +313,20 @@ describe('Shared Node.js Runtime & User Toolchain Sandbox PATH', () => {
 
   it('evaluates AI dangerous-command red-team batch seed with 0 false-negative bypasses and 0 false positives', async () => {
     const { runDangerousCommandMatrix } = await import('../../scripts/run-dangerous-cmd-matrix.mjs');
+    const { disposeSystemPwshParser } = await import('../../packages/core/src/index.ts');
     const seedPath = path.resolve(import.meta.dirname, '..', '..', '..', 'tests', 'fixtures', 'dangerous-commands-seed.json');
     const fallbackSeedPath = path.resolve(import.meta.dirname, '..', 'fixtures', 'dangerous-commands-seed.json');
     const resolvedSeed = fs.existsSync(fallbackSeedPath) ? fallbackSeedPath : seedPath;
     const cases = JSON.parse(fs.readFileSync(resolvedSeed, 'utf8')) as Array<Record<string, unknown>>;
-    const report = runDangerousCommandMatrix(cases);
-    assert.equal(report.total >= 30, true);
-    assert.equal(report.falseNegatives, 0);
-    assert.equal(report.falsePositives, 0);
-    assert.equal(report.failed, 0);
+    try {
+      const report = await runDangerousCommandMatrix(cases);
+      assert.equal(report.total >= 30, true);
+      assert.equal(report.falseNegatives, 0);
+      assert.equal(report.falsePositives, 0);
+      assert.equal(report.failed, 0);
+    } finally {
+      await disposeSystemPwshParser();
+    }
   });
 });
 

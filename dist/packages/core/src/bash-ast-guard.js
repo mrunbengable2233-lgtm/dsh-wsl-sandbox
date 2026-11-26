@@ -3,8 +3,8 @@ import { isPathInside } from './binding.js';
 
 /**
  * Checklist A: Zero-token deterministic Bash lexer/AST guard with 8-layer wrapper peeling,
- * dangerous command detection, external path tracking, physical-device detection,
- * and Codex BANNED_PREFIX_SUGGESTIONS enforcement.
+ * heredoc/here-string/`$'...'`/line-continuation handling, dangerous command detection,
+ * external path tracking, physical-device detection, and Codex BANNED_PREFIX_SUGGESTIONS enforcement.
  */
 
 export const MAX_GUARD_CHARS = 64 * 1024;
@@ -50,6 +50,9 @@ export const BANNED_PREFIX_SUGGESTIONS                                 = [
 ];
 
 const SHELL_BINARIES = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'fish', 'busybox']);
+const INTERPRETER_BINARIES = new Set([
+  'python', 'python2', 'python3', 'node', 'nodejs', 'perl', 'ruby', 'php', 'bun', 'deno', 'rscript', 'julia',
+]);
 
 const SIMPLE_WRAPPERS = new Set([
   'sudo', 'doas', 'command', 'exec', 'nohup', 'nice', 'ionice',
@@ -64,7 +67,7 @@ const WRAPPER_VALUE_FLAGS                                                = {
   stdbuf: new Set(['-i', '-o', '-e']),
   runuser: new Set(['-u', '-g', '-s', '-c']),
   timeout: new Set(['-k', '-s', '--kill-after', '--signal']),
-  xargs: new Set(['-n', '-L', '-P', '-I', '-d', '-E', '-s']),
+  xargs: new Set(['-n', '-L', '-P', '-I', '-d', '-E', '-s', '-a', '--arg-file']),
 };
 
 const POWER_TOOLS = new Set(['shutdown', 'poweroff', 'reboot', 'halt']);
@@ -117,6 +120,12 @@ const WSL_INTEROP_BINARIES = new Set([
   'wsl.exe', 'cmd.exe', 'powershell.exe', 'pwsh.exe', 'explorer.exe', 'bash.exe', 'wslpath.exe',
 ]);
 const DOWNLOAD_CRADLE_TOOLS = new Set(['curl', 'wget', 'fetch']);
+const GHA_CREDS_RE = /(?:^|\/)gha-creds-[^/]*\.json$/i;
+const RAW_READ_TOOLS = new Set([
+  'cat', 'head', 'tail', 'less', 'more', 'tac', 'nl', 'od', 'strings', 'xxd', 'hexdump',
+  'base64', 'sha256sum', 'md5sum', 'stat', 'readlink', 'source', '.',
+  'cp', 'mv', 'tee', 'install', 'truncate',
+]);
 
 function basenameCmd(token        )         {
   const idx = token.lastIndexOf('/');
@@ -131,7 +140,7 @@ export function isBannedPrefix(prefix                   )          {
     if (banned.length === lowered.length && banned.every((b, i) => b.toLowerCase() === lowered[i])) {
       return true;
     }
-    if (banned.length === 1 && banned[0] .toLowerCase() === firstBase && lowered.length === 1) {
+    if (banned.length === 1 && banned[0] .toLowerCase() === firstBase && lowered.length >= 1) {
       return true;
     }
     if (
@@ -148,22 +157,377 @@ export function isBannedPrefix(prefix                   )          {
 
                          
                             
+                                   
                                                                
                                 
+ 
+
+                        
+                                
+                        
  
 
 function normalizeIfs(script        )         {
   return script.replace(/\$\{IFS\}|\$IFS\b/g, ' ');
 }
 
+function decodeAnsiCEscape(content        )         {
+  let out = '';
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i] ;
+    if (ch !== '\\' || i + 1 >= content.length) {
+      out += ch;
+      continue;
+    }
+    const next = content[++i] ;
+    if (next === 'n') out += '\n';
+    else if (next === 'r') out += '\r';
+    else if (next === 't') out += '\t';
+    else if (next === 'v') out += '\v';
+    else if (next === 'b') out += '\b';
+    else if (next === 'f') out += '\f';
+    else if (next === 'a') out += '\x07';
+    else if (next === 'e' || next === 'E') out += '\x1b';
+    else if (next === '\\' || next === "'" || next === '"' || next === '?') out += next;
+    else if (next === 'x') {
+      const m = content.slice(i + 1, i + 3).match(/^[0-9a-fA-F]{1,2}/);
+      if (m) {
+        out += String.fromCharCode(parseInt(m[0], 16));
+        i += m[0].length;
+      } else {
+        out += '\\x';
+      }
+    } else if (next === 'u') {
+      const m = content.slice(i + 1, i + 5).match(/^[0-9a-fA-F]{1,4}/);
+      if (m) {
+        out += String.fromCodePoint(parseInt(m[0], 16));
+        i += m[0].length;
+      } else {
+        out += '\\u';
+      }
+    } else if (next === 'U') {
+      const m = content.slice(i + 1, i + 9).match(/^[0-9a-fA-F]{1,8}/);
+      if (m) {
+        const cp = parseInt(m[0], 16);
+        out += cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+        i += m[0].length;
+      } else {
+        out += '\\U';
+      }
+    } else if (/^[0-7]$/.test(next)) {
+      const m = content.slice(i, i + 3).match(/^[0-7]{1,3}/);
+      if (m) {
+        out += String.fromCharCode(parseInt(m[0], 8));
+        i += m[0].length - 1;
+      }
+    } else {
+      out += '\\' + next;
+    }
+  }
+  return out;
+}
+
+/**
+ * Strips Bash `\<LF>` / `\<CRLF>` line continuations outside `'...'` and `$'...'` on non-heredoc
+ * command lines AND extracts `<<` / `<<-` heredoc bodies so literal prose inside `<<'EOF'` is never
+ * misparsed as commands while unquoted `<<EOF` and shell-fed heredocs remain inspected.
+ */
+function stripContinuationsAndExtractHeredocs(rawScript        )   
+                 
+                                      
+  {
+  const lines = rawScript.split('\n');
+  const outLines           = [];
+  const heredocs = new Map                      ();
+  const active         
+                     
+                      
+                       
+                         
+                        
+     = [];
+
+  let hdSeq = 0;
+  let inSingle = false;
+  let inDouble = false;
+  let inAnsiC = false;
+
+  for (let li = 0; li < lines.length; li++) {
+    let line = (lines[li] ?? '').replace(/\r$/, '');
+
+    if (active.length > 0) {
+      const curHd = active[0] ;
+      const candidate = curHd.stripTabs ? line.replace(/^\t+/, '') : line;
+      if (candidate === curHd.delimiter) {
+        active.shift();
+        heredocs.set(curHd.tokenKey, {
+          quotedDelim: curHd.quotedDelim,
+          body: curHd.bodyLines.join('\n'),
+        });
+        outLines.push('');
+      } else {
+        curHd.bodyLines.push(candidate);
+        outLines.push('');
+      }
+      continue;
+    }
+
+    let outLine = '';
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i] ;
+      const next = line[i + 1] ?? '';
+
+      if (inSingle) {
+        outLine += ch;
+        if (ch === "'") inSingle = false;
+        continue;
+      }
+
+      if (inAnsiC) {
+        if (ch === '\\' && i + 1 < line.length) {
+          outLine += ch + line[i + 1] ;
+          i++;
+          continue;
+        }
+        outLine += ch;
+        if (ch === "'") inAnsiC = false;
+        continue;
+      }
+
+      if (inDouble) {
+        if (ch === '\\') {
+          if (i === line.length - 1 && li + 1 < lines.length) {
+            li++;
+            line = line + (lines[li] ?? '').replace(/\r$/, '');
+            continue;
+          }
+          if (i + 1 < line.length) {
+            outLine += ch + line[i + 1] ;
+            i++;
+          }
+          continue;
+        }
+        outLine += ch;
+        if (ch === '"') inDouble = false;
+        continue;
+      }
+
+      // Unquoted backslash: line continuation if at end of line
+      if (ch === '\\') {
+        if (i === line.length - 1 && li + 1 < lines.length) {
+          li++;
+          line = line + (lines[li] ?? '').replace(/\r$/, '');
+          continue;
+        }
+        if (i + 1 < line.length) {
+          outLine += ch + line[i + 1] ;
+          i++;
+        }
+        continue;
+      }
+
+      // Comment outside quotes
+      if (ch === '#' && (i === 0 || /[\s;|&({]/.test(line[i - 1] ))) {
+        outLine += line.slice(i);
+        break;
+      }
+
+      if (ch === '$' && next === "'") {
+        inAnsiC = true;
+        outLine += "$'";
+        i++;
+        continue;
+      }
+      if (ch === "'") {
+        inSingle = true;
+        outLine += ch;
+        continue;
+      }
+      if (ch === '"') {
+        inDouble = true;
+        outLine += ch;
+        continue;
+      }
+
+      // Here-string `<<<` (must skip all 3 chars so 2nd+3rd `<` aren't parsed as heredoc `<<`)
+      if (ch === '<' && next === '<' && line[i + 2] === '<') {
+        outLine += '<<<';
+        i += 2;
+        continue;
+      }
+
+      // Heredoc `<<` / `<<-`
+      if (ch === '<' && next === '<') {
+        let pos = i + 2;
+        let stripTabs = false;
+        if (line[pos] === '-') {
+          stripTabs = true;
+          pos++;
+        }
+        while (pos < line.length && (line[pos] === ' ' || line[pos] === '\t')) pos++;
+        let delim = '';
+        let quotedDelim = false;
+        let dSingle = false;
+        let dDouble = false;
+        let p = pos;
+        while (p < line.length) {
+          const dc = line[p] ;
+          if (dSingle) {
+            if (dc === "'") dSingle = false;
+            else delim += dc;
+            p++;
+            continue;
+          }
+          if (dDouble) {
+            if (dc === '\\' && p + 1 < line.length) {
+              delim += line[p + 1] ;
+              p += 2;
+              continue;
+            }
+            if (dc === '"') dDouble = false;
+            else delim += dc;
+            p++;
+            continue;
+          }
+          if (dc === '\\' && p + 1 < line.length) {
+            quotedDelim = true;
+            delim += line[p + 1] ;
+            p += 2;
+            continue;
+          }
+          if (dc === "'") {
+            quotedDelim = true;
+            dSingle = true;
+            p++;
+            continue;
+          }
+          if (dc === '"') {
+            quotedDelim = true;
+            dDouble = true;
+            p++;
+            continue;
+          }
+          if (/[\s;|&<>()]/.test(dc)) break;
+          delim += dc;
+          p++;
+        }
+
+        if (delim.length > 0) {
+          const tokenKey = `__DSH_HD_${hdSeq++}__`;
+          active.push({ tokenKey, delimiter: delim, stripTabs, quotedDelim, bodyLines: [] });
+          outLine += `<< ${tokenKey}`;
+          i = p - 1;
+          continue;
+        }
+      }
+
+      outLine += ch;
+    }
+
+    outLines.push(outLine);
+  }
+
+  // Unclosed heredoc fallback: still capture whatever lines remained
+  for (const rem of active) {
+    heredocs.set(rem.tokenKey, {
+      quotedDelim: rem.quotedDelim,
+      body: rem.bodyLines.join('\n'),
+    });
+  }
+
+  return { script: outLines.join('\n'), heredocs };
+}
+
+function maskQuotedBashLiterals(script        )         {
+  let out = '';
+  let inSingle = false;
+  let inDouble = false;
+  let inAnsiC = false;
+
+  for (let i = 0; i < script.length; i++) {
+    const ch = script[i] ;
+    if (inSingle) {
+      if (ch === "'") {
+        inSingle = false;
+        out += "'";
+      } else {
+        out += ' ';
+      }
+      continue;
+    }
+    if (inAnsiC) {
+      if (ch === '\\' && i + 1 < script.length) {
+        out += '  ';
+        i++;
+        continue;
+      }
+      if (ch === "'") {
+        inAnsiC = false;
+        out += "'";
+      } else {
+        out += ' ';
+      }
+      continue;
+    }
+    if (inDouble) {
+      if (ch === '\\' && i + 1 < script.length) {
+        out += '  ';
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inDouble = false;
+        out += '"';
+      } else {
+        out += ' ';
+      }
+      continue;
+    }
+    if (ch === '\\' && i + 1 < script.length) {
+      out += ch + script[i + 1] ;
+      i++;
+      continue;
+    }
+    if (ch === '$' && script[i + 1] === "'") {
+      inAnsiC = true;
+      out += "$'";
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      out += "'";
+      continue;
+    }
+    if (ch === '"') {
+      inDouble = true;
+      out += '"';
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
 function extractSubstitutions(script        )           {
   const nested           = [];
   let inSingle = false;
   let inDouble = false;
+  let inAnsiC = false;
 
   for (let i = 0; i < script.length; i++) {
     const ch = script[i] ;
+    if (inAnsiC) {
+      if (ch === '\\') i++;
+      else if (ch === "'") inAnsiC = false;
+      continue;
+    }
     if (ch === '\\' && !inSingle) {
+      i++;
+      continue;
+    }
+    if (!inSingle && !inDouble && ch === '$' && script[i + 1] === "'") {
+      inAnsiC = true;
       i++;
       continue;
     }
@@ -177,15 +541,27 @@ function extractSubstitutions(script        )           {
     }
     if (inSingle) continue;
 
-    // $( ... ) or <( ... ) or >( ... )
-    if ((ch === '$' || ch === '<' || ch === '>') && script[i + 1] === '(') {
+    // $( ... ) always; <( ... ) and >( ... ) ONLY outside double quotes!
+    if ((ch === '$' || (!inDouble && (ch === '<' || ch === '>'))) && script[i + 1] === '(') {
       let depth = 1;
       let j = i + 2;
       let s = false;
       let d = false;
+      let a = false;
       while (j < script.length && depth > 0) {
         const c = script[j] ;
+        if (a) {
+          if (c === '\\') { j += 2; continue; }
+          if (c === "'") a = false;
+          j++;
+          continue;
+        }
         if (c === '\\' && !s) {
+          j += 2;
+          continue;
+        }
+        if (!s && !d && c === '$' && script[j + 1] === "'") {
+          a = true;
           j += 2;
           continue;
         }
@@ -226,31 +602,78 @@ function extractSubstitutions(script        )           {
   return nested;
 }
 
+function consumeBalancedBlock(script        , startOpenIdx        , openChar           , closeChar           )   
+               
+                 
+  {
+  let depth = 1;
+  let j = startOpenIdx + 1;
+  let s = false;
+  let d = false;
+  let a = false;
+  while (j < script.length && depth > 0) {
+    const c = script[j] ;
+    if (a) {
+      if (c === '\\' && j + 1 < script.length) {
+        j += 2;
+        continue;
+      }
+      if (c === "'") a = false;
+      j++;
+      continue;
+    }
+    if (c === '\\' && !s) {
+      j += 2;
+      continue;
+    }
+    if (!s && !d && c === '$' && script[j + 1] === "'") {
+      a = true;
+      j += 2;
+      continue;
+    }
+    if (c === "'" && !d) s = !s;
+    else if (c === '"' && !s) d = !d;
+    else if (!s && !d) {
+      if (c === openChar) depth++;
+      else if (c === closeChar) depth--;
+    }
+    j++;
+  }
+  return { text: script.slice(startOpenIdx, j), endIdx: j - 1 };
+}
+
 function tokenizeBashSegments(script        )                  {
   const segments                  = [];
   let tokens           = [];
+  let quotedTokens            = [];
   let redirections                                        = [];
   let cur = '';
+  let curHadQuote = false;
   let inSingle = false;
   let inDouble = false;
+  let inAnsiC = false;
+  let ansiBuf = '';
   let pendingRedir                = null;
 
   const flushToken = ()       => {
-    if (cur.length === 0) return;
+    if (cur.length === 0 && !curHadQuote) return;
     if (pendingRedir !== null) {
       redirections.push({ op: pendingRedir, target: cur });
       pendingRedir = null;
     } else {
       tokens.push(cur);
+      quotedTokens.push(curHadQuote);
     }
     cur = '';
+    curHadQuote = false;
   };
 
   const flushSegment = (piped         )       => {
     flushToken();
     if (tokens.length > 0 || redirections.length > 0) {
-      segments.push({ tokens, redirections, pipedToNext: piped });
+      segments.push({ tokens, quotedTokens, redirections, pipedToNext: piped });
       tokens = [];
+      quotedTokens = [];
       redirections = [];
     }
   };
@@ -265,10 +688,28 @@ function tokenizeBashSegments(script        )                  {
       continue;
     }
 
+    if (inAnsiC) {
+      if (ch === '\\' && i + 1 < script.length) {
+        ansiBuf += ch + script[i + 1] ;
+        i++;
+      } else if (ch === "'") {
+        inAnsiC = false;
+        cur += decodeAnsiCEscape(ansiBuf);
+        ansiBuf = '';
+      } else {
+        ansiBuf += ch;
+      }
+      continue;
+    }
+
     if (inDouble) {
       if (ch === '\\' && (next === '"' || next === '\\' || next === '$' || next === '`')) {
         cur += next;
         i++;
+      } else if (ch === '$' && next === '(') {
+        const blk = consumeBalancedBlock(script, i + 1, '(', ')');
+        cur += '$' + blk.text;
+        i = blk.endIdx;
       } else if (ch === '"') {
         inDouble = false;
       } else {
@@ -278,7 +719,7 @@ function tokenizeBashSegments(script        )                  {
     }
 
     // Comments outside quotes
-    if (ch === '#' && cur.length === 0) {
+    if (ch === '#' && cur.length === 0 && !curHadQuote) {
       while (i < script.length && script[i] !== '\n') i++;
       flushSegment(false);
       continue;
@@ -292,12 +733,36 @@ function tokenizeBashSegments(script        )                  {
       continue;
     }
 
+    if (ch === '$' && next === "'") {
+      inAnsiC = true;
+      curHadQuote = true;
+      ansiBuf = '';
+      i++;
+      continue;
+    }
+
     if (ch === "'") {
       inSingle = true;
+      curHadQuote = true;
       continue;
     }
     if (ch === '"') {
       inDouble = true;
+      curHadQuote = true;
+      continue;
+    }
+
+    // Preserve $(...), <(...), >(...), ${...} inside current token rather than splitting segments on inner parens
+    if ((ch === '$' || ch === '<' || ch === '>') && next === '(') {
+      const blk = consumeBalancedBlock(script, i + 1, '(', ')');
+      cur += ch + blk.text;
+      i = blk.endIdx;
+      continue;
+    }
+    if (ch === '$' && next === '{') {
+      const blk = consumeBalancedBlock(script, i + 1, '{', '}');
+      cur += '$' + blk.text;
+      i = blk.endIdx;
       continue;
     }
 
@@ -326,26 +791,32 @@ function tokenizeBashSegments(script        )                  {
       continue;
     }
     if (ch === '&') {
-      // Check for &> or >&
       if (next === '>') {
         flushToken();
-        pendingRedir = '&>';
-        i++;
+        if (script[i + 2] === '>') {
+          pendingRedir = '&>>';
+          i += 2;
+        } else {
+          pendingRedir = '&>';
+          i++;
+        }
         continue;
       }
       flushSegment(false);
       continue;
     }
 
-    // Redirections (>, >>, >|, <, <<)
+    // Redirections (<<<, <<, <&, <, >>, >|, >&, >)
     if (ch === '>' || ch === '<') {
-      // Allow fd prefix like 2> or 1>>
       if (/^\d+$/.test(cur)) {
         cur = '';
       } else {
         flushToken();
       }
-      if (ch === '>' && (next === '>' || next === '|' || next === '&')) {
+      if (ch === '<' && next === '<' && script[i + 2] === '<') {
+        pendingRedir = '<<<';
+        i += 2;
+      } else if (ch === '>' && (next === '>' || next === '|' || next === '&')) {
         pendingRedir = ch + next;
         i++;
       } else if (ch === '<' && (next === '<' || next === '&')) {
@@ -357,7 +828,7 @@ function tokenizeBashSegments(script        )                  {
       continue;
     }
 
-    // Subshell parens
+    // Standalone subshell parens (not $(, <(, >()
     if (ch === '(' || ch === ')') {
       flushSegment(false);
       continue;
@@ -366,14 +837,18 @@ function tokenizeBashSegments(script        )                  {
     cur += ch;
   }
 
+  if (inAnsiC && ansiBuf.length > 0) {
+    cur += decodeAnsiCEscape(ansiBuf);
+  }
   flushSegment(false);
   return segments;
 }
 
 function isForkBomb(script        )          {
-  if (/:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:\s*&[^}]*\}/.test(script)) return true;
+  const masked = maskQuotedBashLiterals(script);
+  if (/:\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:\s*&[^}]*\}/.test(masked)) return true;
   // Generic named recursive background pipe bomb: foo(){ foo|foo& }; foo
-  const m = script.match(/\b([A-Za-z_]\w*)\s*\(\s*\)\s*\{([^}]*)\}/);
+  const m = masked.match(/\b([A-Za-z_]\w*)\s*\(\s*\)\s*\{([^}]*)\}/);
   if (m && m[1] && m[2]) {
     const fn = m[1];
     const body = m[2];
@@ -383,6 +858,272 @@ function isForkBomb(script        )          {
     }
   }
   return false;
+}
+
+                           
+                             
+                                 
+                                         
+ 
+
+function parseEnvArgs(
+  args                   ,
+  onChdir                        ,
+)                  {
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] ;
+    if (a === '--') {
+      i++;
+      break;
+    }
+    if (a === '--ignore-environment') {
+      i++;
+      continue;
+    }
+    if (a === '--unset') {
+      i += 2;
+      continue;
+    }
+    if (a.startsWith('--unset=')) {
+      i++;
+      continue;
+    }
+    if (a === '--chdir') {
+      if (args[i + 1]) onChdir?.(args[i + 1] );
+      i += 2;
+      continue;
+    }
+    if (a.startsWith('--chdir=')) {
+      onChdir?.(a.slice('--chdir='.length));
+      i++;
+      continue;
+    }
+    if (a === '--split-string' || a.startsWith('--split-string=')) {
+      const splitPayload = a === '--split-string' ? args[i + 1] ?? '' : a.slice('--split-string='.length);
+      const consumed = a === '--split-string' ? 2 : 1;
+      return { nextIndex: i + consumed, splitPayload, remaining: args.slice(i + consumed) };
+    }
+    if (a.startsWith('-') && a.length > 1 && !a.startsWith('--')) {
+      let consumedNext = false;
+      for (let k = 1; k < a.length; k++) {
+        const flagCh = a[k] ;
+        if (flagCh === 'i' || flagCh === '0' || flagCh === 'v') {
+          continue;
+        }
+        if (flagCh === 'u') {
+          if (k + 1 >= a.length) consumedNext = true;
+          break;
+        }
+        if (flagCh === 'C') {
+          const dir = k + 1 < a.length ? a.slice(k + 1) : args[i + 1];
+          if (dir) onChdir?.(dir);
+          if (k + 1 >= a.length) consumedNext = true;
+          break;
+        }
+        if (flagCh === 'S') {
+          const splitPayload = k + 1 < a.length ? a.slice(k + 1) : args[i + 1] ?? '';
+          const consumed = k + 1 < a.length ? 1 : 2;
+          return { nextIndex: i + consumed, splitPayload, remaining: args.slice(i + consumed) };
+        }
+      }
+      i += consumedNext ? 2 : 1;
+      continue;
+    }
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) {
+      i++;
+      continue;
+    }
+    break;
+  }
+  return { nextIndex: i };
+}
+
+function unwrapPipeTargetCmd(rawTokens                   , depth = 0)         {
+  if (depth > MAX_WRAPPER_DEPTH || rawTokens.length === 0) return '';
+  let idx = 0;
+  while (idx < rawTokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rawTokens[idx] )) {
+    idx++;
+  }
+  const tokens = rawTokens.slice(idx);
+  if (tokens.length === 0) return '';
+
+  const cmd = basenameCmd(tokens[0] );
+  const args = tokens.slice(1);
+
+  if (cmd === 'env') {
+    const parsedEnv = parseEnvArgs(args);
+    if (parsedEnv.splitPayload !== undefined) {
+      const splitSegs = tokenizeBashSegments(parsedEnv.splitPayload);
+      if (splitSegs[0]?.tokens.length) {
+        return unwrapPipeTargetCmd([...splitSegs[0].tokens, ...(parsedEnv.remaining ?? [])], depth + 1);
+      }
+      return unwrapPipeTargetCmd(parsedEnv.remaining ?? [], depth + 1);
+    }
+    return unwrapPipeTargetCmd(args.slice(parsedEnv.nextIndex), depth + 1);
+  }
+
+  if (cmd === 'timeout') {
+    let i = 0;
+    const valFlags = WRAPPER_VALUE_FLAGS.timeout ;
+    while (i < args.length && args[i] .startsWith('-')) {
+      const f = args[i] ;
+      if (f === '--') {
+        i++;
+        break;
+      }
+      if (f.includes('=')) {
+        i++;
+        continue;
+      }
+      i += valFlags.has(f) ? 2 : 1;
+    }
+    if (i < args.length) i++;
+    return unwrapPipeTargetCmd(args.slice(i), depth + 1);
+  }
+
+  if (cmd === 'busybox' && args[0] && !args[0].startsWith('-')) {
+    return unwrapPipeTargetCmd(args, depth + 1);
+  }
+
+  if (SIMPLE_WRAPPERS.has(cmd)) {
+    let i = 0;
+    const valFlags = WRAPPER_VALUE_FLAGS[cmd];
+    while (i < args.length && args[i] .startsWith('-')) {
+      const f = args[i] ;
+      if (f === '--') {
+        i++;
+        break;
+      }
+      if (f.includes('=')) {
+        i++;
+        continue;
+      }
+      if (cmd === 'xargs' && f.startsWith('-a') && f.length > 2) {
+        i++;
+        continue;
+      }
+      i += valFlags?.has(f) ? 2 : 1;
+    }
+    return unwrapPipeTargetCmd(args.slice(i), depth + 1);
+  }
+
+  return cmd;
+}
+
+const GIT_GLOBAL_VALUE_FLAGS = new Set([
+  '-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--exec-path', '--config-env',
+]);
+
+function findGitSubcommandIndex(args                   )         {
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i] ;
+    if (a === '--') {
+      i++;
+      break;
+    }
+    if (GIT_GLOBAL_VALUE_FLAGS.has(a)) {
+      i += 2;
+      continue;
+    }
+    if (a.startsWith('-')) {
+      i++;
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
+function isBashTextOrPatternArg(cmd        , args                   , argIdx        )          {
+  if (cmd === 'echo' || cmd === 'printf') {
+    return true;
+  }
+  if (cmd === 'git') {
+    const subIdx = findGitSubcommandIndex(args);
+    if (argIdx <= subIdx) return false;
+    const sub = args[subIdx];
+    if (sub === 'commit' || sub === 'tag' || sub === 'notes' || sub === 'merge' || sub === 'revert') {
+      const cur = args[argIdx] ?? '';
+      const prev = args[argIdx - 1] ?? '';
+      if (prev === '-m' || prev === '--message' || prev === '-am' || cur.startsWith('--message=')) {
+        return true;
+      }
+    }
+    if (sub === 'grep') {
+      const prev = args[argIdx - 1] ?? '';
+      if (prev === '-e') return true;
+      let posCount = 0;
+      for (let j = subIdx + 1; j <= argIdx; j++) {
+        const aj = args[j] ;
+        if (aj.startsWith('-')) continue;
+        const p = args[j - 1] ?? '';
+        if (p === '-e' || p === '-f') continue;
+        posCount++;
+      }
+      return posCount === 1;
+    }
+  }
+  if (cmd === 'rg' || cmd === 'grep' || cmd === 'egrep' || cmd === 'fgrep' || cmd === 'ag') {
+    const prev = args[argIdx - 1] ?? '';
+    if (prev === '-e' || prev === '--regexp') return true;
+    let posCount = 0;
+    for (let j = 0; j <= argIdx; j++) {
+      const aj = args[j] ;
+      if (aj.startsWith('-')) continue;
+      const p = args[j - 1] ?? '';
+      if (p === '-e' || p === '--regexp' || p === '-f' || p === '--file' || p === '-g' || p === '--glob') continue;
+      posCount++;
+    }
+    return posCount === 1;
+  }
+  return false;
+}
+
+function extractInlineInterpreterCode(cmd        , args                   )                {
+  const lower = cmd.toLowerCase();
+  if (lower === 'python' || lower === 'python2' || lower === 'python3') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i] ;
+      if (a === '-c' && i + 1 < args.length) return args[i + 1] ;
+      if (a.startsWith('-c') && a.length > 2) return a.slice(2);
+    }
+  } else if (lower === 'node' || lower === 'nodejs' || lower === 'bun') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i] ;
+      if ((a === '-e' || a === '--eval' || a === '-p' || a === '--print') && i + 1 < args.length) {
+        return args[i + 1] ;
+      }
+      if (a.startsWith('--eval=')) return a.slice('--eval='.length);
+      if (a.startsWith('--print=')) return a.slice('--print='.length);
+      if (/^-[a-zA-Z]*[ep][a-zA-Z]*$/.test(a) && i + 1 < args.length) {
+        return args[i + 1] ;
+      }
+    }
+  } else if (lower === 'perl' || lower === 'ruby') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i] ;
+      if ((a === '-e' || (lower === 'perl' && a === '-E')) && i + 1 < args.length) {
+        return args[i + 1] ;
+      }
+    }
+  } else if (lower === 'php') {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === '-r' && i + 1 < args.length) return args[i + 1] ;
+    }
+  } else if (lower === 'deno') {
+    if (args[0] === 'eval' && args.length >= 2) {
+      return args.slice(1).join(' ');
+    }
+  } else if (lower === 'julia') {
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i] ;
+      if ((a === '-e' || a === '--eval') && i + 1 < args.length) return args[i + 1] ;
+      if (a.startsWith('--eval=')) return a.slice('--eval='.length);
+    }
+  }
+  return null;
 }
 
                                    
@@ -401,17 +1142,25 @@ export function evaluateBashCommand(command        , ctx                  )     
   let riskLevel                                            = 'safe';
   let touchesPhysicalDevice =
     (ctx.activeDeviceNodes?.length ?? 0) > 0 || (ctx.authorizedDevices?.length ?? 0) > 0;
+  let forceBlockSessionRule = false;
   let trackedCwd = ctx.cwd ?? ctx.workspaceRoot;
 
   const escalate = (
     nextDecision                ,
     nextRisk                                  ,
     reason        ,
+    blockPrefix = false,
   )       => {
-    reasons.push(reason);
+    if (!reasons.includes(reason)) {
+      reasons.push(reason);
+    }
+    if (blockPrefix) {
+      forceBlockSessionRule = true;
+    }
     if (nextDecision === 'deny') {
       decision = 'deny';
       riskLevel = 'critical';
+      forceBlockSessionRule = true;
     } else if (decision !== 'deny') {
       decision = 'ask';
       const order = { safe: 0, elevated: 1, high: 2, critical: 3 };
@@ -445,44 +1194,48 @@ export function evaluateBashCommand(command        , ctx                  )     
     };
   }
 
-  if (isForkBomb(command)) {
-    return {
-      decision: 'deny',
-      riskLevel: 'critical',
-      code: 'POLICY_BLOCK',
-      reasons: ['Fork bomb pattern detected'],
-      unwrappedCommands: [],
-      touchesPhysicalDevice: false,
-      requiresSessionRuleBlocked: true,
-      externalPaths: [],
-    };
-  }
+  const extractPathValue = (rawArg        )                => {
+    if (!rawArg) return null;
+    if (rawArg.startsWith('-')) {
+      const eq = rawArg.indexOf('=');
+      if (eq > 1) {
+        return rawArg.slice(eq + 1);
+      }
+      return null;
+    }
+    const eq = rawArg.indexOf('=');
+    if (eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(rawArg)) {
+      return rawArg.slice(eq + 1);
+    }
+    return rawArg;
+  };
 
-  if (/gha-creds-.*\.json/i.test(command)) {
-    escalate('deny', 'critical', 'Access to GitHub Actions credential file (gha-creds-*.json) is forbidden');
-  }
-
-  const checkPath = (rawPath        )       => {
-    if (!rawPath || rawPath.startsWith('-')) return;
-    if (PHYSICAL_DEV_RE.test(rawPath)) {
+  const checkPath = (rawPath        , trackExternal = true)       => {
+    const extracted = extractPathValue(rawPath);
+    if (!extracted) return;
+    if (GHA_CREDS_RE.test(extracted) || /gha-creds-.*\.json/i.test(posix.basename(extracted))) {
+      escalate('deny', 'critical', 'Access to GitHub Actions credential file (gha-creds-*.json) is forbidden', true);
+    }
+    const resolved = extracted.startsWith('/')
+      ? posix.normalize(extracted)
+      : posix.normalize(posix.join(trackedCwd, extracted));
+    if (PHYSICAL_DEV_RE.test(resolved)) {
       touchesPhysicalDevice = true;
-      escalate('ask', 'high', `Physical hardware device access detected (${rawPath}); requires manual single-shot approval`);
+      escalate('ask', 'high', `Physical hardware device access detected (${resolved}); requires manual single-shot approval`, true);
     }
-    if (BLOCK_DEV_RE.test(rawPath)) {
-      escalate('deny', 'critical', `Raw block device target is forbidden: ${rawPath}`);
+    if (BLOCK_DEV_RE.test(resolved)) {
+      escalate('deny', 'critical', `Raw block device target is forbidden: ${resolved}`, true);
     }
-    const resolved = rawPath.startsWith('/')
-      ? posix.normalize(rawPath)
-      : posix.normalize(posix.join(trackedCwd, rawPath));
     if (WIN_DRIVE_MNT_RE.test(resolved) || resolved === '/mnt') {
-      escalate('deny', 'critical', `Direct Windows drive (/mnt) access from WSL sandbox is forbidden: ${resolved}`);
+      escalate('deny', 'critical', `Direct Windows drive (/mnt) access from WSL sandbox is forbidden: ${resolved}`, true);
     }
     for (const sysPrefix of SYSTEM_PROTECTED_PREFIXES) {
       if (resolved === sysPrefix || resolved.startsWith(sysPrefix + '/')) {
-        escalate('deny', 'critical', `Protected WSL/system path access is forbidden: ${resolved}`);
+        escalate('deny', 'critical', `Protected WSL/system path access is forbidden: ${resolved}`, true);
       }
     }
     if (
+      trackExternal &&
       !resolved.startsWith('/tmp/') &&
       resolved !== '/tmp' &&
       resolved !== '/dev/null' &&
@@ -493,9 +1246,28 @@ export function evaluateBashCommand(command        , ctx                  )     
     }
   };
 
+  const scanCodeBodyForL0AndDevices = (codeBody        )       => {
+    const winMntMatch = codeBody.match(/(?:^|[\s"'(=])(\/mnt\/[a-zA-Z](?:\/[^\s"')]*)?)/);
+    if (winMntMatch?.[1]) {
+      checkPath(winMntMatch[1], false);
+    }
+    const sysMatch = codeBody.match(/(?:^|[\s"'(=])(\/(?:etc\/wsl\.conf|etc\/fstab|run\/WSL|mnt\/wsl(?:g\/distro)?))/);
+    if (sysMatch?.[1]) {
+      checkPath(sysMatch[1], false);
+    }
+    const blkMatch = codeBody.match(/(?:^|[\s"'(=])(\/dev\/(?:sd|hd|nvme|mmcblk|vd|xvd|disk|mapper|dm-|md|sr|loop|zram|ram)[^\s"']*)/);
+    if (blkMatch?.[1]) {
+      checkPath(blkMatch[1], false);
+    }
+    const physMatch = codeBody.match(/(?:^|[\s"'(=])(\/dev\/(?:ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/[^\s"']*|hidraw\d+|cdc-wdm\d+|video\d+|spidev[^\s"']*|i2c-\d+))/);
+    if (physMatch?.[1]) {
+      checkPath(physMatch[1], false);
+    }
+  };
+
   const inspectArgv = (rawTokens                   , depth        )       => {
     if (depth > MAX_WRAPPER_DEPTH) {
-      escalate('ask', 'high', `Wrapper nesting exceeded MAX_WRAPPER_DEPTH (${MAX_WRAPPER_DEPTH})`);
+      escalate('ask', 'high', `Wrapper nesting exceeded MAX_WRAPPER_DEPTH (${MAX_WRAPPER_DEPTH})`, true);
       return;
     }
 
@@ -511,31 +1283,24 @@ export function evaluateBashCommand(command        , ctx                  )     
     const cmd = basenameCmd(head);
     const args = tokens.slice(1);
 
-    // Recursive wrapper peeling: env
+    // Recursive wrapper peeling: env (including `-S` / `--split-string`, bundled `-iS`, `-u`, `-C`, `--unset=`)
     if (cmd === 'env') {
-      let i = 0;
-      while (i < args.length) {
-        const a = args[i] ;
-        if (a === '--') {
-          i++;
-          break;
+      const parsedEnv = parseEnvArgs(args, (dir) => checkPath(dir));
+      if (parsedEnv.splitPayload !== undefined) {
+        const remaining = parsedEnv.remaining ?? [];
+        const splitSegs = tokenizeBashSegments(parsedEnv.splitPayload);
+        if (splitSegs.length === 1 && splitSegs[0] .redirections.length === 0) {
+          inspectArgv([...splitSegs[0] .tokens, ...remaining], depth + 1);
+        } else {
+          inspectScript(parsedEnv.splitPayload, depth + 1);
+          if (remaining.length > 0) {
+            inspectArgv(remaining, depth + 1);
+          }
         }
-        if (a === '-i' || a === '--ignore-environment' || a === '-0' || a === '-v') {
-          i++;
-          continue;
-        }
-        if (a === '-u' || a === '-C' || a === '-S') {
-          i += 2;
-          continue;
-        }
-        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) {
-          i++;
-          continue;
-        }
-        break;
+        return;
       }
-      if (i < args.length) {
-        inspectArgv(args.slice(i), depth + 1);
+      if (parsedEnv.nextIndex < args.length) {
+        inspectArgv(args.slice(parsedEnv.nextIndex), depth + 1);
       }
       return;
     }
@@ -552,7 +1317,6 @@ export function evaluateBashCommand(command        , ctx                  )     
         }
         i += valFlags.has(f) ? 2 : 1;
       }
-      // Skip duration positional argument
       if (i < args.length) i++;
       if (i < args.length) {
         inspectArgv(args.slice(i), depth + 1);
@@ -578,7 +1342,7 @@ export function evaluateBashCommand(command        , ctx                  )     
       return;
     }
 
-    // Recursive wrapper peeling: nested shells (`bash -c "..."`, `sh -lc "..."`)
+    // Recursive wrapper peeling: nested shells (`bash -c "..."`, `sh -lc "..."`, `busybox <applet> ...`)
     if (SHELL_BINARIES.has(cmd)) {
       for (let i = 0; i < args.length; i++) {
         const a = args[i] ;
@@ -587,12 +1351,16 @@ export function evaluateBashCommand(command        , ctx                  )     
           return;
         }
       }
+      if (cmd === 'busybox' && args[0] && !args[0].startsWith('-')) {
+        inspectArgv(args, depth + 1);
+        return;
+      }
     }
 
     // Recursive wrapper peeling: sudo, doas, command, exec, nohup, nice, ionice, time, stdbuf, setsid, runuser, xargs
     if (SIMPLE_WRAPPERS.has(cmd)) {
       if (cmd === 'sudo' || cmd === 'doas' || cmd === 'runuser') {
-        escalate('deny', 'critical', `Privilege escalation wrapper is forbidden in sandbox: ${cmd}`);
+        escalate('deny', 'critical', `Privilege escalation wrapper is forbidden in sandbox: ${cmd}`, true);
       }
       let i = 0;
       const valFlags = WRAPPER_VALUE_FLAGS[cmd];
@@ -601,6 +1369,21 @@ export function evaluateBashCommand(command        , ctx                  )     
         if (f === '--') {
           i++;
           break;
+        }
+        if (f.includes('=')) {
+          if (cmd === 'xargs' && f.startsWith('--arg-file=')) {
+            checkPath(f.slice('--arg-file='.length), true);
+          }
+          i++;
+          continue;
+        }
+        if (cmd === 'xargs' && f.startsWith('-a') && f.length > 2) {
+          checkPath(f.slice(2), true);
+          i++;
+          continue;
+        }
+        if (cmd === 'xargs' && (f === '-a' || f === '--arg-file') && args[i + 1]) {
+          checkPath(args[i + 1] , true);
         }
         i += valFlags?.has(f) ? 2 : 1;
       }
@@ -615,7 +1398,7 @@ export function evaluateBashCommand(command        , ctx                  )     
 
     // L0: Block invoking Windows host interop binaries from inside WSL sandbox (Single-Shell Purity)
     if (WSL_INTEROP_BINARIES.has(cmd.toLowerCase())) {
-      escalate('deny', 'critical', `Single-shell purity violation: invoking Windows host executable (${cmd}) inside wsl_bash is forbidden`);
+      escalate('deny', 'critical', `Single-shell purity violation: invoking Windows host executable (${cmd}) inside wsl_bash is forbidden`, true);
     }
 
     // L0: Pre-Execution POSIX Bash Dialect Alignment — block accidentally pasted PowerShell cmdlets or CMD syntax inside wsl_bash
@@ -624,6 +1407,7 @@ export function evaluateBashCommand(command        , ctx                  )     
         'deny',
         'critical',
         `Shell dialect mismatch inside wsl_bash: PowerShell cmdlet '${cmd}' cannot run in POSIX Bash. Rewrite using native Bash commands (ls, mv, rm, mkdir, cp, curl).`,
+        true,
       );
     }
     if (
@@ -634,6 +1418,7 @@ export function evaluateBashCommand(command        , ctx                  )     
         'deny',
         'critical',
         `Shell dialect mismatch inside wsl_bash: Windows CMD slash-flags (${cmd} ${args.join(' ')}) detected in POSIX Bash. Use 'rm -rf <target>'.`,
+        true,
       );
     }
     if (args.some((a) => /^\$env:[A-Za-z_]/i.test(a) || /^%[A-Za-z_][A-Za-z0-9_]*%$/.test(a))) {
@@ -641,20 +1426,53 @@ export function evaluateBashCommand(command        , ctx                  )     
         'deny',
         'critical',
         `Shell dialect mismatch inside wsl_bash: Windows '$env:VAR' / '%VAR%' syntax detected in POSIX Bash. Use '$VAR'.`,
+        true,
       );
     }
 
-    // L0: Scan ALL command arguments for protected WSL escape paths (/mnt/*, /run/WSL, /etc/wsl.conf, /etc/fstab)
-    for (const a of args) {
-      if (a.startsWith('/')) {
-        const norm = posix.normalize(a);
-        if (WIN_DRIVE_MNT_RE.test(norm) || norm === '/mnt') {
-          escalate('deny', 'critical', `Direct Windows drive (/mnt) access from WSL sandbox is forbidden: ${norm}`);
+    // L3 + L0 scan on inline script interpreter invocations (`python3 -c`, `node -e`, `perl -e`, etc.)
+    if (INTERPRETER_BINARIES.has(cmd.toLowerCase())) {
+      const inlineCode = extractInlineInterpreterCode(cmd, args);
+      if (inlineCode !== null) {
+        escalate(
+          'ask',
+          'high',
+          `Inline script interpreter execution (${cmd}) requires manual single-shot approval`,
+          true,
+        );
+        scanCodeBodyForL0AndDevices(inlineCode);
+      }
+    }
+
+    // L0: Scan non-message command arguments for gha-creds, protected WSL escape paths, raw block devices & physical devices
+    for (let i = 0; i < args.length; i++) {
+      const rawArg = args[i] ;
+      const isTextArg = isBashTextOrPatternArg(cmd, args, i);
+      if (isTextArg) continue;
+
+      if (GHA_CREDS_RE.test(rawArg) || /gha-creds-[^/]*\.json/i.test(posix.basename(rawArg))) {
+        escalate('deny', 'critical', 'Access to GitHub Actions credential file (gha-creds-*.json) is forbidden', true);
+      }
+
+      const pathVal = extractPathValue(rawArg);
+      if (pathVal) {
+        const resolved = pathVal.startsWith('/')
+          ? posix.normalize(pathVal)
+          : posix.normalize(posix.join(trackedCwd, pathVal));
+        if (WIN_DRIVE_MNT_RE.test(resolved) || resolved === '/mnt') {
+          escalate('deny', 'critical', `Direct Windows drive (/mnt) access from WSL sandbox is forbidden: ${resolved}`, true);
         }
         for (const sysPrefix of SYSTEM_PROTECTED_PREFIXES) {
-          if (norm === sysPrefix || norm.startsWith(sysPrefix + '/')) {
-            escalate('deny', 'critical', `Protected WSL/system path access is forbidden: ${norm}`);
+          if (resolved === sysPrefix || resolved.startsWith(sysPrefix + '/')) {
+            escalate('deny', 'critical', `Protected WSL/system path access is forbidden: ${resolved}`, true);
           }
+        }
+        if (BLOCK_DEV_RE.test(resolved)) {
+          escalate('deny', 'critical', `Raw block device access is forbidden: ${resolved}`, true);
+        }
+        if (PHYSICAL_DEV_RE.test(resolved)) {
+          touchesPhysicalDevice = true;
+          escalate('ask', 'high', `Physical device path referenced (${resolved}); requires manual single-shot approval`, true);
         }
       }
     }
@@ -662,98 +1480,87 @@ export function evaluateBashCommand(command        , ctx                  )     
     // Check physical hardware tools (mandatory manual single-shot approval)
     if (PHYSICAL_FLASH_TOOLS.has(cmd)) {
       touchesPhysicalDevice = true;
-      escalate('ask', 'high', `Physical hardware tool detected (${cmd}); requires manual single-shot approval`);
+      escalate('ask', 'high', `Physical hardware tool detected (${cmd}); requires manual single-shot approval`, true);
     }
     if (cmd === 'fastboot') {
       const sub = args.find((a) => !a.startsWith('-'))?.toLowerCase() ?? '';
       if (!sub || !FASTBOOT_READONLY_SUBCMDS.has(sub)) {
         touchesPhysicalDevice = true;
-        escalate('ask', 'high', `Phone Bootloader / fastboot operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`);
+        escalate('ask', 'high', `Phone Bootloader / fastboot operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`, true);
       }
     }
     if (cmd === 'adb') {
-      // Skip common adb global flags (-s <serial>, -d, -e, -H <host>, -P <port>)
-      let idx = 0;
-      while (idx < args.length) {
-        const a = args[idx] ;
+      let aIdx = 0;
+      while (aIdx < args.length) {
+        const a = args[aIdx] ;
         if (a === '-s' || a === '-t' || a === '-H' || a === '-P' || a === '-L') {
-          idx += 2;
+          aIdx += 2;
         } else if (a.startsWith('-')) {
-          idx += 1;
+          aIdx += 1;
         } else {
           break;
         }
       }
-      const sub = (args[idx] ?? '').toLowerCase();
+      const sub = (args[aIdx] ?? '').toLowerCase();
       if (sub && !ADB_READONLY_SUBCMDS.has(sub)) {
         touchesPhysicalDevice = true;
-        escalate('ask', 'high', `Phone ADB mutating/device operation (${cmd} ${sub}) requires manual single-shot approval`);
+        escalate('ask', 'high', `Phone ADB mutating/device operation (${cmd} ${sub}) requires manual single-shot approval`, true);
       }
     }
     if (cmd === 'idf.py' && args.some((a) => /^(flash|monitor|erase-flash|efuse|app-flash)$/i.test(a))) {
       touchesPhysicalDevice = true;
-      escalate('ask', 'high', `MCU firmware flashing operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`);
+      escalate('ask', 'high', `MCU firmware flashing operation (${cmd} ${args.join(' ')}) requires manual single-shot approval`, true);
     }
     if ((cmd === 'pio' || cmd === 'platformio') && args.some((a) => a === '--target' || a === 'upload' || a === 'monitor')) {
       touchesPhysicalDevice = true;
-      escalate('ask', 'high', `Hardware upload/monitor operation requires manual single-shot approval`);
-    }
-    for (const a of args) {
-      if (PHYSICAL_DEV_RE.test(a)) {
-        touchesPhysicalDevice = true;
-        escalate('ask', 'high', `Physical device path referenced (${a}); requires manual single-shot approval`);
-      }
+      escalate('ask', 'high', `Hardware upload/monitor operation requires manual single-shot approval`, true);
     }
 
     // L0: Power & kernel mount/privilege tools
     if (POWER_TOOLS.has(cmd)) {
-      escalate('deny', 'critical', `System power command is forbidden: ${cmd}`);
+      escalate('deny', 'critical', `System power command is forbidden: ${cmd}`, true);
     }
     if (cmd === 'systemctl' && args.some((a) => SYSTEMCTL_POWER_VERBS.has(a))) {
-      escalate('deny', 'critical', `Dangerous systemctl power action is forbidden`);
+      escalate('deny', 'critical', `Dangerous systemctl power action is forbidden`, true);
     }
     if (KERNEL_PRIV_TOOLS.has(cmd)) {
-      escalate('deny', 'critical', `Kernel/mount privilege command is forbidden: ${cmd}`);
+      escalate('deny', 'critical', `Kernel/mount privilege command is forbidden: ${cmd}`, true);
     }
     if (cmd === 'sysctl' && args.some((a) => a === '-w' || a === '--write')) {
-      escalate('deny', 'critical', 'Kernel parameter write (sysctl -w) is forbidden');
+      escalate('deny', 'critical', 'Kernel parameter write (sysctl -w) is forbidden', true);
     }
 
     // L0: Disk formatting & block erasure
     if (DISK_WIPE_ALWAYS_DENY.has(cmd) || /^mkfs(\.\w+)?$/.test(cmd) || /^mke2fs(\.\w+)?$/.test(cmd)) {
       const onlyHelp = args.length > 0 && args.every((a) => a === '-h' || a === '--help' || a === '-V' || a === '--version');
       if (!onlyHelp) {
-        escalate('deny', 'critical', `Disk formatting/wiping command is forbidden: ${cmd}`);
+        escalate('deny', 'critical', `Disk formatting/wiping command is forbidden: ${cmd}`, true);
       }
     }
     if (DISK_READONLY_ALLOWED.has(cmd)) {
       const readOnly = args.length > 0 && args.every((a) => a === '-l' || a === '--list' || a === '-h' || a === '--help' || a === '-V' || a === '--version');
       if (!readOnly) {
-        escalate('deny', 'critical', `Mutating partition tool invocation is forbidden: ${cmd}`);
+        escalate('deny', 'critical', `Mutating partition tool invocation is forbidden: ${cmd}`, true);
       }
     }
 
-    // L0: dd / tee / cp / mv / install / truncate targeting raw block devices
+    // L0: dd (`if=` & `of=`) / raw file readers & writers targeting block devices
     if (cmd === 'dd') {
       for (const a of args) {
-        if (a.startsWith('of=')) {
-          const target = a.slice(3);
-          if (BLOCK_DEV_RE.test(target)) {
-            escalate('deny', 'critical', `dd writing to raw block device is forbidden: ${target}`);
-          }
-          checkPath(target);
+        if (a.startsWith('of=') || a.startsWith('if=')) {
+          checkPath(a);
         }
       }
     }
-    if (cmd === 'tee' || cmd === 'cp' || cmd === 'mv' || cmd === 'install' || cmd === 'truncate') {
+    if (RAW_READ_TOOLS.has(cmd)) {
       for (const a of args) {
-        if (!a.startsWith('-') && BLOCK_DEV_RE.test(a)) {
-          escalate('deny', 'critical', `${cmd} targeting raw block device is forbidden: ${a}`);
+        if (!a.startsWith('-')) {
+          checkPath(a, true);
         }
       }
     }
 
-    // L0 / L3: rm analysis (Codex ForcedRm + dsh-wsl recursive rm + root wipe L0)
+    // L0 / L3: rm analysis
     if (cmd === 'rm') {
       let forceOrRecursive = false;
       let afterDoubleDash = false;
@@ -781,7 +1588,7 @@ export function evaluateBashCommand(command        , ctx                  )     
           resolved === '/home' ||
           /^\/home\/[^/]+$/.test(resolved)
         ) {
-          escalate('deny', 'critical', `Destructive rm targeting root/system/home directory is forbidden: ${resolved}`);
+          escalate('deny', 'critical', `Destructive rm targeting root/system/home directory is forbidden: ${resolved}`, true);
         }
         checkPath(t);
       }
@@ -790,22 +1597,33 @@ export function evaluateBashCommand(command        , ctx                  )     
       }
     }
 
-    // L3: find -delete / -exec rm
+    // L3 + recursive inspection: find -delete / -exec / -execdir
     if (cmd === 'find') {
       if (args.includes('-delete')) {
-        escalate('ask', 'high', 'find -delete performs destructive deletion and requires approval');
+        escalate('ask', 'high', 'find -delete performs destructive deletion and requires approval', true);
       }
       for (let i = 0; i < args.length; i++) {
-        if (args[i] === '-exec' || args[i] === '-execdir') {
-          const execTarget = args[i + 1] ? basenameCmd(args[i + 1] ) : '';
-          if (execTarget === 'rm' || execTarget === 'sh' || execTarget === 'bash') {
-            escalate('ask', 'high', `find ${args[i]} ${execTarget} requires approval`);
+        const flag = args[i] ;
+        if (flag === '-exec' || flag === '-execdir' || flag === '-ok' || flag === '-okdir') {
+          const execTokens           = [];
+          let j = i + 1;
+          while (j < args.length && args[j] !== ';' && args[j] !== '+') {
+            execTokens.push(args[j] === '{}' ? './target' : args[j] );
+            j++;
           }
+          if (execTokens.length > 0) {
+            inspectArgv(execTokens, depth + 1);
+            const execTarget = basenameCmd(execTokens[0] );
+            if (execTarget === 'rm' || execTarget === 'sh' || execTarget === 'bash' || execTarget === 'unlink') {
+              escalate('ask', 'high', `find ${flag} ${execTarget} requires approval`, true);
+            }
+          }
+          i = j;
         }
       }
     }
 
-    // L3: git dangerous flags & parameters (Gemini CLI + Codex)
+    // L3: git dangerous flags & parameters
     if (cmd === 'git') {
       let subIdx = 0;
       while (subIdx < args.length) {
@@ -815,7 +1633,7 @@ export function evaluateBashCommand(command        , ctx                  )     
           const resolved = dirArg.startsWith('/') ? posix.normalize(dirArg) : posix.normalize(posix.join(trackedCwd, dirArg));
           if (!isPathInside(ctx.workspaceRoot, resolved)) {
             externalPaths.add(resolved);
-            escalate('ask', 'high', `git -C targets directory outside workspace: ${resolved}`);
+            escalate('ask', 'high', `git -C targets directory outside workspace: ${resolved}`, true);
           }
           subIdx += 2;
           continue;
@@ -825,7 +1643,7 @@ export function evaluateBashCommand(command        , ctx                  )     
           const resolved = dirArg.startsWith('/') ? posix.normalize(dirArg) : posix.normalize(posix.join(trackedCwd, dirArg));
           if (!isPathInside(ctx.workspaceRoot, resolved)) {
             externalPaths.add(resolved);
-            escalate('ask', 'high', `git ${a} targets external directory: ${resolved}`);
+            escalate('ask', 'high', `git ${a} targets external directory: ${resolved}`, true);
           }
           subIdx++;
           continue;
@@ -890,12 +1708,19 @@ export function evaluateBashCommand(command        , ctx                  )     
 
   const inspectScript = (rawScript        , depth        )       => {
     if (depth > MAX_WRAPPER_DEPTH) {
-      escalate('ask', 'high', `Script substitution nesting exceeded MAX_WRAPPER_DEPTH (${MAX_WRAPPER_DEPTH})`);
+      escalate('ask', 'high', `Script substitution nesting exceeded MAX_WRAPPER_DEPTH (${MAX_WRAPPER_DEPTH})`, true);
       return;
     }
-    const normalized = normalizeIfs(rawScript);
 
-    // Inspect command/process substitutions recursively
+    const { script: cleanedScript, heredocs } = stripContinuationsAndExtractHeredocs(rawScript);
+    const normalized = normalizeIfs(cleanedScript);
+
+    if (isForkBomb(normalized)) {
+      escalate('deny', 'critical', 'Fork bomb pattern detected', true);
+      return;
+    }
+
+    // Inspect command/process substitutions recursively outside quoted heredocs
     for (const nested of extractSubstitutions(normalized)) {
       inspectScript(nested, depth + 1);
     }
@@ -903,26 +1728,80 @@ export function evaluateBashCommand(command        , ctx                  )     
     const segments = tokenizeBashSegments(normalized);
     for (let i = 0; i < segments.length; i++) {
       const seg = segments[i] ;
-      // Check redirection targets
+      const targetCmd = unwrapPipeTargetCmd(seg.tokens);
+
+      // Look ahead across connected pipeline segments to detect heredocs piped into shells/interpreters
+      let pipelineFeedsShell = false;
+      let pipelineFeedsInterp = false;
+      for (let p = i; p + 1 < segments.length && segments[p] .pipedToNext; p++) {
+        const downCmd = unwrapPipeTargetCmd(segments[p + 1] .tokens);
+        if (SHELL_BINARIES.has(downCmd)) pipelineFeedsShell = true;
+        if (INTERPRETER_BINARIES.has(downCmd.toLowerCase())) pipelineFeedsInterp = true;
+      }
+
+      // Check redirections (>, >>, >|, &>, &>>, <, <<, <<<)
       for (const redir of seg.redirections) {
-        if (redir.op.startsWith('>')) {
-          checkPath(redir.target);
+        if (redir.op === '<<') {
+          const hd = heredocs.get(redir.target);
+          if (hd) {
+            if (!hd.quotedDelim) {
+              for (const nested of extractSubstitutions(hd.body)) {
+                inspectScript(nested, depth + 1);
+              }
+            }
+            if (SHELL_BINARIES.has(targetCmd) || pipelineFeedsShell) {
+              inspectScript(hd.body, depth + 1);
+            } else if (INTERPRETER_BINARIES.has(targetCmd.toLowerCase()) || pipelineFeedsInterp) {
+              escalate('ask', 'high', `Heredoc execution via interpreter (${targetCmd}) requires single-shot approval`, true);
+              scanCodeBodyForL0AndDevices(hd.body);
+            }
+          }
+          continue;
+        }
+        if (redir.op === '<<<') {
+          if (SHELL_BINARIES.has(targetCmd)) {
+            inspectScript(redir.target, depth + 1);
+          } else if (INTERPRETER_BINARIES.has(targetCmd.toLowerCase())) {
+            escalate('ask', 'high', `Here-string execution via interpreter (${targetCmd}) requires single-shot approval`, true);
+            scanCodeBodyForL0AndDevices(redir.target);
+          }
+          if (GHA_CREDS_RE.test(redir.target) || /gha-creds-[^/]*\.json/i.test(posix.basename(redir.target))) {
+            escalate('deny', 'critical', 'Access to GitHub Actions credential file (gha-creds-*.json) is forbidden', true);
+          }
+          continue;
+        }
+        if (redir.op === '<') {
+          checkPath(redir.target, true);
+          if (SHELL_BINARIES.has(targetCmd)) {
+            escalate('ask', 'high', `Redirecting script file into shell (${targetCmd} < ${redir.target}) requires single-shot approval`, true);
+          }
+          continue;
+        }
+        if (redir.op.startsWith('>') || redir.op === '&>' || redir.op === '&>>') {
+          checkPath(redir.target, true);
         }
       }
-      // Detect dangerous `curl/wget ... | sh/bash` pipe-to-shell patterns
+
+      // Detect dangerous `curl/wget ... | sh/bash` and `curl/wget ... | python/node/perl/ruby/php` patterns (peeling wrappers on both sides!)
       if (seg.pipedToNext && i + 1 < segments.length) {
-        const curHead = seg.tokens[0];
-        const curCmd = curHead ? basenameCmd(curHead) : '';
-        const nextHead = segments[i + 1] .tokens[0];
-        const nextCmd = nextHead ? basenameCmd(nextHead) : '';
-        if (SHELL_BINARIES.has(nextCmd)) {
+        const curCmd = targetCmd;
+        const nextCmd = unwrapPipeTargetCmd(segments[i + 1] .tokens);
+        const nextIsShell = SHELL_BINARIES.has(nextCmd);
+        const nextIsInterp = INTERPRETER_BINARIES.has(nextCmd.toLowerCase());
+        if (nextIsShell || (DOWNLOAD_CRADLE_TOOLS.has(curCmd) && nextIsInterp)) {
           if (DOWNLOAD_CRADLE_TOOLS.has(curCmd)) {
-            escalate('deny', 'critical', `Remote download piped directly into shell (${curCmd} | ${nextCmd}) is forbidden`);
-          } else {
-            escalate('ask', 'high', `Piping stream directly into shell (${nextCmd}) requires approval`);
+            escalate(
+              'deny',
+              'critical',
+              `Remote download piped directly into shell/interpreter (${curCmd} | ${nextCmd}) is forbidden`,
+              true,
+            );
+          } else if (nextIsShell) {
+            escalate('ask', 'high', `Piping stream directly into shell (${nextCmd}) requires single-shot approval`, true);
           }
         }
       }
+
       inspectArgv(seg.tokens, depth);
     }
   };
@@ -930,12 +1809,17 @@ export function evaluateBashCommand(command        , ctx                  )     
   inspectScript(command, 0);
 
   if (externalPaths.size > 0 && decision === 'allow') {
-    escalate('ask', 'elevated', `Command references path(s) outside workspaceRoot: ${Array.from(externalPaths).join(', ')}`);
+    escalate('ask', 'elevated', `Command references path(s) outside workspaceRoot: ${Array.from(externalPaths).join(', ')}`, true);
   }
 
   const firstUnwrapped = unwrappedCommands[0];
   let suggestedPrefix                      ;
-  let requiresSessionRuleBlocked = touchesPhysicalDevice || decision === 'deny';
+  let requiresSessionRuleBlocked =
+    touchesPhysicalDevice ||
+    decision === 'deny' ||
+    forceBlockSessionRule ||
+    unwrappedCommands.length !== 1 ||
+    externalPaths.size > 0;
 
   if (firstUnwrapped && firstUnwrapped.length > 0 && !requiresSessionRuleBlocked) {
     const candidate = firstUnwrapped.slice(0, Math.min(2, firstUnwrapped.length));
@@ -957,4 +1841,100 @@ export function evaluateBashCommand(command        , ctx                  )     
     suggestedPrefix,
     externalPaths: Array.from(externalPaths),
   };
+}
+
+                                            
+                                           
+                                                 
+ 
+
+/**
+ * Extracts normalized non-prose command arguments and redirection targets from a POSIX Bash
+ * script (respecting heredocs, line continuations, `$'...'`, and `git`/`rg`/`echo` prose args)
+ * so host-side guards reuse the exact Bash lexer without duplicating tokenization logic.
+ */
+export function extractBashNonProseTargets(command        )                            {
+  const nonProseArgs           = [];
+  const redirectionTargets           = [];
+  if (typeof command !== 'string' || command.length === 0 || command.length > MAX_GUARD_CHARS) {
+    return { nonProseArgs, redirectionTargets };
+  }
+
+  const walk = (rawScript        , depth        )       => {
+    if (depth > MAX_WRAPPER_DEPTH) return;
+    const { script: cleanedScript, heredocs } = stripContinuationsAndExtractHeredocs(rawScript);
+    const normalized = normalizeIfs(cleanedScript);
+
+    for (const nested of extractSubstitutions(normalized)) {
+      walk(nested, depth + 1);
+    }
+
+    const segments = tokenizeBashSegments(normalized);
+    for (let i = 0; i < segments.length; i++) {
+      const seg = segments[i] ;
+      const targetCmd = unwrapPipeTargetCmd(seg.tokens);
+      let pipelineFeedsShell = false;
+      for (let p = i; p + 1 < segments.length && segments[p] .pipedToNext; p++) {
+        if (SHELL_BINARIES.has(unwrapPipeTargetCmd(segments[p + 1] .tokens))) {
+          pipelineFeedsShell = true;
+        }
+      }
+      for (const redir of seg.redirections) {
+        if (redir.op === '<<') {
+          const hd = heredocs.get(redir.target);
+          if (hd) {
+            if (!hd.quotedDelim) {
+              for (const nested of extractSubstitutions(hd.body)) {
+                walk(nested, depth + 1);
+              }
+            }
+            if (SHELL_BINARIES.has(targetCmd) || pipelineFeedsShell) {
+              walk(hd.body, depth + 1);
+            }
+          }
+          continue;
+        }
+        if (redir.op === '<<<') {
+          if (SHELL_BINARIES.has(targetCmd)) {
+            walk(redir.target, depth + 1);
+          } else {
+            nonProseArgs.push(redir.target);
+          }
+          continue;
+        }
+        redirectionTargets.push(redir.target);
+      }
+
+      // Skip leading VAR=VALUE assignments to identify command head and args cleanly
+      let idx = 0;
+      while (idx < seg.tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(seg.tokens[idx] )) {
+        idx++;
+      }
+      const tokens = seg.tokens.slice(idx);
+      if (tokens.length === 0) continue;
+      const cmd = basenameCmd(tokens[0] );
+      const args = tokens.slice(1);
+      if (cmd === 'env') {
+        const parsedEnv = parseEnvArgs(args);
+        if (parsedEnv.splitPayload !== undefined) {
+          walk(parsedEnv.splitPayload, depth + 1);
+        }
+      } else if (SHELL_BINARIES.has(cmd)) {
+        for (let aIdx = 0; aIdx < args.length; aIdx++) {
+          if (/^-[a-zA-Z]*c[a-zA-Z]*$/.test(args[aIdx] ) && aIdx + 1 < args.length) {
+            walk(args[aIdx + 1] , depth + 1);
+            break;
+          }
+        }
+      }
+      for (let aIdx = 0; aIdx < args.length; aIdx++) {
+        if (!isBashTextOrPatternArg(cmd, args, aIdx)) {
+          nonProseArgs.push(args[aIdx] );
+        }
+      }
+    }
+  };
+
+  walk(command, 0);
+  return { nonProseArgs, redirectionTargets };
 }

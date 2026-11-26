@@ -66,8 +66,9 @@ import { failSandbox } from './errors.js';
  
 
 const VALID_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const VALID_LINUX_USERNAME_RE = /^[a-z_][a-z0-9_.-]{0,31}$/;
 const VALID_SHARE_ALIAS_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
-const ALLOWED_DEVICE_RE = /^\/dev\/(ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/\d{3}\/\d{3}|hidraw\d+|cdc-wdm\d+|video\d+)$/;
+const ALLOWED_DEVICE_RE = /^\/dev\/(ttyUSB\d+|ttyACM\d+|ttyS\d+|bus\/usb\/\d{3}\/\d{3}|hidraw\d+|cdc-wdm\d+|video\d+|spidev\d+\.\d+|i2c-\d+)$/;
 
 const INTERNAL_DISTRO_PATTERNS = [
   /^docker-desktop$/i,
@@ -100,19 +101,46 @@ const FORBIDDEN_WORKSPACE_ROOTS = new Set([
   '/tmp',
   '/usr',
   '/var',
+  '/var/run',
 ]);
 
 const FORBIDDEN_WORKSPACE_PREFIXES = [
+  '/bin/',
+  '/boot/',
   '/dev/',
   '/etc/',
+  '/lib/',
+  '/lib64/',
   '/mnt/',
   '/proc/',
+  '/root/',
   '/run/',
+  '/sbin/',
   '/sys/',
+  '/usr/',
+  '/var/run/',
 ];
 
 export function isValidIdentifier(value         )                  {
   return typeof value === 'string' && VALID_ID_RE.test(value);
+}
+
+/**
+ * Validates a WSL distribution name including custom/DIY WSL Manager imports with spaces,
+ * parentheses, or Unicode characters (e.g. `'AI workspace'`, `'Ubuntu (Lab)'`), while blocking
+ * control characters, Windows path/UNC separators, and traversal segments.
+ */
+export function isValidDistroName(value         )                  {
+  if (typeof value !== 'string') return false;
+  if (value.length === 0 || value.length > 128) return false;
+  if (value.trim() !== value) return false;
+  if (value === '.' || value === '..') return false;
+  if (/[\x00-\x1f\x7f/\\:*?"<>|]/.test(value)) return false;
+  return true;
+}
+
+export function isValidLinuxUsername(value         )                  {
+  return typeof value === 'string' && VALID_LINUX_USERNAME_RE.test(value);
 }
 
 export function isSafeAbsoluteLinuxPath(value         )                  {
@@ -162,7 +190,7 @@ export function validateWorkspaceRoot(linuxPath        , username         )     
   if (FORBIDDEN_CONFIG_PATH_PATTERNS.some((re) => re.test(linuxPath))) {
     failSandbox('POLICY_BLOCK', `Workspace root cannot point to private config/credential directory: ${linuxPath}`);
   }
-  if (username && (linuxPath === `/home/${username}` || linuxPath === '/root')) {
+  if (/^\/home\/[^/]+$/.test(linuxPath) || (username && (linuxPath === `/home/${username}` || linuxPath === '/root'))) {
     failSandbox('POLICY_BLOCK', `Entire user home directory cannot be mounted as workspaceRoot: ${linuxPath}`);
   }
   return linuxPath;
@@ -176,6 +204,7 @@ const FORBIDDEN_WINDOWS_MOUNT_PATTERNS = [
   /^\/mnt\/[a-z]\/system volume information(?:\/|$)/i,
   /^\/mnt\/[a-z]\/\$recycle\.bin(?:\/|$)/i,
   /^\/mnt\/[a-z]\/recovery(?:\/|$)/i,
+  /^\/mnt\/[a-z]\/users$/i,
   /^\/mnt\/[a-z]\/users\/[^/]+$/i,
   /^\/mnt\/[a-z]\/users\/[^/]+\/appdata(?:\/|$)/i,
 ];
@@ -263,13 +292,22 @@ export function validateShareEntry(share                 )                  {
     FORBIDDEN_WORKSPACE_ROOTS.has(normalizedSource) ||
     FORBIDDEN_WINDOWS_MOUNT_PATTERNS.some((re) => re.test(normalizedSource)) ||
     FORBIDDEN_CONFIG_PATH_PATTERNS.some((re) => re.test(normalizedSource)) ||
-    normalizedSource.startsWith('/mnt/wslg/distro') ||
-    normalizedSource.startsWith('/mnt/wsl/') ||
-    normalizedSource.startsWith('/run/WSL') ||
-    normalizedSource.startsWith('/etc') ||
-    normalizedSource.startsWith('/proc') ||
-    normalizedSource.startsWith('/sys') ||
-    normalizedSource.startsWith('/dev')
+    /^\/home\/[^/]+$/.test(normalizedSource) ||
+    isPathInside('/mnt/wslg/distro', normalizedSource) ||
+    isPathInside('/mnt/wsl', normalizedSource) ||
+    isPathInside('/run/WSL', normalizedSource) ||
+    isPathInside('/etc', normalizedSource) ||
+    isPathInside('/proc', normalizedSource) ||
+    isPathInside('/sys', normalizedSource) ||
+    isPathInside('/dev', normalizedSource) ||
+    isPathInside('/root', normalizedSource) ||
+    isPathInside('/boot', normalizedSource) ||
+    isPathInside('/usr', normalizedSource) ||
+    isPathInside('/bin', normalizedSource) ||
+    isPathInside('/sbin', normalizedSource) ||
+    isPathInside('/lib', normalizedSource) ||
+    isPathInside('/lib64', normalizedSource) ||
+    isPathInside('/var/run', normalizedSource)
   ) {
     failSandbox(
       'POLICY_BLOCK',
@@ -292,7 +330,7 @@ export function validateDeviceNode(node                      )                  
   if (typeof node.path !== 'string' || !ALLOWED_DEVICE_RE.test(node.path)) {
     failSandbox(
       'POLICY_BLOCK',
-      `Only explicit USB/serial/HID/CDC/video device nodes (/dev/ttyUSB*, /dev/ttyACM*, /dev/ttyS*, /dev/bus/usb/NNN/NNN, /dev/hidraw*, /dev/cdc-wdm*, /dev/video*) are allowed: ${node.path}`,
+      `Only explicit USB/serial/HID/CDC/video/SPI/I2C device nodes (/dev/ttyUSB*, /dev/ttyACM*, /dev/ttyS*, /dev/bus/usb/NNN/NNN, /dev/hidraw*, /dev/cdc-wdm*, /dev/video*, /dev/spidevX.Y, /dev/i2c-N) are allowed: ${node.path}`,
     );
   }
   return Object.freeze({ path: node.path, label: node.label });
@@ -303,11 +341,11 @@ export function isInternalContainerDistro(distro        )          {
 }
 
 export function parseWslUncPath(uncPath        )                                                     {
-  const match = uncPath.match(/^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)(.*)$/i);
+  const match = uncPath.match(/^\\\\(?:\?\\UNC\\)?(?:wsl\.localhost|wsl\$)\\([^\\]+)(.*)$/i);
   if (!match) return null;
   const distribution = match[1];
   const rest = match[2] ?? '';
-  if (!distribution || !isValidIdentifier(distribution)) return null;
+  if (!distribution || !isValidDistroName(distribution)) return null;
   const linuxPath = posix.normalize('/' + rest.replace(/\\/g, '/'));
   const normalized = linuxPath.length > 1 && linuxPath.endsWith('/') ? linuxPath.slice(0, -1) : linuxPath;
   if (!isSafeAbsoluteLinuxPath(normalized)) return null;
@@ -324,7 +362,7 @@ export function validateProbeAndCreateBinding(
   if (probe.wslVersion !== 2) {
     failSandbox('BACKEND_UNAVAILABLE', `WSL version ${probe.wslVersion} is unsupported; WSL 2 is required`);
   }
-  if (!isValidIdentifier(probe.sessionId) || !isValidIdentifier(probe.distribution)) {
+  if (!isValidIdentifier(probe.sessionId) || !isValidDistroName(probe.distribution)) {
     failSandbox('BACKEND_UNAVAILABLE', 'Invalid sessionId or distribution name');
   }
   if (isInternalContainerDistro(probe.distribution)) {
@@ -333,7 +371,7 @@ export function validateProbeAndCreateBinding(
   if (!Number.isSafeInteger(probe.uid) || probe.uid <= 0) {
     failSandbox('BACKEND_UNAVAILABLE', `Non-root Linux UID required (got ${probe.uid})`);
   }
-  if (!isValidIdentifier(probe.username)) {
+  if (!isValidLinuxUsername(probe.username)) {
     failSandbox('BACKEND_UNAVAILABLE', `Invalid Linux username: ${probe.username}`);
   }
   if (probe.arch !== 'x86_64' && probe.arch !== 'aarch64') {
@@ -412,9 +450,17 @@ export function validateProbeAndCreateBinding(
                                         
                                     
                               
+                                           
+                            
                                                          
                                                                
  
+
+function expandTildePath(rawPath        , homeDir        )         {
+  if (rawPath === '~') return posix.normalize(homeDir);
+  if (rawPath.startsWith('~/')) return posix.normalize(posix.join(homeDir, rawPath.slice(2)));
+  return posix.normalize(rawPath);
+}
 
 export function assertVerifiedProbe(
   probe                ,
@@ -426,11 +472,36 @@ export function assertVerifiedProbe(
   if (probe.distribution !== expected.expectedDistribution) {
     failSandbox('STALE_BINDING', `Probe distribution mismatch: ${probe.distribution} !== ${expected.expectedDistribution}`);
   }
-  if (probe.workspaceRoot !== expected.expectedWorkspaceRoot) {
-    failSandbox('STALE_BINDING', `Probe workspaceRoot mismatch: ${probe.workspaceRoot} !== ${expected.expectedWorkspaceRoot}`);
+
+  const effectiveHome = expected.homeDir ?? (probe.username ? `/home/${probe.username}` : undefined);
+  const resolvedExpectedWorkspace =
+    effectiveHome && (expected.expectedWorkspaceRoot === '~' || expected.expectedWorkspaceRoot.startsWith('~/'))
+      ? expandTildePath(expected.expectedWorkspaceRoot, effectiveHome)
+      : expected.expectedWorkspaceRoot;
+  const resolvedExpectedCwd =
+    effectiveHome && (expected.expectedCwd === '~' || expected.expectedCwd.startsWith('~/'))
+      ? expandTildePath(expected.expectedCwd, effectiveHome)
+      : expected.expectedCwd;
+
+  if (expected.requestedWorkspaceRoot !== undefined) {
+    const resolvedRequested =
+      effectiveHome
+        ? expandTildePath(expected.requestedWorkspaceRoot, effectiveHome)
+        : posix.normalize(expected.requestedWorkspaceRoot);
+    validateWorkspaceRoot(resolvedRequested, probe.username);
+    if (probe.workspaceRoot !== resolvedRequested) {
+      failSandbox(
+        'STALE_BINDING',
+        `Probe workspaceRoot mismatch against requestedWorkspaceRoot: ${probe.workspaceRoot} !== ${resolvedRequested}`,
+      );
+    }
   }
-  if (probe.cwd !== expected.expectedCwd) {
-    failSandbox('STALE_BINDING', `Probe cwd mismatch: ${probe.cwd} !== ${expected.expectedCwd}`);
+
+  if (probe.workspaceRoot !== resolvedExpectedWorkspace) {
+    failSandbox('STALE_BINDING', `Probe workspaceRoot mismatch: ${probe.workspaceRoot} !== ${resolvedExpectedWorkspace}`);
+  }
+  if (probe.cwd !== resolvedExpectedCwd) {
+    failSandbox('STALE_BINDING', `Probe cwd mismatch: ${probe.cwd} !== ${resolvedExpectedCwd}`);
   }
   if (probe.profile !== expected.expectedProfile) {
     failSandbox('STALE_BINDING', `Probe profile mismatch: ${probe.profile} !== ${expected.expectedProfile}`);

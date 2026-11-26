@@ -6,6 +6,7 @@ export * from './seccomp-bpf.ts';
 export * from './bwrap-builder.ts';
 export * from './bash-ast-guard.ts';
 export * from './pwsh-guard.ts';
+export * from './pwsh-system-parser.ts';
 export * from './approval-controller.ts';
 export * from './uds-proxy.ts';
 export * from './protocol.ts';

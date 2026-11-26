@@ -26,8 +26,9 @@ if (!fs.existsSync(coreIndex) || !fs.existsSync(pwshHook)) {
 }
 
 const {
+  disposeSystemPwshParser,
   evaluateBashCommand,
-  evaluatePwshCommand,
+  evaluatePwshCommandWithSystemAst,
   validateDeviceNode,
   validateShareEntry,
 } = await import('../dist/packages/core/src/index.js');
@@ -63,7 +64,7 @@ function decisionSatisfies(actual, expected) {
   return actual === expected;
 }
 
-export function runDangerousCommandMatrix(cases) {
+export async function runDangerousCommandMatrix(cases) {
   const results = [];
   let passed = 0;
   let falseNegatives = 0;
@@ -82,7 +83,7 @@ export function runDangerousCommandMatrix(cases) {
     let reasons = [];
 
     if (surface === 'pwsh') {
-      const res = evaluatePwshCommand(String(tc.command ?? ''));
+      const res = await evaluatePwshCommandWithSystemAst(String(tc.command ?? ''));
       actualDecision = res.decision;
       touchesPhysicalDevice = res.touchesPhysicalDevice;
       requiresSessionRuleBlocked = res.requiresSessionRuleBlocked;
@@ -211,7 +212,12 @@ if (isMain) {
   }
 
   const cases = parseInputFile(inputPath);
-  const report = runDangerousCommandMatrix(cases);
+  let report;
+  try {
+    report = await runDangerousCommandMatrix(cases);
+  } finally {
+    await disposeSystemPwshParser();
+  }
 
   if (asJson) {
     console.log(JSON.stringify(report, null, 2));
