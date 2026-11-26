@@ -9,3 +9,5 @@ export * from './pwsh-guard.js';
 export * from './approval-controller.js';
 export * from './uds-proxy.js';
 export * from './protocol.js';
+export * from './logger.js';
+export * from './node-runtime.js';

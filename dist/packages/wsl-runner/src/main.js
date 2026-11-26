@@ -10,16 +10,21 @@ import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import {
+  formatRunnerWireLog,
   isSandboxError,
+                      
   MAX_RPC_FRAME_BYTES,
+  normalizeLogLevel,
                    
                       
                             
+  RotatingNdjsonSink,
                           
                            
                   
                    
                       
+  StructuredLogger,
                           
   UdsAllowlistProxy,
 } from '../../core/src/index.js';
@@ -31,6 +36,44 @@ import { ConfinedTerminalManager } from './pty-manager.js';
 const runnerId = randomUUID();
 const startedAt = Date.now();
 const leaseMs = Number(process.env.DSH_WSL_RUNNER_LEASE_MS || 0);
+
+const runnerLogDir =
+  process.env.DSH_WSL_RUNNER_LOG_DIR || path.join(os.homedir(), '.config', 'dsh-wsl-sandbox', 'logs');
+// When paired with Host WslTransport, runner logs stream over memory stderr pipe to Host's coalesced sink
+// so we NEVER double-write every log line to both WSL VHDX ext4 and Windows NTFS!
+const runnerFileSink =
+  process.env.DSH_WSL_RUNNER_FILE_LOG === '1' && process.env.DSH_WSL_DISABLE_FILE_LOG !== '1'
+    ? new RotatingNdjsonSink({
+        logDir: runnerLogDir,
+        fileName: 'wsl-runner.ndjson',
+        maxBytes: 5 * 1024 * 1024,
+        maxFiles: 3,
+        flushIntervalMs: 2500,
+      })
+    : undefined;
+
+const runnerLogger = new StructuredLogger({
+  source: 'wsl-runner',
+  level: normalizeLogLevel(process.env.DSH_WSL_LOG_LEVEL, 'info'),
+  fileSink: runnerFileSink,
+  preloadFromDisk: false,
+  onEntry: (entry) => {
+    try {
+      process.stderr.write(formatRunnerWireLog(entry));
+    } catch {
+      // ignore broken stderr during teardown
+    }
+  },
+});
+
+const rlog = runnerLogger.child('runner');
+rlog.info('runner.start', 'WSL sandbox runner started', {
+  runnerId,
+  nodeVersion: process.version,
+  nodeExecPath: process.execPath,
+  leaseMs,
+  logFilePath: runnerLogger.getLogFilePath() ?? null,
+});
 
 const fsService = new ConfinedFsService();
 const procManager = new ConfinedProcManager();
@@ -85,6 +128,7 @@ async function configureManagedProxy(params                      )              
     if (managedProxy) {
       await managedProxy.stop();
       managedProxy = undefined;
+      rlog.info('proxy.stopped', 'Managed UDS allowlist proxy stopped');
     }
     return { enabled: false };
   }
@@ -96,6 +140,10 @@ async function configureManagedProxy(params                      )              
       localLabCidrs: params.localLabCidrs ?? [],
       localLabPorts: params.localLabPorts ?? [],
     });
+    rlog.debug('proxy.updated', 'Managed UDS allowlist proxy policy updated', {
+      customDomains: (params.customAllowedDomains ?? []).length,
+      hasUpstreamProxy: Boolean(params.upstreamProxy),
+    });
     return { enabled: true, socketPath: managedProxy.getSocketPath() };
   }
 
@@ -106,9 +154,29 @@ async function configureManagedProxy(params                      )              
     localLabCidrs: params.localLabCidrs,
     localLabPorts: params.localLabPorts,
     authorizeUnknownHost: (host, port) => requestHostProxyAuthorization(host, port),
+    onDenied: ({ host, port, reason }) => {
+      runnerLogger.log('warn', {
+        component: 'proxy',
+        event: 'proxy.blocked',
+        message: `Blocked outbound connection to ${host}:${port} (${reason})`,
+        data: { host, port, reason },
+      });
+    },
+    onAllowed: ({ host, port, via }) => {
+      runnerLogger.log('debug', {
+        component: 'proxy',
+        event: 'proxy.allowed',
+        message: `Allowed outbound connection to ${host}:${port} via ${via}`,
+        data: { host, port, via },
+      });
+    },
   });
   await proxy.start();
   managedProxy = proxy;
+  rlog.info('proxy.started', 'Managed UDS allowlist proxy started', {
+    socketPath: proxy.getSocketPath(),
+    hasUpstreamProxy: Boolean(params.upstreamProxy),
+  });
   return { enabled: true, socketPath: proxy.getSocketPath() };
 }
 
@@ -133,13 +201,37 @@ async function handleRequest(req            )                   {
         ok: true,
         pid: process.pid,
         runnerId,
+        nodeVersion: process.version,
+        nodeExecPath: process.execPath,
         uptimeMs: Date.now() - startedAt,
         activeProcs: procManager.getActiveCount(),
         proxyEnabled: Boolean(managedProxy),
       };
 
-    case 'probe':
-      return runEnvironmentProbe(p                          , runnerId);
+    case 'probe': {
+      const t0 = Date.now();
+      const probeRes = await runEnvironmentProbe(p                          , runnerId);
+      rlog.info(
+        'probe.completed',
+        `Environment probe completed (ready=${probeRes.sandboxReady}, enforcement=${probeRes.enforcement})`,
+        {
+          distribution: probeRes.distribution,
+          uid: probeRes.uid,
+          username: probeRes.username,
+          workspaceRoot: probeRes.workspaceRoot,
+          sandboxReady: probeRes.sandboxReady,
+          enforcement: probeRes.enforcement,
+          nodeVersion: process.version,
+          nodeExecPath: process.execPath,
+        },
+        { sessionId: probeRes.sessionId, durationMs: Date.now() - t0 },
+      );
+      return {
+        ...probeRes,
+        nodeVersion: process.version,
+        nodeExecPath: process.execPath,
+      };
+    }
 
     case 'proxy.configure':
       return configureManagedProxy(p                                   );
@@ -148,6 +240,12 @@ async function handleRequest(req            )                   {
       const host = String(p.host ?? '').trim();
       if (managedProxy && host) {
         managedProxy.addSessionAllowedDomain(host);
+        runnerLogger.log('info', {
+          component: 'proxy',
+          event: 'proxy.domainApproved',
+          message: `Approved domain '${host}' for current runner session`,
+          data: { host },
+        });
         return { approved: true, host };
       }
       return { approved: false, host };
@@ -192,8 +290,32 @@ async function handleRequest(req            )                   {
     case 'fs.move':
       return fsService.move(p                                                                    );
 
-    case 'proc.exec':
-      return procManager.exec(withManagedProxy({ ...(p                             ), ownerRunnerId: runnerId }));
+    case 'proc.exec': {
+      const execParams = withManagedProxy({ ...(p                             ), ownerRunnerId: runnerId });
+      const t0 = Date.now();
+      const res = await procManager.exec(execParams);
+      const dur = Date.now() - t0;
+      const lvl = res.timedOut || res.sandbox.denied || res.sandbox.runnerFailed ? 'warn' : 'info';
+      runnerLogger.log(lvl, {
+        component: 'proc',
+        event: 'proc.exec',
+        message: `Sandbox exec finished (exit=${res.exitCode}, timedOut=${res.timedOut}, denied=${res.sandbox.denied})`,
+        sessionId: execParams.binding?.sessionId,
+        durationMs: dur,
+        data: {
+          cwd: execParams.cwd,
+          mode: execParams.mode,
+          networkMode: execParams.networkMode,
+          exitCode: res.exitCode,
+          signal: res.signal,
+          timedOut: res.timedOut,
+          aborted: res.aborted,
+          denied: res.sandbox.denied,
+          denialMatches: res.sandbox.denialMatches,
+        },
+      });
+      return res;
+    }
 
     case 'proc.kill':
       return { killed: await procManager.kill(String(p.execId ?? '')) };
@@ -207,7 +329,25 @@ async function handleRequest(req            )                   {
 
     case 'term.exec': {
       const tp = p                                 ;
-      return termManager.exec({ ...withManagedProxy({ ...tp, ownerRunnerId: runnerId }), terminalId: tp.terminalId });
+      const t0 = Date.now();
+      const res = await termManager.exec({ ...withManagedProxy({ ...tp, ownerRunnerId: runnerId }), terminalId: tp.terminalId });
+      const dur = Date.now() - t0;
+      const lvl = res.timedOut || res.sandbox.denied ? 'warn' : 'info';
+      runnerLogger.log(lvl, {
+        component: 'terminal',
+        event: 'term.exec',
+        message: `Terminal '${tp.terminalId}' exec finished (exit=${res.exitCode}, cwd=${res.cwd})`,
+        sessionId: tp.binding?.sessionId,
+        durationMs: dur,
+        data: {
+          terminalId: tp.terminalId,
+          cwd: res.cwd,
+          exitCode: res.exitCode,
+          timedOut: res.timedOut,
+          denied: res.sandbox.denied,
+        },
+      });
+      return res;
     }
 
     case 'term.reset':
@@ -239,10 +379,37 @@ async function handleRequest(req            )                   {
         managedProxy?.clearSessionAllowedDomains();
       }
       const killedCount = await procManager.invalidateGeneration(gen, { sessionId, terminalId });
+      rlog.info(
+        'session.invalidate',
+        `Invalidated generation < ${gen} (killed=${killedCount})`,
+        { generation: gen, killedCount, scopedSessionId: sessionId ?? null, scopedTerminalId: terminalId ?? null },
+        { sessionId },
+      );
       return { killedCount, scopedSessionId: sessionId ?? null, scopedTerminalId: terminalId ?? null };
     }
 
+    case 'logs.tail': {
+      const entries = runnerLogger.query(p                             );
+      return {
+        ok: true,
+        entries,
+        level: runnerLogger.getLevel(),
+        bufferedCount: runnerLogger.getBufferedCount(),
+      };
+    }
+
+    case 'logs.setLevel': {
+      const nextLvl = normalizeLogLevel(p.level, runnerLogger.getLevel());
+      runnerLogger.setLevel(nextLvl);
+      return { ok: true, level: nextLvl };
+    }
+
+    case 'logs.clear': {
+      return { ok: true, ...runnerLogger.clear() };
+    }
+
     case 'shutdown': {
+      rlog.info('runner.shutdown', 'Graceful shutdown requested by host');
       // Respond cleanly first so host transport knows graceful cleanup completed, then exit
       setImmediate(() => {
         void shutdown();
@@ -272,6 +439,7 @@ async function handleRequest(req            )                   {
           }
         }
       }
+      rlog.info('cache.cleared', `Cleared ${clearedEntries} sandbox cache subdirectories`, { clearedEntries });
       return { ok: true, cacheBase, clearedEntries };
     }
 
@@ -366,6 +534,7 @@ async function handleRequest(req            )                   {
 let shuttingDown = false;
 
 function cleanupTempArtifactsSync()       {
+  runnerLogger.dispose();
   procManager.cleanupSync();
   try {
     fs.rmSync(proxyDir, { recursive: true, force: true });

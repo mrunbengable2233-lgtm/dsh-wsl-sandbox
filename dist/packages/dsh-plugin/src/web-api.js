@@ -9,6 +9,10 @@ import {
                        
   failSandbox,
   isSandboxError,
+  isValidLogLevel,
+                
+                 
+                        
 } from '../../core/src/index.js';
                                                            
 import {
@@ -34,6 +38,7 @@ import { discoverWslDistros, isInsideLxssBasePath, probeWslDistroUser } from './
                                     
                                                     
                                           
+                                     
  
 
                       
@@ -190,14 +195,18 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     res.status(200).html(renderWslSandboxUiHtml());
   });
 
+  const activeLogger = deps.logger ?? deps.sessionManager.getLogger();
+
   add('GET', '/wsl-sandbox/api/status', (_req, res) => {
     const binding = deps.sessionManager.getBindingSnapshot();
     res.status(200).json({
       ok: true,
       bound: Boolean(binding),
+      runnerActive: deps.sessionManager.isRunnerActive(),
       generation: deps.sessionManager.getGeneration(),
       binding: binding ?? null,
       config: deps.configStore.get(),
+      nodeRuntime: deps.sessionManager.getNodeRuntimeSummary(),
       pendingApprovals: deps.approvalBridge.listPending().length,
       sessionRules: deps.approvalBridge.getSessionRules(),
     });
@@ -233,6 +242,12 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     };
     const updated = deps.configStore.addShare(share);
     const added = updated.advanced.shares[updated.advanced.shares.length - 1] ?? null;
+    activeLogger?.log('info', {
+      component: 'shares',
+      event: 'share.added',
+      message: `Authorized single-directory share /shares/${added?.alias ?? share.alias} (${added?.mode ?? share.mode})`,
+      data: { share: added },
+    });
     res.status(200).json({ ok: true, share: added, config: updated });
   });
 
@@ -240,6 +255,12 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     const shareId = req.params.id ?? '';
     const updated = deps.configStore.removeShare(shareId);
     const killedCount = await deps.sessionManager.invalidateNow(`Share '${shareId}' revoked`);
+    activeLogger?.log('info', {
+      component: 'shares',
+      event: 'share.revoked',
+      message: `Revoked share '${shareId}' and invalidated ${killedCount} active process(es)`,
+      data: { shareId, killedCount },
+    });
     res.status(200).json({ ok: true, revokedShareId: shareId, killedCount, config: updated });
   });
 
@@ -322,17 +343,20 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     let wslInternalDir                    ;
     let wslEntries           = [];
     let automountDisabledInWslConf = false;
-    try {
-      const info = (await deps.sessionManager.callRpc('wsl.listBackups', {}, 8_000))     
-                           
-                           
-                                             
-       ;
-      wslInternalDir = info.backupDir;
-      wslEntries = info.entries ?? [];
-      automountDisabledInWslConf = Boolean(info.automountDisabledInWslConf);
-    } catch {
-      // Runner not spawned yet; still serve host backup directory items
+    // Only query in-WSL backup directory if runner is ALREADY running (never cold-boot WSL VM or spin VHDX on UI view!)
+    if (deps.sessionManager.isRunnerActive()) {
+      try {
+        const info = (await deps.sessionManager.callRpc('wsl.listBackups', {}, 8_000))     
+                             
+                             
+                                               
+         ;
+        wslInternalDir = info.backupDir;
+        wslEntries = info.entries ?? [];
+        automountDisabledInWslConf = Boolean(info.automountDisabledInWslConf);
+      } catch {
+        // ignore
+      }
     }
     const items = collectHostBackupItems(resolvedBackupDir, cfg.distro, wslInternalDir, wslEntries);
     res.status(200).json({
@@ -678,6 +702,73 @@ export function registerWslSandboxWebApi(ctx                  , deps            
       ok: true,
       records: deps.approvalBridge.getAuditLog(),
     });
+  });
+
+  add('GET', '/wsl-sandbox/api/logs', (req, res) => {
+    if (!activeLogger) {
+      res.status(200).json({
+        ok: true,
+        entries: [],
+        stats: { level: deps.configStore.get().logLevel, bufferedCount: 0, logFilePath: null, diskFlushCount: 0 },
+      });
+      return;
+    }
+    const rawLevel = req.query.level?.trim().toLowerCase();
+    const minLevel                       = isValidLogLevel(rawLevel) ? rawLevel : undefined;
+    const rawSource = req.query.source?.trim().toLowerCase();
+    const source                                =
+      rawSource === 'host' || rawSource === 'wsl-runner' || rawSource === 'bootstrap' || rawSource === 'all'
+        ? rawSource
+        : 'all';
+    const sinceSeq = req.query.sinceSeq ? Number(req.query.sinceSeq) : undefined;
+    const limit = req.query.limit ? Number(req.query.limit) : 200;
+
+    // 100% served from RAM ring buffer — ZERO disk read syscalls!
+    const entries = activeLogger.query({
+      minLevel,
+      source,
+      component: req.query.component,
+      search: req.query.search,
+      sinceSeq: Number.isFinite(sinceSeq) ? sinceSeq : undefined,
+      limit: Number.isFinite(limit) ? limit : 200,
+    });
+    const diskStats = activeLogger.getDiskStats();
+    res.status(200).json({
+      ok: true,
+      entries,
+      stats: {
+        level: activeLogger.getLevel(),
+        bufferedCount: activeLogger.getBufferedCount(),
+        logFilePath: activeLogger.getLogFilePath() ?? null,
+        logDir: activeLogger.getLogDir() ?? null,
+        ...diskStats,
+      },
+    });
+  });
+
+  add('GET', '/wsl-sandbox/api/logs/export', (req, res) => {
+    const rawLevel = req.query.level?.trim().toLowerCase();
+    const minLevel                       = isValidLogLevel(rawLevel) ? rawLevel : undefined;
+    const ndjson = activeLogger
+      ? activeLogger.exportNdjson({
+          minLevel,
+          search: req.query.search,
+          limit: 1000,
+        })
+      : '';
+    res
+      .status(200)
+      .header('Content-Type', 'application/x-ndjson; charset=utf-8')
+      .header('Content-Disposition', 'attachment; filename="dsh-wsl-sandbox-logs.ndjson"')
+      .text(ndjson);
+  });
+
+  add('DELETE', '/wsl-sandbox/api/logs', async (_req, res) => {
+    const cleared = activeLogger ? activeLogger.clear() : { clearedMemory: 0, removedFiles: 0 };
+    if (deps.sessionManager.isRunnerActive()) {
+      await deps.sessionManager.callRpc('logs.clear', {}, 4_000).catch(() => {});
+    }
+    res.status(200).json({ ok: true, ...cleared });
   });
 
   add('POST', '/wsl-sandbox/api/agents-md', (req, res) => {

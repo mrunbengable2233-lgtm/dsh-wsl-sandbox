@@ -7,8 +7,10 @@ import {
   isPathInside,
   type ProbeResponse,
   type ProcExecResult,
+  resolveSharedHostNodeRuntime,
   type SandboxMode,
   type SessionBinding,
+  type StructuredLogger,
   type TerminalExecResult,
 } from '../../core/src/index.ts';
 import type { ApprovalBridge } from './approval-bridge.ts';
@@ -26,7 +28,18 @@ export interface SessionManagerOptions {
   readonly approvalBridge: ApprovalBridge;
   readonly sessionId?: string;
   readonly allowLinuxDevMode?: boolean;
+  readonly logger?: StructuredLogger;
   readonly onStderr?: (line: string) => void;
+}
+
+export interface NodeRuntimeSummary {
+  readonly hostNodeVersion: string;
+  readonly hostNodeExecutable: string;
+  readonly hostSharedWithDsh: boolean;
+  readonly isElectronCarrier: boolean;
+  readonly configuredWslNodePath: string;
+  readonly wslNodeVersion: string | null;
+  readonly wslNodeExecPath: string | null;
 }
 
 function renderExecOutcome(value: unknown): DshContentBlock[] {
@@ -91,6 +104,7 @@ export class WslSandboxSessionManager {
   private readonly approvalBridge: ApprovalBridge;
   private readonly sessionId: string;
   private readonly allowLinuxDevMode: boolean;
+  private readonly logger?: StructuredLogger;
   private readonly onStderr?: (line: string) => void;
 
   private transport: WslTransport | undefined;
@@ -104,11 +118,16 @@ export class WslSandboxSessionManager {
     this.approvalBridge = options.approvalBridge;
     this.sessionId = options.sessionId ?? `dsh-wsl-${randomUUID().slice(0, 8)}`;
     this.allowLinuxDevMode = options.allowLinuxDevMode ?? process.platform === 'linux';
+    this.logger = options.logger;
     this.onStderr = options.onStderr;
 
     this.unsubscribeConfig = this.configStore.onChange((next, prev) => {
       void this.handleConfigChanged(next, prev);
     });
+  }
+
+  getLogger(): StructuredLogger | undefined {
+    return this.logger;
   }
 
   getBindingSnapshot(): SessionBinding | undefined {
@@ -119,17 +138,89 @@ export class WslSandboxSessionManager {
     return this.generation;
   }
 
+  isRunnerActive(): boolean {
+    return Boolean(this.transport?.isRunning());
+  }
+
+  getNodeRuntimeSummary(): NodeRuntimeSummary {
+    const host = resolveSharedHostNodeRuntime();
+    const runnerInfo = this.transport?.getRunnerNodeInfo();
+    const cfg = this.configStore.get();
+    return {
+      hostNodeVersion: host.nodeVersion,
+      hostNodeExecutable: host.executable,
+      hostSharedWithDsh: host.sharedWithHostProcess,
+      isElectronCarrier: host.isElectronCarrier,
+      configuredWslNodePath: cfg.wslNodePath ?? 'auto',
+      wslNodeVersion: runnerInfo?.nodeVersion ?? null,
+      wslNodeExecPath: runnerInfo?.nodeExecPath ?? null,
+    };
+  }
+
   private async handleConfigChanged(next: WslSandboxConfig, prev: WslSandboxConfig): Promise<void> {
+    if (next.logLevel !== prev.logLevel) {
+      this.logger?.setLevel(next.logLevel);
+      if (this.transport?.isRunning()) {
+        await this.transport.setRunnerLogLevel(next.logLevel);
+      }
+    }
+
+    // If ONLY logLevel changed, avoid killing active sandbox terminals/processes unnecessarily!
+    const onlyLogLevelChanged =
+      next.enabled === prev.enabled &&
+      next.transportMode === prev.transportMode &&
+      next.distro === prev.distro &&
+      next.username === prev.username &&
+      next.workspaceRoot === prev.workspaceRoot &&
+      next.runnerPath === prev.runnerPath &&
+      next.wslNodePath === prev.wslNodePath &&
+      next.environmentProfile === prev.environmentProfile &&
+      next.sandboxMode === prev.sandboxMode &&
+      next.approvalPolicyMode === prev.approvalPolicyMode &&
+      next.networkMode === prev.networkMode &&
+      next.upstreamProxy === prev.upstreamProxy &&
+      next.mirrorCn === prev.mirrorCn &&
+      next.cacheMode === prev.cacheMode &&
+      next.enablePwshGuard === prev.enablePwshGuard &&
+      JSON.stringify(next.unmaskedEnvWorkspaces) === JSON.stringify(prev.unmaskedEnvWorkspaces) &&
+      JSON.stringify(next.advanced) === JSON.stringify(prev.advanced);
+
+    if (onlyLogLevelChanged) {
+      this.logger?.log('info', {
+        component: 'config',
+        event: 'config.logLevelChanged',
+        message: `Updated log level to '${next.logLevel}'`,
+        data: { logLevel: next.logLevel },
+      });
+      return;
+    }
+
     this.generation += 1;
     this.binding = undefined;
     this.proxyConfiguredRevision = undefined;
     this.approvalBridge.invalidate(`Configuration changed to ${next.revision}`);
 
+    this.logger?.log('info', {
+      component: 'config',
+      event: 'config.updated',
+      message: `Configuration updated (${next.revision}): distro=${next.distro}, profile=${next.environmentProfile}, mode=${next.sandboxMode}`,
+      sessionId: this.sessionId,
+      data: {
+        revision: next.revision,
+        enabled: next.enabled,
+        distro: next.distro,
+        environmentProfile: next.environmentProfile,
+        sandboxMode: next.sandboxMode,
+        networkMode: next.networkMode,
+      },
+    });
+
     const transportChanged =
       next.transportMode !== prev.transportMode ||
       next.distro !== prev.distro ||
       next.username !== prev.username ||
-      next.runnerPath !== prev.runnerPath;
+      next.runnerPath !== prev.runnerPath ||
+      next.wslNodePath !== prev.wslNodePath;
 
     if (this.transport) {
       if (transportChanged || !next.enabled) {
@@ -152,6 +243,9 @@ export class WslSandboxSessionManager {
         distro: cfg.distro,
         username: cfg.username,
         runnerPath: cfg.runnerPath,
+        nodeExecutable: cfg.wslNodePath,
+        logLevel: cfg.logLevel,
+        logger: this.logger,
         onStderr: this.onStderr,
         onAuthorizeProxyHost: (host, port) => this.authorizeUnknownProxyHost(host, port),
       });
@@ -342,6 +436,13 @@ export function createWslSandboxTools(
     });
 
     if (guard.decision === 'deny') {
+      sessionManager.getLogger()?.log('warn', {
+        component: 'tools',
+        event: 'wslGuard.deny',
+        message: `Blocked ${params.toolName} command at L0 AST/dialect policy: ${guard.reasons.join('; ')}`,
+        sessionId: binding.sessionId,
+        data: { toolName: params.toolName, riskLevel: guard.riskLevel, reasons: guard.reasons },
+      });
       failSandbox(
         'POLICY_BLOCK',
         `WSL command blocked by L0 zero-token AST/dialect policy: ${guard.reasons.join('; ')}`,

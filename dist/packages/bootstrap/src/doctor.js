@@ -127,13 +127,22 @@ const TOOL_MATRIX
 function getSearchDirs()           {
   const home = os.homedir();
   const extra = [
+    path.join(home, '.dsh', 'runtime', 'bin'),
+    path.join(home, '.local', 'share', 'dsh', 'node', 'bin'),
     path.join(home, '.local', 'share', 'mise', 'shims'),
     path.join(home, '.local', 'bin'),
+    path.join(home, '.nvm', 'current', 'bin'),
+    path.join(home, '.local', 'share', 'fnm', 'aliases', 'default', 'bin'),
+    path.join(home, '.volta', 'bin'),
     path.join(home, '.cargo', 'bin'),
     path.join(home, '.bun', 'bin'),
+    '/opt/dsh-toolchain/shims',
+    '/opt/dsh-toolchain/bin',
     '/usr/local/go/bin',
   ];
-  const envDirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  const envDirs = (process.env.PATH ?? '')
+    .split(path.delimiter)
+    .filter((p) => Boolean(p) && !p.startsWith('/mnt/'));
   return [...new Set([...extra, ...envDirs, '/usr/local/bin', '/usr/bin', '/bin'])];
 }
 

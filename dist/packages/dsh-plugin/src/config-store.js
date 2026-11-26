@@ -11,11 +11,14 @@ import {
                           
   failSandbox,
   isValidIdentifier,
+  isValidLogLevel,
+                
                    
   parseIpv4Cidr,
                    
   validateDeviceNode,
   validateShareEntry,
+  validateWslNodeExecutable,
   validateWorkspaceRoot,
 } from '../../core/src/index.js';
 
@@ -40,6 +43,8 @@ import {
                              
                                  
                               
+                                                                                               
+                                
                                                                                              
                                                   
                                     
@@ -48,6 +53,8 @@ import {
                                  
                              
                                 
+                                                                                        
+                              
                                      
                                     
                                           
@@ -67,6 +74,7 @@ import {
                 
                      
                   
+                   
                           
                    
                           
@@ -74,6 +82,7 @@ import {
                      
                 
                  
+                
                          
                        
                              
@@ -102,6 +111,10 @@ export function getDefaultConfigPath(dshHome         )         {
 
 export function getDefaultBackupDir(dshHome         )         {
   return path.join(getDefaultConfigDir(dshHome), 'backups');
+}
+
+export function getDefaultLogDir(dshHome         )         {
+  return path.join(getDefaultConfigDir(dshHome), 'logs');
 }
 
 /**
@@ -212,6 +225,24 @@ function inferDefaultLinuxUser()         {
   return 'dev';
 }
 
+function resolveDefaultRunnerPath(isWin         , defaultUser        )         {
+  const stagedPath = `/home/${defaultUser}/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js`;
+  if (isWin) return stagedPath;
+  if (fs.existsSync(stagedPath)) return stagedPath;
+
+  const localCandidates = [
+    path.resolve(import.meta.dirname, '../../wsl-runner/src/main.js'),
+    path.resolve(import.meta.dirname, '../../../dist/packages/wsl-runner/src/main.js'),
+    path.resolve(import.meta.dirname, '../../wsl-runner/src/main.ts'),
+  ];
+  for (const candidate of localCandidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return stagedPath;
+}
+
 export function createDefaultConfig(overrides                            )                   {
   const isWin = process.platform === 'win32';
   const defaultUser = inferDefaultLinuxUser();
@@ -223,7 +254,8 @@ export function createDefaultConfig(overrides                            )      
     // on native Linux devbox: uses WSL_DISTRO_NAME if inside WSL or 'local-linux'.
     distro: isWin ? 'Ubuntu-26.04' : (process.env.WSL_DISTRO_NAME || 'local-linux'),
     workspaceRoot: `/home/${defaultUser}/workspace`,
-    runnerPath: `/home/${defaultUser}/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js`,
+    runnerPath: resolveDefaultRunnerPath(isWin, defaultUser),
+    wslNodePath: 'auto',
     environmentProfile: 'standard',
     sandboxMode: 'workspace-write',
     approvalPolicyMode: 'balanced',
@@ -231,6 +263,7 @@ export function createDefaultConfig(overrides                            )      
     upstreamProxy: '',
     mirrorCn: false,
     cacheMode: 'workspace-persistent',
+    logLevel: 'info',
     approvalTimeoutMs: 60_000,
     enablePwshGuard: true,
     enablePromptInjection: true,
@@ -305,10 +338,15 @@ export function validateFullConfig(raw                  )                   {
   if (!VALID_CACHE_MODES.has(raw.cacheMode)) {
     failSandbox('INVALID_SETUP', `Invalid cacheMode: ${String(raw.cacheMode)}`);
   }
+  const logLevel           = raw.logLevel ?? 'info';
+  if (!isValidLogLevel(logLevel)) {
+    failSandbox('INVALID_SETUP', `Invalid logLevel: ${String(logLevel)}`);
+  }
   if (!Number.isSafeInteger(raw.approvalTimeoutMs) || raw.approvalTimeoutMs < 1000 || raw.approvalTimeoutMs > 600_000) {
     failSandbox('INVALID_SETUP', `Invalid approvalTimeoutMs: ${raw.approvalTimeoutMs}`);
   }
 
+  const wslNodePath = validateWslNodeExecutable(raw.wslNodePath);
   const upstreamProxy = validateUpstreamProxy(raw.upstreamProxy ?? '');
   const shares = (raw.advanced?.shares ?? []).map(validateShareEntry);
   const deviceNodes = (raw.advanced?.deviceNodes ?? []).map(validateDeviceNode);
@@ -333,7 +371,9 @@ export function validateFullConfig(raw                  )                   {
 
   return {
     ...raw,
+    wslNodePath,
     environmentProfile,
+    logLevel,
     upstreamProxy,
     backupDir,
     unmaskedEnvWorkspaces: [...new Set(raw.unmaskedEnvWorkspaces ?? [])],
@@ -372,6 +412,18 @@ export class ConfigStore {
     this.filePath = options?.filePath ?? getDefaultConfigPath();
     this.persistToDisk = options?.persistToDisk ?? true;
     this.config = this.loadOrInit(options?.initial);
+  }
+
+  getConfigFilePath()         {
+    return this.filePath;
+  }
+
+  getConfigDir()         {
+    return path.dirname(this.filePath);
+  }
+
+  isPersistent()          {
+    return this.persistToDisk;
   }
 
           loadOrInit(initial                            )                   {
@@ -462,6 +514,7 @@ export class ConfigStore {
       username: patch.username !== undefined ? patch.username : this.config.username,
       workspaceRoot: patch.workspaceRoot ?? this.config.workspaceRoot,
       runnerPath: patch.runnerPath ?? this.config.runnerPath,
+      wslNodePath: patch.wslNodePath !== undefined ? patch.wslNodePath : this.config.wslNodePath,
       environmentProfile: patch.environmentProfile ?? this.config.environmentProfile,
       sandboxMode: patch.sandboxMode ?? this.config.sandboxMode,
       approvalPolicyMode: patch.approvalPolicyMode ?? this.config.approvalPolicyMode,
@@ -469,6 +522,7 @@ export class ConfigStore {
       upstreamProxy: patch.upstreamProxy !== undefined ? patch.upstreamProxy : this.config.upstreamProxy,
       mirrorCn: patch.mirrorCn ?? this.config.mirrorCn,
       cacheMode: patch.cacheMode ?? this.config.cacheMode,
+      logLevel: patch.logLevel ?? this.config.logLevel,
       approvalTimeoutMs: patch.approvalTimeoutMs ?? this.config.approvalTimeoutMs,
       enablePwshGuard: patch.enablePwshGuard ?? this.config.enablePwshGuard,
       enablePromptInjection: patch.enablePromptInjection ?? this.config.enablePromptInjection,
