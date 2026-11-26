@@ -73,7 +73,11 @@ GPT 提供的两份文档（完整原文见**附录 A** 与**附录 B**）在**�
 
 1. **【致命可用性 Bug】文档 1 §4.2 把 `:tmpdir` 与 `:slash_tmp` 设为 `"deny"`**
    - 原文示例写了 `":tmpdir" = "deny"` 与 `":slash_tmp" = "deny"`。在 Linux 中完全封死 `/tmp` 会导致 Bash Here-Doc (`<<EOF`)、`mktemp`、`gcc`、`cargo`、`npm`、`pip`、`pytest`、`git` 大面积失败。
-   - **修正**：绝不能禁 `/tmp`，而应在 `bwrap` 中使用 `--tmpfs /tmp --tmpfs /var/tmp` 挂载**单次执行/单会话私有的内存临时盘**——既满足工具链正常运行，又与宿主 `/tmp`（尤其是高危的 `/tmp/.X11-unix`）物理隔离，进程退出自动销毁。
+   - **修正**：绝不能禁 `/tmp`，而应在 `bwrap` 中使用 `--tmpfs /tmp --tmpfs /var/tmp` 为沙箱子进程挂载**单次执行私有的内存临时遮蔽盘**——既满足工具链正常运行，又与宿主 `/tmp`（尤其是高危的 `/tmp/.X11-unix`）物理隔离，该遮蔽层随 `bwrap` 子进程退出自动销毁。
+   - **边界限定说明（遮蔽层 vs 受控落盘层）**：此处「进程退出自动销毁」**仅限 `bwrap` 内的内存/只读遮蔽层**（`/tmp`、`/var/tmp`、`/run`、`/mnt`，以及对 `~/.dsh`、`~/.config/dsh-wsl-sandbox`、`~/.ssh`、`~/.gnupg`、`~/.aws`、`~/.kube`、`~/.docker` 的 `--tmpfs --remount-ro` 与 `.env*`/凭证文件的空文件 `--ro-bind`），**不代表整个插件零落盘**：
+     1. `workspace-write` 模式下的 `--bind workspaceRoot`、显式 `additionalWritableRoots`、显式 `rw` 模式的 `/shares/<alias>`，以及 `cacheMode=workspace-persistent` 默认挂载的 `~/.cache/dsh-wsl-sandbox/<sha256-12>` 均直接落盘到 WSL 原生 `ext4`（若将 `cacheMode` 设为 `ephemeral` 则缓存留在内存遮蔽层）；
+     2. `wsl_write` / `wsl_edit` 通过常驻 Runner 的 `ConfinedFsService` 在用户态直接落盘 `ext4`（不拉起 `bwrap` 子壳，但同样强制校验 `workspace-write`、祖先链 `realpath`、`O_NOFOLLOW` 原子替换以及对工作区和 `rw` 共享目录统一的 Checklist B 敏感路径只读拦截）；
+     3. WSL 2 中宿主 `/tmp` 通常位于根磁盘 `ext4` 而非 `tmpfs`，因此 Runner 的运行期控制目录（`dsh-wsl-runner-*`、`dsh-wsl-proxy-*`）优先创建在真正的内核内存盘 `/run/user/<uid>` 或 `/dev/shm`（`tmpfs`），并附带 `owner.pid` 启动自检清扫以防 `kill -9` 残留；安装期持久化产物统一由 `uninstall-dsh-plugin.ps1` / `provision-wsl.sh --uninstall` 清单化回收。
 
 2. **【架构耦合死板】两份文档均建议外调 `codex sandbox --permission-profile <name> -- ...` CLI**
    - 缺点一：强迫用户必须在 WSL 内额外安装并维护一套 OpenAI `codex` 二进制与外部静态 TOML 配置；缺点二：DSH 的 `ctx.sandbox.confine(argv, policy)` 是每次调用动态传入 `read-only` / `workspace-write` 与 `writableRoots` 的，外调固定名字的静态 profile 会废掉 DSH 原生权限档切换与单次提权能力。

@@ -127,11 +127,18 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 
 ## 4. 受控文件系统、UDS 代理防 SSRF、单壳守卫与单票审批
 
-### 4.1 `ConfinedFsService` 防符号链接穿越与 TOCTOU 防护
-代码位置：`packages/wsl-runner/src/fs-service.ts`
-- `wsl_read` / `wsl_write` / `wsl_edit` / `wsl_glob` / `wsl_grep` 不启动完整 shell，由 Runner 在 WSL 原生 `ext4` 上直接服务（绕开缓慢的 9P 协议）。
-- **祖先链 `realpath` 校验**（`canonicalizeWithinRoot`）：即使写入目标文件尚不存在，也会向上回溯至最近已存在的祖先目录执行 `fs.realpathSync`，验证其严格位于 `realpath(workspaceRoot)` 或已授权 `/shares/<alias>` 内部，阻断通过指向外部的父目录软链接写穿工作区。
-- **`O_NOFOLLOW | O_CREAT | O_EXCL` 原子落盘**（`atomicWriteNoFollow`）：先 `lstat` 拒绝直接覆写符号链接目标，再以 `O_NOFOLLOW | O_EXCL` 创建同目录随机临时文件，`fsync` 后 `rename` 原子替换。
+### 4.1 `ConfinedFsService` 防符号链接穿越、Checklist B 对齐与落盘边界声明
+代码位置：`packages/wsl-runner/src/fs-service.ts` & `packages/wsl-runner/src/hygiene.ts`
+- **架构边界透明声明（内存遮蔽层 vs 受控落盘层）**：
+  - `bwrap` 的 `--tmpfs` 内存盘仅用于隔离遮蔽层（`/tmp`、`/var/tmp`、`/run`、`/mnt` 及 `~/.dsh`、`~/.config/dsh-wsl-sandbox`、`~/.ssh` 等敏感目录），随子进程退出销毁；
+  - `workspace-write` 下的 `workspaceRoot`、显式 `rw` 模式的 `/shares/<alias>`、默认 `cacheMode=workspace-persistent` 下的 `~/.cache/dsh-wsl-sandbox/<sha256-12>`（设 `ephemeral` 则不落盘）以及 `wsl_write`/`wsl_edit` 均属于受控 `ext4` 落盘写入。
+- **`wsl_write` / `wsl_edit` 与 `bwrap` 写保护完全对齐**：
+  - 由 Runner 在 WSL 原生 `ext4` 上直接服务（绕开缓慢的 9P 协议），同时在 `assertWriteAllowed` 中强制执行 `binding.profile === 'workspace-write'`、`share.mode === 'rw'`，并对 **`workspaceRoot` 与 `rw` 共享目录统一执行 `isProtectedWorkspaceWrite`（Checklist B：拦截 `.git/hooks`、`.gitconfig`、`.bashrc`、`.vscode`、`.dsh` 等）**。
+  - **祖先链 `realpath` 校验**（`canonicalizeWithinRoot`）与 **`O_NOFOLLOW | O_CREAT | O_EXCL` 原子落盘**（`atomicWriteNoFollow`）阻断符号链接写穿与 TOCTOU。
+- **WSL 2 真内存 `tmpfs` 运行期目录与 `kill -9` 孤儿清扫**：
+  - 鉴于 WSL 2（如 Ubuntu 24.04）中 `/tmp` 挂载在根磁盘 `ext4.vhdx` 而非内存盘，`resolveEphemeralRamTmpRoot` 优先解析 `/proc/mounts` 中真正的 `tmpfs`（`/run/user/<uid>` 或 `/dev/shm`）存放 `dsh-wsl-runner-*` 与 `dsh-wsl-proxy-*`（`wsl --terminate` 即随内核内存自动蒸发），同时写入 `owner.pid` 并在每次启动时跨 `/run/user/<uid>`、`/dev/shm`、`/tmp` 自动清扫 `SIGKILL` 崩溃残留（先解锁 `0444` `empty-mask` 再递归回收）与超 30 天未访问的缓存。
+- **零 `curl | sudo bash` 供应链加固与增量可逆卸载**：
+  - `provision-wsl.sh` 已彻底移除 `curl deb.nodesource.com/setup_XX.x | sudo -E bash`，改为校验官方 `SHASUMS256.txt` 后将预编译 Node 24 LTS 解压至用户态 `~/.local/share/dsh-wsl-sandbox/toolchains/node`（零 root APT 源污染）；所有备份启用 SHA-256 内容去重（最多保留 5 份滚动 `.bak`）；安装期增量包与路径记录于 `provision-manifest.json` / `install-manifest.json`，由 `uninstall-dsh-plugin.ps1` + `removeAgentsMdWslSection` 全量可逆回收。
 
 ### 4.2 `--unshare-net` 下的 UDS 白名单代理与 SSRF / DNS Rebinding 防御
 代码位置：`packages/core/src/uds-proxy.ts` & `packages/wsl-runner/src/proc-manager.ts`

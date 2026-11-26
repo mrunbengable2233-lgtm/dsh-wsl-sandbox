@@ -264,8 +264,18 @@ npm pack
 - 微软默认 WSL 2 内核没有手机厂商的 Windows WinUSB/OEM 驱动，也缺少绝大多数免驱 USB 网卡的 Linux `.ko` 驱动模块。
 - 当需要执行 `fastboot`、`adb`、`pnputil`（装驱动）或 `NetAdapter`（改网卡）时，本插件会在 Windows 侧弹出 **单次硬件人工审批卡片**，点一次批准安全执行一次，既不耽误刷机/调驱动，又防止 AI 擅自乱动硬件。
 
-### Q4：以后不想用了怎么卸载？会不会锁死文件夹删不掉？
-**绝不会锁文件夹！**（采用 `--cd ~` + WSL 原生 `ext4` + 日志空闲 `0` 文件句柄设计）：
-1. 在 DSH 插件管理里禁用或移除 `dsh-wsl-sandbox`；
-2. Windows 上的源码/安装包文件夹随时可直接删除；
-3. 如需彻底清理配置与缓存，按需删除 `%USERPROFILE%\.dsh\dsh-wsl-sandbox` 与 WSL 内的 `~/.local/share/dsh-wsl-sandbox` 即可。
+### Q4：以后不想用了怎么彻底卸载？会不会留下一堆隐藏缓存或者锁死文件夹删不掉？
+**绝不会锁文件夹，而且自带一键无残留卸载脚本！**
+本插件把安装期间写过的每一处配置、备份、`AGENTS.md` 标记和工具链增量都记录在清单文件里，不需要你去翻日志找路径。在 **PowerShell 7** 里进入插件目录运行一行命令即可：
+
+```powershell
+# 先预览会清理哪些目录（安全演练，不删文件）：
+.\packages\bootstrap\uninstall-dsh-plugin.ps1 -DryRun
+
+# 一键标准卸载（自动从 DSH 移除插件、还原 WSL 配置、剥离 AGENTS.md 标记、解锁只读备份并删净 Windows 与 WSL 里的插件目录和缓存）：
+.\packages\bootstrap\uninstall-dsh-plugin.ps1
+
+# 如果连安装向导新装进 WSL 的 Go / Rust / uv / Node 24 等开发包也想一并退回安装前状态，加上 -PurgeToolchains：
+.\packages\bootstrap\uninstall-dsh-plugin.ps1 -PurgeToolchains
+```
+执行完后，直接把插件源码/安装包文件夹拖进回收站即可，零残留、零文件占用锁！

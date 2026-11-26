@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
                                                                  
 import os from 'node:os';
@@ -29,7 +30,7 @@ import {
                        
   getOptionalService,
 } from './cordis-types.js';
-import { upsertAgentsMdWslSection } from './prompt-injector.js';
+import { removeAgentsMdWslSection, upsertAgentsMdWslSection } from './prompt-injector.js';
                                                            
 import { renderWslSandboxUiHtml } from './web-ui-entry.js';
 import { discoverWslDistros, isInsideLxssBasePath, probeWslDistroUser } from './wsl-discovery.js';
@@ -410,15 +411,91 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     hardenPrivatePath(resolvedBackupDir, 'dir');
 
     const savedFiles           = [];
+    const sha256Str = (s        )         => createHash('sha256').update(s, 'utf8').digest('hex');
+
+    const unlockReadOnlyHostFile = (target        )       => {
+      if (!fs.existsSync(target)) return;
+      if (process.platform === 'win32') {
+        try {
+          spawnSync('attrib.exe', ['-R', target], { stdio: 'ignore', windowsHide: true });
+        } catch {
+          // ignore
+        }
+      }
+      try {
+        fs.chmodSync(target, 0o600);
+      } catch {
+        // ignore
+      }
+    };
+
     const writeReadOnlyHostBackup = (dest        , content        )       => {
+      unlockReadOnlyHostFile(dest);
       fs.writeFileSync(dest, content, { mode: 0o400 });
       hardenPrivatePath(dest, 'readonly-file');
       savedFiles.push(dest);
     };
-    const copyReadOnlyHostBackup = (src        , dest        )       => {
-      fs.copyFileSync(src, dest);
-      hardenPrivatePath(dest, 'readonly-file');
-      savedFiles.push(dest);
+
+    const saveDeduplicatedHostSeries = (
+      origName        ,
+      rollingPrefix        ,
+      rollingExt        ,
+      timestamp        ,
+      content        ,
+      maxRolling = 5,
+    )       => {
+      const origPath = path.join(resolvedBackupDir, origName);
+      if (!fs.existsSync(origPath)) {
+        writeReadOnlyHostBackup(origPath, content);
+      }
+      const existingRolling = fs
+        .readdirSync(resolvedBackupDir)
+        .filter(
+          (f) =>
+            f !== origName &&
+            f.startsWith(`${rollingPrefix}.`) &&
+            f.endsWith(`.${rollingExt}`),
+        )
+        .sort();
+
+      const compareTarget =
+        existingRolling.length > 0
+          ? path.join(resolvedBackupDir, existingRolling[existingRolling.length - 1] )
+          : origPath;
+
+      if (fs.existsSync(compareTarget)) {
+        try {
+          if (sha256Str(fs.readFileSync(compareTarget, 'utf8')) === sha256Str(content)) {
+            return;
+          }
+        } catch {
+          // fall through
+        }
+      }
+
+      writeReadOnlyHostBackup(
+        path.join(resolvedBackupDir, `${rollingPrefix}.${timestamp}.${rollingExt}`),
+        content,
+      );
+
+      const updatedRolling = fs
+        .readdirSync(resolvedBackupDir)
+        .filter(
+          (f) =>
+            f !== origName &&
+            f.startsWith(`${rollingPrefix}.`) &&
+            f.endsWith(`.${rollingExt}`),
+        )
+        .sort();
+      while (updatedRolling.length > maxRolling) {
+        const oldest = path.join(resolvedBackupDir, updatedRolling.shift() );
+        unlockReadOnlyHostFile(oldest);
+        try {
+          fs.rmSync(oldest, { force: true });
+        } catch {
+          // ignore
+        }
+      }
     };
 
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -427,10 +504,8 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     const absentHostMarker = path.join(resolvedBackupDir, '.wslconfig.orig.absent');
 
     if (fs.existsSync(wslCfg)) {
-      if (!fs.existsSync(origHostCfg) && !fs.existsSync(absentHostMarker)) {
-        copyReadOnlyHostBackup(wslCfg, origHostCfg);
-      }
-      copyReadOnlyHostBackup(wslCfg, path.join(resolvedBackupDir, `.wslconfig.${ts}.bak`));
+      const hostContent = fs.readFileSync(wslCfg, 'utf8');
+      saveDeduplicatedHostSeries('.wslconfig.orig', '.wslconfig', 'bak', ts, hostContent, 5);
     } else if (!fs.existsSync(origHostCfg) && !fs.existsSync(absentHostMarker)) {
       writeReadOnlyHostBackup(
         absentHostMarker,
@@ -448,27 +523,38 @@ export function registerWslSandboxWebApi(ctx                  , deps            
        ;
       wslInternalDir = wslResult.wslInternalBackupDir;
       if (typeof wslResult.wslConfContent === 'string') {
-        const distroOrig = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig`);
-        if (!fs.existsSync(distroOrig)) {
-          writeReadOnlyHostBackup(distroOrig, wslResult.wslConfContent);
-        }
-        writeReadOnlyHostBackup(path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.${ts}.bak`), wslResult.wslConfContent);
+        saveDeduplicatedHostSeries(
+          `wsl.conf.${cfg.distro}.orig`,
+          `wsl.conf.${cfg.distro}`,
+          'bak',
+          ts,
+          wslResult.wslConfContent,
+          5,
+        );
       } else {
         const distroAbsent = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig.absent`);
-        if (!fs.existsSync(distroAbsent)) {
+        if (!fs.existsSync(distroAbsent) && !fs.existsSync(path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig`))) {
           writeReadOnlyHostBackup(distroAbsent, `# ${cfg.distro} had no /etc/wsl.conf at initial backup (${ts})\n`);
         }
       }
       if (typeof wslResult.fstabContent === 'string') {
-        const fstabOrig = path.join(resolvedBackupDir, `fstab.${cfg.distro}.orig`);
-        if (!fs.existsSync(fstabOrig)) {
-          writeReadOnlyHostBackup(fstabOrig, wslResult.fstabContent);
-        }
+        saveDeduplicatedHostSeries(
+          `fstab.${cfg.distro}.orig`,
+          `fstab.${cfg.distro}`,
+          'bak',
+          ts,
+          wslResult.fstabContent,
+          5,
+        );
       }
       if (typeof wslResult.drvfsMountsContent === 'string') {
-        writeReadOnlyHostBackup(
-          path.join(resolvedBackupDir, `drvfs-mounts.${cfg.distro}.${ts}.txt`),
+        saveDeduplicatedHostSeries(
+          `drvfs-mounts.${cfg.distro}.orig.txt`,
+          `drvfs-mounts.${cfg.distro}`,
+          'txt',
+          ts,
           wslResult.drvfsMountsContent + '\n',
+          5,
         );
       }
     } catch {
@@ -771,6 +857,30 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     res.status(200).json({ ok: true, ...cleared });
   });
 
+  const updateInstallManifestAgentsMd = (filePath        , mode                  )       => {
+    if (!deps.configStore.isPersistent()) return;
+    const manifestPath = path.join(deps.configStore.getConfigDir(), 'install-manifest.json');
+    let doc                          = {};
+    if (fs.existsSync(manifestPath)) {
+      try {
+        doc = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))                           ;
+      } catch {
+        doc = {};
+      }
+    }
+    const prevList = Array.isArray(doc.agentsMdFiles)
+      ? (doc.agentsMdFiles            ).filter((x) => typeof x === 'string')
+      : [];
+    const set = new Set(prevList);
+    if (mode === 'add') set.add(filePath);
+    else set.delete(filePath);
+    doc.agentsMdFiles = Array.from(set);
+    doc.updatedAt = new Date().toISOString();
+    fs.mkdirSync(path.dirname(manifestPath), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(manifestPath, JSON.stringify(doc, null, 2) + '\n', { mode: 0o600 });
+    hardenPrivatePath(manifestPath, 'file');
+  };
+
   add('POST', '/wsl-sandbox/api/agents-md', (req, res) => {
     const body = (req.body ?? {})                            ;
     const cfg = deps.configStore.get();
@@ -779,7 +889,86 @@ export function registerWslSandboxWebApi(ctx                  , deps            
       distro: cfg.distro,
       workspaceRoot: cfg.workspaceRoot,
     });
+    updateInstallManifestAgentsMd(result.filePath, 'add');
     res.status(200).json({ ok: true, ...result });
+  });
+
+  add('DELETE', '/wsl-sandbox/api/agents-md', (req, res) => {
+    const body = (req.body ?? {})                            ;
+    const cfg = deps.configStore.get();
+    const targetDir = body.projectRoot?.trim() || cfg.workspaceRoot;
+    const result = removeAgentsMdWslSection(targetDir);
+    updateInstallManifestAgentsMd(result.filePath, 'remove');
+    res.status(200).json({ ok: true, ...result });
+  });
+
+  add('POST', '/wsl-sandbox/api/cache/purge', async (_req, res) => {
+    const result = await deps.sessionManager.callRpc('cache.clear', {}, 15_000);
+    res.status(200).json({ ok: true, ...(result                           ) });
+  });
+
+  add('GET', '/wsl-sandbox/api/footprint', async (_req, res) => {
+    const cfg = deps.configStore.get();
+    const hostConfigDir = deps.configStore.getConfigDir();
+    const resolvedBackupDir = resolveEffectiveBackupDir(cfg.backupDir);
+    const manifestPath = path.join(hostConfigDir, 'install-manifest.json');
+
+    let installManifest                                 = null;
+    if (fs.existsSync(manifestPath)) {
+      try {
+        installManifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))                           ;
+      } catch {
+        installManifest = null;
+      }
+    }
+
+    const statDir = (dirPath        )                                                                           => {
+      if (!fs.existsSync(dirPath)) return { path: dirPath, exists: false, fileCount: 0, totalBytes: 0 };
+      let fileCount = 0;
+      let totalBytes = 0;
+      const walk = (curr        )       => {
+        try {
+          const st = fs.lstatSync(curr);
+          if (st.isFile() || st.isSymbolicLink()) {
+            fileCount++;
+            totalBytes += st.size;
+          } else if (st.isDirectory()) {
+            for (const f of fs.readdirSync(curr)) walk(path.join(curr, f));
+          }
+        } catch {
+          // ignore
+        }
+      };
+      walk(dirPath);
+      return { path: dirPath, exists: true, fileCount, totalBytes };
+    };
+
+    let wslFootprint                                 = null;
+    if (deps.sessionManager.isRunnerActive()) {
+      try {
+        wslFootprint = (await deps.sessionManager.callRpc('wsl.footprint', {}, 8_000))                           ;
+      } catch {
+        wslFootprint = null;
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
+      host: {
+        configDir: statDir(hostConfigDir),
+        backupDir: statDir(resolvedBackupDir),
+        logDir: statDir(path.join(hostConfigDir, 'logs')),
+        installManifestPath: manifestPath,
+        installManifest,
+      },
+      wsl: wslFootprint,
+      uninstallCommands: {
+        windowsSafe: '.\\packages\\bootstrap\\uninstall-dsh-plugin.ps1',
+        windowsDryRun: '.\\packages\\bootstrap\\uninstall-dsh-plugin.ps1 -DryRun',
+        windowsPurgeToolchains: '.\\packages\\bootstrap\\uninstall-dsh-plugin.ps1 -PurgeToolchains',
+        wslOnly: 'bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --uninstall',
+      },
+    });
   });
 
   // Real `@deepseek-ai/dsh-host-webserver` (`ctx.webServer`) carrier

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -11,12 +12,27 @@ import {
   RotatingNdjsonSink,
   resolveSharedHostNodeRuntime,
   SandboxError,
+  type SessionBinding,
   sanitizeSandboxEnv,
   StructuredLogger,
   validateWslNodeExecutable,
 } from '../../packages/core/src/index.ts';
 import { apply as applyWslSandbox } from '../../packages/dsh-plugin/src/index.ts';
-import { assertPrivateFileMode, BUILT_RUNNER_PATH, BWRAP_SKIP_REASON } from '../test-env.ts';
+import { removeAgentsMdWslSection, upsertAgentsMdWslSection } from '../../packages/dsh-plugin/src/prompt-injector.ts';
+import { ConfinedFsService } from '../../packages/wsl-runner/src/fs-service.ts';
+import {
+  resolveEphemeralRamTmpRoot,
+  sweepOrphanedRunnerTempDirs,
+  writeDeduplicatedReadOnlyBackup,
+} from '../../packages/wsl-runner/src/hygiene.ts';
+import {
+  assertPrivateFileMode,
+  BUILT_RUNNER_PATH,
+  BWRAP_SKIP_REASON,
+  IS_LINUX,
+  POSIX_BASH_SKIP_REASON,
+  PROVISION_SH_PATH,
+} from '../test-env.ts';
 
 describe('StructuredLogger & RotatingNdjsonSink — SSD write coalescing, deduplication, redaction & rotation', () => {
   it('redacts inline tokens, URL basic-auth, and secret keys recursively before RAM or disk persistence', () => {
@@ -302,4 +318,223 @@ describe('Shared Node.js Runtime & User Toolchain Sandbox PATH', () => {
     assert.equal(report.failed, 0);
   });
 });
+
+describe('Lifecycle Hygiene, Crash Recovery & Reversible Uninstallation (Issue #1 & #2)', () => {
+  it('reversibly removes dsh-wsl-sandbox AGENTS.md block and deletes empty plugin-created scaffold files', () => {
+    const tmpProj = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-agentsmd-test-'));
+    try {
+      // Case 1: Created from scratch -> deleted completely on remove
+      const created = upsertAgentsMdWslSection(tmpProj, { distro: 'Ubuntu-26.04', workspaceRoot: '~/workspace' });
+      assert.equal(created.action, 'created');
+      assert.equal(fs.existsSync(created.filePath), true);
+
+      const removedEmpty = removeAgentsMdWslSection(tmpProj);
+      assert.equal(removedEmpty.action, 'deleted-empty-file');
+      assert.equal(fs.existsSync(created.filePath), false);
+
+      // Case 2: Appended to user-authored AGENTS.md (and supports legacy `:begin` marker too) -> preserves user text
+      fs.writeFileSync(
+        created.filePath,
+        '# Team Conventions\n\nKeep commits atomic.\n\n<!-- dsh-wsl-sandbox:begin -->\nOld block\n<!-- dsh-wsl-sandbox:end -->\n\n## Footer\nStay safe.\n',
+        'utf8',
+      );
+      const stripped = removeAgentsMdWslSection(tmpProj);
+      assert.equal(stripped.action, 'removed-section');
+      const remaining = fs.readFileSync(created.filePath, 'utf8');
+      assert.doesNotMatch(remaining, /dsh-wsl-sandbox/);
+      assert.match(remaining, /Keep commits atomic\./);
+      assert.match(remaining, /Stay safe\./);
+    } finally {
+      fs.rmSync(tmpProj, { recursive: true, force: true });
+    }
+  });
+
+  it('deduplicates unchanged backup snapshots by SHA-256 and caps rolling .bak files at 5 without 0400 EACCES errors', () => {
+    const bkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-bk-dedupe-'));
+    try {
+      // 6 repeated calls with identical content -> ONLY 1 file (`wsl.conf.orig`), ZERO `.bak` accumulation!
+      for (let i = 0; i < 6; i++) {
+        writeDeduplicatedReadOnlyBackup({
+          backupDir: bkDir,
+          origFileName: 'wsl.conf.orig',
+          rollingPrefix: 'wsl.conf',
+          rollingExt: 'bak',
+          timestamp: `20261126-00000${i}`,
+          content: '[boot]\nsystemd=true\n',
+          maxRolling: 5,
+        });
+      }
+      assert.deepEqual(fs.readdirSync(bkDir).sort(), ['wsl.conf.orig']);
+      assertPrivateFileMode(path.join(bkDir, 'wsl.conf.orig'), 0o400);
+
+      // 8 distinct content revisions -> `.orig` stays untouched + rolling `.bak` capped at exactly 5
+      for (let i = 1; i <= 8; i++) {
+        writeDeduplicatedReadOnlyBackup({
+          backupDir: bkDir,
+          origFileName: 'wsl.conf.orig',
+          rollingPrefix: 'wsl.conf',
+          rollingExt: 'bak',
+          timestamp: `20261126-01000${i}`,
+          content: `[boot]\nrevision=${i}\n`,
+          maxRolling: 5,
+        });
+      }
+      const files = fs.readdirSync(bkDir).sort();
+      assert.equal(files.length, 6); // 1 .orig + 5 rolling .bak
+      assert.equal(files.includes('wsl.conf.orig'), true);
+      assert.equal(fs.readFileSync(path.join(bkDir, 'wsl.conf.orig'), 'utf8'), '[boot]\nsystemd=true\n');
+    } finally {
+      for (const f of fs.readdirSync(bkDir)) {
+        try { fs.chmodSync(path.join(bkDir, f), 0o600); } catch { /* ignore */ }
+      }
+      fs.rmSync(bkDir, { recursive: true, force: true });
+    }
+  });
+
+  it('sweeps SIGKILL-orphaned 0444 runner/proxy temp dirs via owner.pid while preserving live runner dirs and preferring RAM tmpfs', () => {
+    if (IS_LINUX) {
+      const ramRoot = resolveEphemeralRamTmpRoot();
+      assert.ok(
+        ramRoot === '/dev/shm' || ramRoot.startsWith('/run/user/') || ramRoot === os.tmpdir(),
+        `Unexpected ramRoot: ${ramRoot}`,
+      );
+    }
+
+    const fakeTmp = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-sweep-lab-'));
+    try {
+      const crashedRunner = path.join(fakeTmp, 'dsh-wsl-runner-dead1');
+      const crashedProxy = path.join(fakeTmp, 'dsh-wsl-proxy-dead2');
+      const liveRunner = path.join(fakeTmp, 'dsh-wsl-runner-live');
+
+      for (const d of [crashedRunner, crashedProxy, liveRunner]) {
+        fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(path.join(d, 'empty-mask'), '', { mode: 0o444 });
+      }
+      fs.writeFileSync(path.join(crashedRunner, 'owner.pid'), '99999991\n');
+      fs.writeFileSync(path.join(crashedProxy, 'owner.pid'), '99999992\n');
+      fs.writeFileSync(path.join(liveRunner, 'owner.pid'), `${process.pid}\n`);
+
+      const swept = sweepOrphanedRunnerTempDirs({ tmpRoot: fakeTmp });
+      assert.equal(swept.sweptDirs.length, 2);
+      assert.equal(fs.existsSync(crashedRunner), false);
+      assert.equal(fs.existsSync(crashedProxy), false);
+      assert.equal(fs.existsSync(liveRunner), true);
+    } finally {
+      for (const ent of fs.readdirSync(fakeTmp)) {
+        const sub = path.join(fakeTmp, ent, 'empty-mask');
+        if (fs.existsSync(sub)) {
+          try { fs.chmodSync(sub, 0o600); } catch { /* ignore */ }
+        }
+      }
+      fs.rmSync(fakeTmp, { recursive: true, force: true });
+    }
+  });
+
+  it('enforces Checklist B (.git/hooks, .bashrc, .dsh) protection inside rw /shares/<alias> in ConfinedFsService', () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-fs-ws-'));
+    const rwShare = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-fs-rwshare-'));
+    fs.mkdirSync(path.join(rwShare, '.git', 'hooks'), { recursive: true });
+    try {
+      const svc = new ConfinedFsService();
+      const binding: SessionBinding = {
+        sessionId: 'sess-fs-share',
+        uid: 1000,
+        username: 'dev',
+        distro: 'Ubuntu-26.04',
+        workspaceRoot: ws,
+        cwd: ws,
+        profile: 'workspace-write',
+        revision: 'rev-1',
+        generation: 1,
+        runnerId: 'r-1',
+        authorizedShares: [{ id: 'sh-1', alias: 'extrepo', sourceLinuxPath: rwShare, mode: 'rw', oneShot: false }],
+        authorizedDevices: [],
+      };
+
+      // Normal file write in rw share is allowed
+      const okWrite = svc.write({ binding, path: '/shares/extrepo/README.md', content: 'hello\n' });
+      assert.equal(okWrite.bytesWritten, 6);
+
+      // Checklist B protected targets inside rw share MUST be blocked just like workspaceRoot!
+      for (const bad of ['/shares/extrepo/.git/hooks/pre-commit', '/shares/extrepo/.bashrc', '/shares/extrepo/.dsh/config.json']) {
+        assert.throws(() => svc.write({ binding, path: bad, content: 'pwned\n' }), SandboxError, `Expected Checklist B block for ${bad}`);
+      }
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+      fs.rmSync(rwShare, { recursive: true, force: true });
+    }
+  });
+
+  it('cleanly reverses all WSL artifacts in provision-wsl.sh --uninstall --purge-toolchains and has zero curl|sudo NodeSource commands', { skip: POSIX_BASH_SKIP_REASON }, () => {
+    const provContent = fs.readFileSync(PROVISION_SH_PATH, 'utf8');
+    assert.doesNotMatch(provContent, /nodesource\.com\/setup_/);
+
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-uninstall-home-'));
+    try {
+      // Populate all WSL-side artifacts including 0400 backups, shell RC hooks, cache, runner, delta path, and empty ~/workspace
+      const cfgRoot = path.join(fakeHome, '.config', 'dsh-wsl-sandbox');
+      const bkDir = path.join(cfgRoot, 'backups');
+      const cacheDir = path.join(fakeHome, '.cache', 'dsh-wsl-sandbox', 'deadbeef1234');
+      const runnerDir = path.join(fakeHome, '.local', 'share', 'dsh-wsl-sandbox', 'runner');
+      const deltaTool = path.join(fakeHome, '.local', 'bin', 'fake-delta-tool');
+      const emptyWs = path.join(fakeHome, 'workspace');
+
+      fs.mkdirSync(bkDir, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(runnerDir, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(path.dirname(deltaTool), { recursive: true, mode: 0o700 });
+      fs.mkdirSync(emptyWs, { recursive: true, mode: 0o755 });
+
+      fs.writeFileSync(path.join(bkDir, 'wsl.conf.orig'), '[boot]\n', { mode: 0o400 });
+      fs.chmodSync(path.join(bkDir, 'wsl.conf.orig'), 0o400);
+      fs.writeFileSync(path.join(cacheDir, 'pkg.tgz'), 'cached');
+      fs.writeFileSync(path.join(runnerDir, 'main.js'), '// runner');
+      fs.writeFileSync(deltaTool, '#!/bin/sh\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(fakeHome, '.dsh-wsl-env.sh'), 'export DSH_WSL_PROFILE="standard"\n', { mode: 0o600 });
+      fs.writeFileSync(
+        path.join(fakeHome, '.bashrc'),
+        '# User bashrc\nalias ll="ls -la"\n[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh"\n',
+      );
+      fs.writeFileSync(
+        path.join(cfgRoot, 'provision-manifest.json'),
+        JSON.stringify({ deltaEntries: [`path:${deltaTool}`] }, null, 2),
+        { mode: 0o600 },
+      );
+
+      const res = spawnSync(
+        'bash',
+        [PROVISION_SH_PATH, '--uninstall', '--purge-toolchains', '--skip-restore'],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, HOME: fakeHome },
+        },
+      );
+      assert.equal(res.status, 0, res.stderr || res.stdout);
+
+      assert.equal(fs.existsSync(cfgRoot), false, '~/.config/dsh-wsl-sandbox (including 0400 backups) must be removed');
+      assert.equal(fs.existsSync(path.join(fakeHome, '.cache', 'dsh-wsl-sandbox')), false, '~/.cache/dsh-wsl-sandbox must be removed');
+      assert.equal(fs.existsSync(path.join(fakeHome, '.local', 'share', 'dsh-wsl-sandbox')), false, '~/.local/share/dsh-wsl-sandbox must be removed');
+      assert.equal(fs.existsSync(path.join(fakeHome, '.dsh-wsl-env.sh')), false, '~/.dsh-wsl-env.sh must be removed');
+      assert.equal(fs.existsSync(deltaTool), false, 'Delta toolchain path from provision-manifest.json must be removed');
+      assert.equal(fs.existsSync(emptyWs), false, 'Empty default ~/workspace must be removed');
+
+      const bashrcAfter = fs.readFileSync(path.join(fakeHome, '.bashrc'), 'utf8');
+      assert.doesNotMatch(bashrcAfter, /\.dsh-wsl-env\.sh/);
+      assert.match(bashrcAfter, /alias ll="ls -la"/);
+
+      // Verify non-empty ~/workspace with user code is NEVER deleted!
+      fs.mkdirSync(emptyWs, { recursive: true });
+      fs.writeFileSync(path.join(emptyWs, 'my-code.ts'), 'export const x = 1;\n');
+      const res2 = spawnSync('bash', [PROVISION_SH_PATH, '--uninstall', '--skip-restore'], {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: fakeHome },
+      });
+      assert.equal(res2.status, 0);
+      assert.equal(fs.existsSync(path.join(emptyWs, 'my-code.ts')), true, 'Non-empty user ~/workspace must be preserved!');
+    } finally {
+      fs.rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+});
+
 
