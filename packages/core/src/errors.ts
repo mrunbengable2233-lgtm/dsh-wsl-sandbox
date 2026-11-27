@@ -27,13 +27,19 @@ export class SandboxError extends Error {
   readonly code: SandboxErrorCode;
   readonly details?: SandboxErrorDetails;
 
-  constructor(code: SandboxErrorCode, message?: string, details?: SandboxErrorDetails) {
-    super(message ?? code);
+  constructor(
+    code: SandboxErrorCode,
+    message?: string,
+    details?: SandboxErrorDetails,
+    options?: ErrorOptions,
+  ) {
+    super(message ?? code, options);
     this.name = 'SandboxError';
     this.code = code;
     if (details !== undefined) {
       this.details = details;
     }
+    Error.captureStackTrace?.(this, SandboxError);
   }
 }
 
@@ -41,8 +47,9 @@ export function failSandbox(
   code: SandboxErrorCode,
   message?: string,
   details?: SandboxErrorDetails,
+  options?: ErrorOptions,
 ): never {
-  throw new SandboxError(code, message, details);
+  throw new SandboxError(code, message, details, options);
 }
 
 export function isSandboxError(err: unknown): err is SandboxError {

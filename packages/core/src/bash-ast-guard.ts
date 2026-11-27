@@ -1759,9 +1759,9 @@ export function evaluateBashCommand(command: string, ctx: BashGuardContext): Gua
           continue;
         }
         if (redir.op === '<<<') {
-          if (SHELL_BINARIES.has(targetCmd)) {
+          if (SHELL_BINARIES.has(targetCmd) || pipelineFeedsShell) {
             inspectScript(redir.target, depth + 1);
-          } else if (INTERPRETER_BINARIES.has(targetCmd.toLowerCase())) {
+          } else if (INTERPRETER_BINARIES.has(targetCmd.toLowerCase()) || pipelineFeedsInterp) {
             escalate('ask', 'high', `Here-string execution via interpreter (${targetCmd}) requires single-shot approval`, true);
             scanCodeBodyForL0AndDevices(redir.target);
           }
@@ -1895,7 +1895,7 @@ export function extractBashNonProseTargets(command: string): BashHostInspectionT
           continue;
         }
         if (redir.op === '<<<') {
-          if (SHELL_BINARIES.has(targetCmd)) {
+          if (SHELL_BINARIES.has(targetCmd) || pipelineFeedsShell) {
             walk(redir.target, depth + 1);
           } else {
             nonProseArgs.push(redir.target);

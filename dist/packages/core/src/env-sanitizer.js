@@ -13,11 +13,15 @@ export const STRIPPED_ENV_VARS = new Set        ([
   'SSH_AUTH_SOCK',
   'SSH_AGENT_PID',
   'GPG_AGENT_INFO',
-  // Dynamic linker / shell / runtime injection vectors (CVE-2026-12537 class)
+  // Dynamic linker / glibc / shell / git / TLS / npm injection vectors
   'LD_PRELOAD',
   'LD_LIBRARY_PATH',
   'LD_AUDIT',
   'LD_DEBUG',
+  'LD_PROFILE',
+  'GLIBC_TUNABLES',
+  'GCONV_PATH',
+  'HOSTALIASES',
   'BASH_ENV',
   'ENV',
   'PROMPT_COMMAND',
@@ -25,6 +29,7 @@ export const STRIPPED_ENV_VARS = new Set        ([
   'GLOBIGNORE',
   'SHELLOPTS',
   'BASHOPTS',
+  'ZDOTDIR',
   'NODE_OPTIONS',
   'NODE_EXTRA_CA_CERTS',
   'PYTHONSTARTUP',
@@ -35,6 +40,18 @@ export const STRIPPED_ENV_VARS = new Set        ([
   'GIT_EXEC_PATH',
   'GIT_CONFIG_PARAMETERS',
   'GIT_CONFIG_COUNT',
+  'GIT_DIR',
+  'GIT_WORK_TREE',
+  'GIT_TEMPLATE_DIR',
+  'GIT_CONFIG_GLOBAL',
+  'GIT_EXTERNAL_DIFF',
+  'GIT_ASKPASS',
+  'SSH_ASKPASS',
+  'SSL_CERT_FILE',
+  'SSL_CERT_DIR',
+  'REQUESTS_CA_BUNDLE',
+  'CURL_CA_BUNDLE',
+  'NPM_CONFIG_SCRIPT_SHELL',
   'PERL5OPT',
   'PERL5LIB',
   'RUBYOPT',
@@ -43,7 +60,11 @@ export const STRIPPED_ENV_VARS = new Set        ([
   'RUSTC_WRAPPER',
 ]);
 
-const CREDENTIAL_NAME_RE = /(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY|CREDENTIAL|AUTH)/i;
+// Segment-aware credential regex: strips API_KEY, TOKEN, SECRET, PASSWORD, PASSWD, PRIVATE_KEY,
+// ACCESS_KEY, CREDENTIAL, AUTH while preserving benign names like GIT_AUTHOR_NAME,
+// GIT_AUTHOR_EMAIL, GIT_COMMITTER_NAME, MAX_TOKENS, TOKENIZERS_PARALLELISM.
+const CREDENTIAL_NAME_RE =
+  /(?:(?:^|_)(?:API_KEY|TOKEN|AUTH|AUTHORIZATION|CREDENTIAL|CREDENTIALS|PRIVATE_KEY|ACCESS_KEY)(?:$|_)|(?:API_KEY|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY))/i;
 
 export const DEFAULT_SANDBOX_PATH = [
   '/opt/dsh-toolchain/shims',
@@ -100,7 +121,17 @@ export function sanitizeSandboxEnv(options                    )                 
     ? options.pathEntries.filter((p) => p.startsWith('/') && !p.startsWith('/mnt/')).join(':')
     : fallbackPath;
 
-  out.PATH = safePath || fallbackPath;
+  const cacheBase = options.cacheRootDir || '/tmp/.dsh-cache';
+  const cacheBinEntries =
+    cacheBase.startsWith('/') && !cacheBase.startsWith('/mnt/')
+      ? [`${cacheBase}/pnpm`, `${cacheBase}/cargo/bin`]
+      : [];
+
+  const basePathStr = safePath || fallbackPath;
+  const basePathParts = basePathStr.split(':').filter(Boolean);
+  const pathParts = [...cacheBinEntries.filter((p) => !basePathParts.includes(p)), ...basePathParts];
+
+  out.PATH = pathParts.join(':');
   out.HOME = options.homeDir;
   out.TMPDIR = '/tmp';
   out.TEMP = '/tmp';
@@ -113,7 +144,6 @@ export function sanitizeSandboxEnv(options                    )                 
   out.COREPACK_ENABLE_DOWNLOAD_PROMPT = '0';
 
   // Redirect writable toolchain caches away from read-only real $HOME while keeping read-only RUSTUP_HOME
-  const cacheBase = options.cacheRootDir || '/tmp/.dsh-cache';
   out.XDG_CACHE_HOME = cacheBase;
   out.UV_CACHE_DIR = `${cacheBase}/uv`;
   out.PIP_CACHE_DIR = `${cacheBase}/pip`;
@@ -143,7 +173,7 @@ export function sanitizeSandboxEnv(options                    )                 
         continue;
       }
       if (key.startsWith('DSH_')) continue;
-      if (STRIPPED_ENV_VARS.has(key)) continue;
+      if (STRIPPED_ENV_VARS.has(key) || STRIPPED_ENV_VARS.has(key.toUpperCase())) continue;
       if (CREDENTIAL_NAME_RE.test(key)) continue;
       if (val.includes('\0')) continue;
       out[key] = val;
@@ -156,6 +186,8 @@ export function sanitizeSandboxEnv(options                    )                 
     out.HTTPS_PROXY = options.proxyUrl;
     out.http_proxy = options.proxyUrl;
     out.https_proxy = options.proxyUrl;
+    delete out.ALL_PROXY;
+    delete out.all_proxy;
     out.NO_PROXY = '';
     out.no_proxy = '';
   } else {

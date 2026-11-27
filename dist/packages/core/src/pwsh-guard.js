@@ -1312,9 +1312,10 @@ function reconstructAstCommandStrings(cmd                       )
         argv.push(el.argumentValue);
         argValues.push({ text: el.argumentValue, quoted: argQuoted });
       } else if (el.argumentText) {
-        unquotedParts.push(el.argumentText);
+        const argQuoted = /^['"\u2018\u2019\u201c\u201d@]/u.test(el.argumentText);
+        unquotedParts.push(argQuoted ? '""' : el.argumentText);
         argv.push(el.argumentText);
-        argValues.push({ text: el.argumentText, quoted: false });
+        argValues.push({ text: el.argumentText, quoted: argQuoted });
       }
       continue;
     }

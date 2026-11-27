@@ -151,6 +151,10 @@ export function mergeWslDistrosWithLxss(
   return merged;
 }
 
+export function isHostSpawnDisabled(): boolean {
+  return process.env.DSH_WSL_NO_HOST_SPAWN === '1';
+}
+
 /**
  * Read-only query of Windows `HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*`.
  * Captures imported/moved distros (e.g. moved to D:\WSL via WSL Manager or WSL Settings)
@@ -158,7 +162,7 @@ export function mergeWslDistrosWithLxss(
  */
 export function queryWindowsLxssRegistry(): Map<string, LxssRegistryEntry> {
   const map = new Map<string, LxssRegistryEntry>();
-  if (process.platform !== 'win32') return map;
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) return map;
 
   const ps = [
     '$items = @();',
@@ -207,11 +211,14 @@ export function discoverWslDistros(): WslDiscoveryReport {
     lxssRegistryKey: 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
   };
 
-  if (process.platform !== 'win32') {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) {
     return {
       platform: process.platform,
       distros: [],
-      recommendedDistro: process.env.WSL_DISTRO_NAME || 'local-linux',
+      recommendedDistro:
+        process.platform !== 'win32'
+          ? (process.env.WSL_DISTRO_NAME || 'local-linux')
+          : 'Ubuntu-26.04',
       wslSettingsSharedPaths: sharedPaths,
     };
   }
@@ -243,7 +250,7 @@ export function discoverWslDistros(): WslDiscoveryReport {
  * Uses `--cd ~` so it never locks any Windows NTFS directory.
  */
 export function probeWslDistroUser(distro: string, username?: string): ProbedDistroUser | null {
-  if (process.platform !== 'win32' || !isValidIdentifier(distro)) return null;
+  if (process.platform !== 'win32' || isHostSpawnDisabled() || !isValidIdentifier(distro)) return null;
   const args = ['-d', distro, '--cd', '~'];
   if (username && isValidIdentifier(username)) {
     args.push('-u', username);

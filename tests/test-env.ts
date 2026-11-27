@@ -5,7 +5,7 @@ import path from 'node:path';
 
 // Shared cross-platform test environment probe & repo-root resolver.
 // 1. Resolves `REPO_ROOT` independent of `process.cwd()` and works identically whether running
-//    from `tests/` source files OR `dist/.compiled-tests/` compiled JS files.
+//    from `tests/` source files OR `.cache/compiled-tests/` compiled JS files.
 // 2. Automatically runs `scripts/build.mjs` once if `dist/` or `client.js` is missing.
 // 3. Honestly probes real OS / `bwrap` / Unix-socket / POSIX `bash`+`tar` capabilities.
 

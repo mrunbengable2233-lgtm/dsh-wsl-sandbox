@@ -514,51 +514,53 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     }
 
     let wslInternalDir                    ;
-    try {
-      const wslResult = (await deps.sessionManager.callRpc('wsl.backupConfigs', {}, 12_000))     
-                                      
+    if (deps.sessionManager.isRunnerActive() || cfg.transportMode === 'local-linux') {
+      try {
+        const wslResult = (await deps.sessionManager.callRpc('wsl.backupConfigs', {}, 12_000))     
+                                        
+                                         
                                        
-                                     
-                                           
-       ;
-      wslInternalDir = wslResult.wslInternalBackupDir;
-      if (typeof wslResult.wslConfContent === 'string') {
-        saveDeduplicatedHostSeries(
-          `wsl.conf.${cfg.distro}.orig`,
-          `wsl.conf.${cfg.distro}`,
-          'bak',
-          ts,
-          wslResult.wslConfContent,
-          5,
-        );
-      } else {
-        const distroAbsent = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig.absent`);
-        if (!fs.existsSync(distroAbsent) && !fs.existsSync(path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig`))) {
-          writeReadOnlyHostBackup(distroAbsent, `# ${cfg.distro} had no /etc/wsl.conf at initial backup (${ts})\n`);
+                                             
+         ;
+        wslInternalDir = wslResult.wslInternalBackupDir;
+        if (typeof wslResult.wslConfContent === 'string') {
+          saveDeduplicatedHostSeries(
+            `wsl.conf.${cfg.distro}.orig`,
+            `wsl.conf.${cfg.distro}`,
+            'bak',
+            ts,
+            wslResult.wslConfContent,
+            5,
+          );
+        } else {
+          const distroAbsent = path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig.absent`);
+          if (!fs.existsSync(distroAbsent) && !fs.existsSync(path.join(resolvedBackupDir, `wsl.conf.${cfg.distro}.orig`))) {
+            writeReadOnlyHostBackup(distroAbsent, `# ${cfg.distro} had no /etc/wsl.conf at initial backup (${ts})\n`);
+          }
         }
+        if (typeof wslResult.fstabContent === 'string') {
+          saveDeduplicatedHostSeries(
+            `fstab.${cfg.distro}.orig`,
+            `fstab.${cfg.distro}`,
+            'bak',
+            ts,
+            wslResult.fstabContent,
+            5,
+          );
+        }
+        if (typeof wslResult.drvfsMountsContent === 'string') {
+          saveDeduplicatedHostSeries(
+            `drvfs-mounts.${cfg.distro}.orig.txt`,
+            `drvfs-mounts.${cfg.distro}`,
+            'txt',
+            ts,
+            wslResult.drvfsMountsContent + '\n',
+            5,
+          );
+        }
+      } catch {
+        // Runner offline; host backup still succeeded
       }
-      if (typeof wslResult.fstabContent === 'string') {
-        saveDeduplicatedHostSeries(
-          `fstab.${cfg.distro}.orig`,
-          `fstab.${cfg.distro}`,
-          'bak',
-          ts,
-          wslResult.fstabContent,
-          5,
-        );
-      }
-      if (typeof wslResult.drvfsMountsContent === 'string') {
-        saveDeduplicatedHostSeries(
-          `drvfs-mounts.${cfg.distro}.orig.txt`,
-          `drvfs-mounts.${cfg.distro}`,
-          'txt',
-          ts,
-          wslResult.drvfsMountsContent + '\n',
-          5,
-        );
-      }
-    } catch {
-      // Runner offline; host backup still succeeded
     }
 
     const items = collectHostBackupItems(resolvedBackupDir, cfg.distro, wslInternalDir, []);
@@ -628,34 +630,38 @@ export function registerWslSandboxWebApi(ctx                  , deps            
 
     const explorerArgs = isFileTarget ? [`/select,${finalTarget}`] : [finalTarget];
     let launched = false;
-    if (process.platform === 'win32') {
-      const child = spawn('explorer.exe', explorerArgs, {
-        shell: false,
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref();
-      launched = true;
-    } else if (process.platform === 'darwin') {
-      const child = spawn('open', isFileTarget ? ['-R', finalTarget] : [finalTarget], {
-        shell: false,
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.unref();
-      launched = true;
-    } else if (process.env.WSL_DISTRO_NAME) {
-      // Running inside WSL Linux dev mode: convert path via wslpath -w and launch Windows explorer.exe
-      const wp = spawnSync('wslpath', ['-w', finalTarget], { encoding: 'utf8' });
-      const winPath = wp.status === 0 ? wp.stdout.trim() : finalTarget;
-      const child = spawn('explorer.exe', isFileTarget ? [`/select,${winPath}`] : [winPath], {
-        shell: false,
-        detached: true,
-        stdio: 'ignore',
-      });
-      child.on('error', () => {});
-      child.unref();
-      launched = true;
+    if (process.env.DSH_WSL_NO_HOST_SPAWN !== '1') {
+      if (process.platform === 'win32') {
+        const child = spawn('explorer.exe', explorerArgs, {
+          shell: false,
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.on('error', () => {});
+        child.unref();
+        launched = true;
+      } else if (process.platform === 'darwin') {
+        const child = spawn('open', isFileTarget ? ['-R', finalTarget] : [finalTarget], {
+          shell: false,
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.on('error', () => {});
+        child.unref();
+        launched = true;
+      } else if (process.env.WSL_DISTRO_NAME) {
+        // Running inside WSL Linux dev mode: convert path via wslpath -w and launch Windows explorer.exe
+        const wp = spawnSync('wslpath', ['-w', finalTarget], { encoding: 'utf8' });
+        const winPath = wp.status === 0 ? wp.stdout.trim() : finalTarget;
+        const child = spawn('explorer.exe', isFileTarget ? [`/select,${winPath}`] : [winPath], {
+          shell: false,
+          detached: true,
+          stdio: 'ignore',
+        });
+        child.on('error', () => {});
+        child.unref();
+        launched = true;
+      }
     }
 
     res.status(200).json({
@@ -668,7 +674,7 @@ export function registerWslSandboxWebApi(ctx                  , deps            
   });
 
   add('POST', '/wsl-sandbox/api/wsl-config/pick-dir', (_req, res) => {
-    if (process.platform !== 'win32') {
+    if (process.platform !== 'win32' || process.env.DSH_WSL_NO_HOST_SPAWN === '1') {
       res.status(200).json({
         ok: true,
         supported: false,
