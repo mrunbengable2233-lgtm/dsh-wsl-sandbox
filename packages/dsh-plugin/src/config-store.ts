@@ -39,6 +39,10 @@ export interface AdvancedSandboxConfig {
 export interface WslSandboxConfig {
   readonly revision: string;
   readonly enabled: boolean;
+  /** 是否已完成首次安装/人工配置确认（首次空盘安装默认为 false，用于触发 OOBE 向导） */
+  readonly initialized?: boolean;
+  /** 用户是否主动关闭或完成了 OOBE 向导（关闭后不再每次打开 DSH 自动弹窗） */
+  readonly oobeDismissed?: boolean;
   readonly transportMode: 'wsl' | 'local-linux';
   readonly distro: string;
   readonly username?: string;
@@ -70,6 +74,8 @@ export type BasicConfigPatch = Partial<
   Pick<
     WslSandboxConfig,
     | 'enabled'
+    | 'initialized'
+    | 'oobeDismissed'
     | 'transportMode'
     | 'distro'
     | 'username'
@@ -116,6 +122,10 @@ export function getDefaultBackupDir(dshHome?: string): string {
 
 export function getDefaultLogDir(dshHome?: string): string {
   return path.join(getDefaultConfigDir(dshHome), 'logs');
+}
+
+export function hasInstallManifest(configDir: string): boolean {
+  return fs.existsSync(path.join(configDir, 'install-manifest.json'));
 }
 
 /**
@@ -381,9 +391,13 @@ export function validateFullConfig(raw: WslSandboxConfig): WslSandboxConfig {
 
   const customAllowedDomains = (raw.advanced?.customAllowedDomains ?? []).map(validateDomain);
   const backupDir = validateBackupDirPath(raw.backupDir) ?? getDefaultBackupDir();
+  const initialized = typeof raw.initialized === 'boolean' ? raw.initialized : undefined;
+  const oobeDismissed = typeof raw.oobeDismissed === 'boolean' ? raw.oobeDismissed : undefined;
 
   return {
     ...raw,
+    ...(initialized !== undefined ? { initialized } : {}),
+    ...(oobeDismissed !== undefined ? { oobeDismissed } : {}),
     runnerPath,
     wslNodePath,
     environmentProfile,
@@ -440,7 +454,25 @@ export class ConfigStore {
     return this.persistToDisk;
   }
 
+  /** 判断当前配置是否已通过安装脚本或人工确认完成初始化 */
+  isInitialized(): boolean {
+    if (this.persistToDisk && hasInstallManifest(this.getConfigDir())) return true;
+    if (this.config.initialized === true) return true;
+    if (this.config.initialized === false) return false;
+    if (this.config.transportMode === 'local-linux') return true;
+    if (!this.persistToDisk) return true;
+    return false;
+  }
+
+  /** 判断是否需要在前端自动弹出首次安装 OOBE 向导 */
+  isOobeNeeded(): boolean {
+    if (process.platform !== 'win32' || this.config.transportMode !== 'wsl') return false;
+    return !this.isInitialized() && !Boolean(this.config.oobeDismissed);
+  }
+
   private loadOrInit(initial?: Partial<WslSandboxConfig>): WslSandboxConfig {
+    const configDir = path.dirname(this.filePath);
+    const hasManifest = this.persistToDisk && hasInstallManifest(configDir);
     if (this.persistToDisk && fs.existsSync(this.filePath)) {
       try {
         const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8')) as Partial<WslSandboxConfig>;
@@ -455,16 +487,40 @@ export class ConfigStore {
                   parsed.advanced?.customAllowedDomains ?? initial?.advanced?.customAllowedDomains ?? [],
               }
             : undefined;
+        const inferredInitialized = hasManifest ? true : (parsed.initialized ?? initial?.initialized);
         return createDefaultConfig({
           ...initial,
           ...parsed,
+          ...(inferredInitialized !== undefined ? { initialized: inferredInitialized } : {}),
           ...(mergedAdvanced ? { advanced: mergedAdvanced } : {}),
         });
       } catch {
         // Fall through to defaults if corrupted
       }
     }
-    const defaults = createDefaultConfig(initial);
+
+    const hasExplicitInitial = Boolean(initial && Object.keys(initial).length > 0);
+    const effectiveTransport = initial?.transportMode ?? (process.platform === 'win32' ? 'wsl' : 'local-linux');
+    const isUninitializedWinBlankInstall =
+      this.persistToDisk &&
+      process.platform === 'win32' &&
+      effectiveTransport === 'wsl' &&
+      !hasExplicitInitial &&
+      !hasManifest &&
+      initial?.enabled === undefined;
+
+    const defaults = isUninitializedWinBlankInstall
+      ? createDefaultConfig({
+          enabled: false,
+          initialized: false,
+          oobeDismissed: false,
+          ...initial,
+        })
+      : createDefaultConfig({
+          initialized: initial?.initialized ?? true,
+          oobeDismissed: initial?.oobeDismissed ?? false,
+          ...initial,
+        });
     if (this.persistToDisk) {
       this.saveAtomic(defaults);
     }
@@ -526,9 +582,11 @@ export class ConfigStore {
               customAllowedDomains: parsed.advanced.customAllowedDomains ?? prev.advanced.customAllowedDomains,
             }
           : prev.advanced;
+      const hasManifest = hasInstallManifest(this.getConfigDir());
       const loaded = createDefaultConfig({
         ...prev,
         ...parsed,
+        ...(hasManifest ? { initialized: true } : {}),
         advanced: mergedAdvanced,
       });
       const stripRev = (c: WslSandboxConfig) => ({ ...c, revision: '' });
@@ -578,9 +636,19 @@ export class ConfigStore {
         'Full Windows drive (/mnt) mounting is disabled in basic config; use Advanced single-directory /shares/<alias> instead.',
       );
     }
+    const nextInitialized =
+      patch.initialized !== undefined
+        ? patch.initialized
+        : patch.enabled === true
+          ? true
+          : this.config.initialized;
+    const nextOobeDismissed =
+      patch.oobeDismissed !== undefined ? patch.oobeDismissed : this.config.oobeDismissed;
     return this.commit({
       ...this.config,
       enabled: patch.enabled ?? this.config.enabled,
+      ...(nextInitialized !== undefined ? { initialized: nextInitialized } : {}),
+      ...(nextOobeDismissed !== undefined ? { oobeDismissed: nextOobeDismissed } : {}),
       transportMode: patch.transportMode ?? this.config.transportMode,
       distro: patch.distro ?? this.config.distro,
       username: patch.username !== undefined ? patch.username : this.config.username,

@@ -12,11 +12,12 @@ import {
 } from '../../core/src/index.js';
                                                            
                                                           
-             
-                   
-                     
-                           
-                           
+import {
+                        
+                          
+                                
+  subscribeCordisWaterfall,
+} from './cordis-types.js';
                                                         
 
 /**
@@ -764,11 +765,11 @@ export function registerHostPwshGuardHook(
     }
   }
 
-  // 2. Polite `tools/pre-execute` waterfall listener
-  if (ctx.waterfall) {
-    const wfDispose = ctx.waterfall                                   (
-      'tools/pre-execute',
-      async (payload, next) => {
+  // 2. 礼貌订阅 `tools/pre-execute` 瀑布流监听（通过 Cordis `ctx.on` 安全挂载）
+  const wfDispose = subscribeCordisWaterfall                                   (
+    ctx,
+    'tools/pre-execute',
+    async (payload, next) => {
         const passThrough = () =>
           typeof next === 'function' ? next() : ({ kind: 'allow' }                             );
 
@@ -876,9 +877,8 @@ export function registerHostPwshGuardHook(
         }
       },
     );
-    if (typeof wfDispose === 'function') {
-      disposers.push(() => void wfDispose());
-    }
+  if (typeof wfDispose === 'function') {
+    disposers.push(() => void wfDispose());
   }
 
   if (disposers.length === 0) return undefined;

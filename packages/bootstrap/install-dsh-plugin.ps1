@@ -718,6 +718,8 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
   $cfg = [ordered]@{
     revision = "rev-1"
     enabled = $sandboxEnabled
+    initialized = $true
+    oobeDismissed = $true
     transportMode = "wsl"
     distro = $Distro
     username = $linuxUser
@@ -750,9 +752,18 @@ if (-not (Test-Path -LiteralPath $cfgPath)) {
   Write-Host "[4/5] Created owner-only config: $cfgPath (enabled=$sandboxEnabled, profile=$Profile, wslNodePath=auto, logLevel=info)" -ForegroundColor Green
   Add-InstallLog "Created config.json at $cfgPath (enabled=$sandboxEnabled)"
 } else {
-  if ($UpdateConfig -or $Provision) {
-    $existing = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $existingPreview = $null
+  try {
+    $existingPreview = Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  } catch {
+    $existingPreview = $null
+  }
+  $needsFirstTimeReplace = ($null -ne $existingPreview -and $null -ne $existingPreview.PSObject.Properties["initialized"] -and $existingPreview.initialized -eq $false)
+  if ($UpdateConfig -or $Provision -or $needsFirstTimeReplace) {
+    $existing = if ($null -ne $existingPreview) { $existingPreview } else { Get-Content -LiteralPath $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json }
     $existing | Add-Member -NotePropertyName enabled -NotePropertyValue $sandboxEnabled -Force
+    $existing | Add-Member -NotePropertyName initialized -NotePropertyValue $true -Force
+    $existing | Add-Member -NotePropertyName oobeDismissed -NotePropertyValue $true -Force
     $existing | Add-Member -NotePropertyName distro -NotePropertyValue $Distro -Force
     $existing | Add-Member -NotePropertyName username -NotePropertyValue $linuxUser -Force
     $existing | Add-Member -NotePropertyName workspaceRoot -NotePropertyValue $WorkspaceRoot -Force

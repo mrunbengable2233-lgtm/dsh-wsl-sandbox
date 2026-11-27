@@ -1,5 +1,6 @@
 import path from 'node:path';
 import {
+  disposeSystemPwshParser,
   type LogLevel,
   resolveSharedHostNodeRuntime,
   RotatingNdjsonSink,
@@ -112,9 +113,8 @@ function normalizeHostLogger(rawLogger: unknown): Partial<DshLogger> | undefined
 function registerSafeEffect(ctx: DshCordisContext, cleanup: () => void | Promise<void>): void {
   if (typeof ctx.effect !== 'function') return;
   if ('fiber' in (ctx as object) || typeof ctx.inject === 'function') {
-    ctx.effect(() => () => {
-      void cleanup();
-    });
+    // 返回 cleanup() 自身的 Promise（若为异步卸载），让 Cordis Fiber 完整 await 后再允许重载
+    ctx.effect(() => () => cleanup());
   } else {
     ctx.effect(cleanup);
   }
@@ -295,6 +295,7 @@ export function apply(
       await fn();
     }
     await sessionManager.dispose();
+    await disposeSystemPwshParser();
     logger.log('info', {
       component: 'plugin',
       event: 'plugin.disposed',

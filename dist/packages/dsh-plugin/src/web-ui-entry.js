@@ -183,6 +183,7 @@ export function renderWslSandboxUiHtml()         {
       </div>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <span class="dsh-wsl-sbx-mono" style="font-size:12px;color:var(--text-secondary)">dsh-wsl-sandbox v0.3.0</span>
+        <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" id="btn-oobe-reopen" style="padding:3px 9px;font-size:11.5px" onclick="reopenOobeHint()">OOBE 初始化向导说明</button>
         <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" id="langBtn-zh" style="padding:3px 9px;font-size:11.5px" onclick="setUiLang('zh')">简体中文</button>
         <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" id="langBtn-en" style="padding:3px 9px;font-size:11.5px" onclick="setUiLang('en')">English</button>
       </div>
@@ -489,7 +490,7 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
             </select>
             <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" style="flex:1;min-width:180px" id="log-q" placeholder="搜索事件名、组件或关键字..." onkeydown="if(event.key==='Enter')loadLogs()" />
             <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="loadLogs()">刷新</button>
-            <a class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" style="text-decoration:none" href="/wsl-sandbox/api/logs/export" target="_blank">导出 NDJSON</a>
+            <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="exportLogsNdjson()">导出 NDJSON</button>
             <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="clearLogs()">清空日志</button>
           </div>
           <div style="font-size:11.5px;color:var(--text-secondary)" class="dsh-wsl-sbx-mono" id="logStatsBar">
@@ -1062,6 +1063,26 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
     async function removeAgentsMdBlock() {
       const r = await api('DELETE', '/wsl-sandbox/api/agents-md', {});
       msg(r.ok ? ('AGENTS.md 处理结果: ' + r.action + ' (' + r.filePath + ')') : ('移除失败: ' + (r.error && r.error.message)));
+    }
+    async function reopenOobeHint() {
+      const r = await api('POST', '/wsl-sandbox/api/oobe', { action: 'reopen' });
+      msg(r.ok
+        ? '已重置 OOBE 首次安装向导标志：切回 DeepSeek Harness 主界面即会自动弹出交互式三步安装向导（也可直接在下方「受控 AI 初始化引导」卡片开启通道）。'
+        : ('操作失败: ' + (r.error && r.error.message)));
+    }
+    async function exportLogsNdjson() {
+      const res = await fetch('/wsl-sandbox/api/logs/export', { headers: { 'X-DSH-WSL-Client': '1' } });
+      if (!res.ok) { msg('导出日志失败: HTTP ' + res.status); return; }
+      const text = await res.text();
+      const blob = new Blob([text], { type: 'application/x-ndjson;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'dsh-wsl-sandbox-logs.ndjson';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
     async function runDoc() {
       document.getElementById('docBox').textContent = '正在执行内核隔离与当前档位工具链自检...';

@@ -13,7 +13,7 @@ import {
   type StructuredLogger,
 } from '../../core/src/index.ts';
 import type { ConfigStore } from './config-store.ts';
-import type { DshApprovalService, DshCordisContext } from './cordis-types.ts';
+import { type DshApprovalService, type DshCordisContext, subscribeCordisWaterfall } from './cordis-types.ts';
 
 export interface PendingQueueItem {
   readonly requestId: string;
@@ -116,18 +116,16 @@ export class ApprovalBridge {
   }
 
   /**
-   * Register a polite `approval/request` waterfall listener on Cordis context:
-   * passes every non-`dsh-wsl-sandbox` request untouched via `return next()`.
+   * 在 Cordis 上下文安全注册 `approval/request` 瀑布流透传监听器：
+   * 所有非 `dsh-wsl-sandbox` 请求均通过 `next()` 原样放行。
    */
   attachCordisWaterfall(ctx: DshCordisContext): (() => void) | undefined {
-    if (!ctx.waterfall) return undefined;
-    const dispose = ctx.waterfall<{ source?: string }, unknown>('approval/request', async (req, next) => {
+    return subscribeCordisWaterfall<{ source?: string }, unknown>(ctx, 'approval/request', async (req, next) => {
       if (req?.source !== 'dsh-wsl-sandbox') {
         return typeof next === 'function' ? next() : undefined;
       }
       return typeof next === 'function' ? next() : undefined;
     });
-    return typeof dispose === 'function' ? () => void dispose() : undefined;
   }
 
   setBinding(binding: SessionBinding): void {

@@ -1192,4 +1192,44 @@ describe('v0.2.1 Audit Regressions — 100% Hermetic Host & Plugin Guarantees', 
     assert.equal(legacy.isLegacyInboxWsl, true);
     assert.equal(legacy.isBelow24, true);
   });
+
+  it('keeps blank Windows first-run install uninitialized (enabled=false, oobeNeeded=true) until install-manifest or explicit setup', () => {
+    const tmpBlank = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-oobe-blank-'));
+    try {
+      const cfgPath = path.join(tmpBlank, 'config.json');
+      const store = new ConfigStore({
+        filePath: cfgPath,
+        persistToDisk: true,
+        initial: {},
+      });
+
+      if (process.platform === 'win32') {
+        assert.equal(store.get().enabled, false);
+        assert.equal(store.get().initialized, false);
+        assert.equal(store.isInitialized(), false);
+        assert.equal(store.isOobeNeeded(), true);
+
+        // 稍后配置 -> 仅关闭弹窗提醒，仍保持未初始化状态
+        store.updateBasic({ oobeDismissed: true });
+        assert.equal(store.isInitialized(), false);
+        assert.equal(store.isOobeNeeded(), false);
+
+        // 写入 install-manifest.json + reload -> 自动识别已初始化
+        fs.writeFileSync(
+          path.join(tmpBlank, 'install-manifest.json'),
+          JSON.stringify({ version: '0.3.0', distro: 'Ubuntu-24.04' }),
+          'utf8',
+        );
+        const reloaded = store.reloadFromDisk();
+        assert.equal(reloaded.initialized, true);
+        assert.equal(store.isInitialized(), true);
+        assert.equal(store.isOobeNeeded(), false);
+      } else {
+        assert.equal(store.isInitialized(), true);
+        assert.equal(store.isOobeNeeded(), false);
+      }
+    } finally {
+      fs.rmSync(tmpBlank, { recursive: true, force: true });
+    }
+  });
 });

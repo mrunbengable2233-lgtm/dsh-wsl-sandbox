@@ -580,6 +580,12 @@ export class WslSandboxSessionManager {
 
   private ensureTransport(cfg: WslSandboxConfig): TransportLike {
     if (!cfg.enabled) {
+      if (!this.configStore.isInitialized()) {
+        failSandbox(
+          'SANDBOX_UNAVAILABLE',
+          'dsh-wsl-sandbox is currently disabled in configuration (not initialized yet: open "WSL 2 沙箱 / WSL 2 Sandbox" in DSH left sidebar to run the OOBE setup wizard)',
+        );
+      }
       failSandbox('SANDBOX_UNAVAILABLE', 'dsh-wsl-sandbox is currently disabled in configuration');
     }
     if (!this.transport) {
@@ -651,10 +657,20 @@ export class WslSandboxSessionManager {
     this.configStore.reloadFromDisk();
     let cfg = this.configStore.get();
     if (!cfg.enabled) {
+      if (!this.configStore.isInitialized()) {
+        failSandbox(
+          'SANDBOX_UNAVAILABLE',
+          'dsh-wsl-sandbox is currently disabled in configuration (not initialized yet: open "WSL 2 沙箱 / WSL 2 Sandbox" in DSH left sidebar to run the OOBE setup wizard)',
+        );
+      }
       failSandbox('SANDBOX_UNAVAILABLE', 'dsh-wsl-sandbox is currently disabled in configuration');
     }
 
+    const canAutoDiscoverInTestOrInit =
+      this.configStore.isInitialized() ||
+      Boolean(this.options.stageRunner || this.options.discoverDistros);
     const shouldAutoPrepareWsl =
+      canAutoDiscoverInTestOrInit &&
       cfg.transportMode === 'wsl' &&
       ((process.platform === 'win32' && !isHostSpawnDisabled()) ||
         Boolean(this.options.stageRunner || this.options.discoverDistros));

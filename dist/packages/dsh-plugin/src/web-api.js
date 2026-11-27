@@ -117,8 +117,11 @@ function extractHostHostname(rawHost                    )         {
   return trimmed;
 }
 
-function isAllowedHostHeader(req                 )          {
-  return LOOPBACK_HOSTS.has(extractHostHostname(req.headers.host));
+function isAllowedHostHeader(req                 , boundHost         )          {
+  const host = extractHostHostname(req.headers.host);
+  if (LOOPBACK_HOSTS.has(host)) return true;
+  if (boundHost && host === extractHostHostname(boundHost)) return true;
+  return false;
 }
 
 function isSameOriginOrLoopback(req                 )          {
@@ -246,6 +249,9 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     const binding = deps.sessionManager.getBindingSnapshot();
     res.status(200).json({
       ok: true,
+      initialized: deps.configStore.isInitialized(),
+      oobeNeeded: deps.configStore.isOobeNeeded(),
+      pluginRoot: findPluginPackageRoot() ?? null,
       bound: Boolean(binding),
       runnerActive: deps.sessionManager.isRunnerActive(),
       generation: deps.sessionManager.getGeneration(),
@@ -256,6 +262,57 @@ export function registerWslSandboxWebApi(ctx                  , deps            
       pendingApprovals: deps.approvalBridge.listPending().length,
       sessionRules: deps.approvalBridge.getSessionRules(),
     });
+  });
+
+  // 首次安装 OOBE 状态流转（关闭提醒、重新打开或保存向导初始选型，绝不自动启动 WSL）
+  add('POST', '/wsl-sandbox/api/oobe', (req, res) => {
+    const body = (req.body ?? {})     
+                                                 
+                      
+                                                             
+                         
+                             
+                          
+     ;
+    if (body.action === 'dismiss') {
+      const updated = deps.configStore.updateBasic({ oobeDismissed: true });
+      res.status(200).json({
+        ok: true,
+        config: updated,
+        initialized: deps.configStore.isInitialized(),
+        oobeNeeded: deps.configStore.isOobeNeeded(),
+      });
+      return;
+    }
+    if (body.action === 'reopen') {
+      const updated = deps.configStore.updateBasic({ oobeDismissed: false });
+      res.status(200).json({
+        ok: true,
+        config: updated,
+        initialized: deps.configStore.isInitialized(),
+        oobeNeeded: deps.configStore.isOobeNeeded(),
+      });
+      return;
+    }
+    if (body.action === 'complete') {
+      const patch                   = {
+        oobeDismissed: true,
+        ...(typeof body.distro === 'string' && body.distro.trim() ? { distro: body.distro.trim() } : {}),
+        ...(body.environmentProfile ? { environmentProfile: body.environmentProfile } : {}),
+        ...(body.mirrorCn !== undefined ? { mirrorCn: Boolean(body.mirrorCn) } : {}),
+        ...(body.upstreamProxy !== undefined ? { upstreamProxy: String(body.upstreamProxy) } : {}),
+        ...(body.enableNow === true ? { enabled: true, initialized: true } : {}),
+      };
+      const updated = deps.configStore.updateBasic(patch);
+      res.status(200).json({
+        ok: true,
+        config: updated,
+        initialized: deps.configStore.isInitialized(),
+        oobeNeeded: deps.configStore.isOobeNeeded(),
+      });
+      return;
+    }
+    res.status(400).json({ ok: false, error: { code: 'INVALID_ACTION', message: 'Invalid OOBE action' } });
   });
 
   // 仅读取静态引导脚本与校验 SHA-256，绝不触发任何宿主子进程或 WSL 启动
@@ -1270,27 +1327,62 @@ export function registerWslSandboxWebApi(ctx                  , deps            
   // Real `@deepseek-ai/dsh-host-webserver` (`ctx.webServer`) carrier
   if (webServer && typeof webServer.register === 'function') {
     const dispatchRaw = async (req                 , res                )                => {
-      if (!isAllowedHostHeader(req)) {
-        wrapNodeResponse(res).status(403).json({
-          ok: false,
-          error: { code: 'FORBIDDEN_HOST', message: 'Non-loopback Host header rejected' },
-        });
-        return;
-      }
-
       const method = (req.method ?? 'GET').toUpperCase();
-      const urlObj = new URL(req.url ?? '/', 'http://127.0.0.1');
-      const pathname = urlObj.pathname.replace(/\/+$/, '') || '/';
-
-      if (method !== 'GET' && method !== 'HEAD') {
-        if (!isSameOriginOrLoopback(req)) {
-          wrapNodeResponse(res).status(403).json({
+      const conn = getOptionalService(ctx, 'connection');
+      if (conn && typeof conn.admit === 'function') {
+        // 真实 DSH 宿主的 `/wsl-sandbox/ui` 仍校验 Host 白名单（拒绝 403），仅免除静态 HTML 的 401，`/wsl-sandbox/api/*` 强制过完整鉴权
+        const reqUrlPath = new URL(req.url ?? '/', 'http://127.0.0.1').pathname.replace(/\/+$/, '') || '/';
+        const admission = conn.admit(req);
+        if (
+          admission &&
+          typeof admission === 'object' &&
+          'rejection' in admission &&
+          typeof admission.rejection === 'number' &&
+          !(reqUrlPath === '/wsl-sandbox/ui' && admission.rejection === 401)
+        ) {
+          wrapNodeResponse(res).status(admission.rejection).json({
             ok: false,
-            error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin mutation rejected' },
+            error: {
+              code: admission.rejection === 401 ? 'UNAUTHORIZED' : 'FORBIDDEN_HOST',
+              message:
+                admission.rejection === 401
+                  ? 'DSH authentication required'
+                  : 'Untrusted Host or Origin rejected by DSH connection policy',
+            },
           });
           return;
         }
+        if (method !== 'GET' && method !== 'HEAD') {
+          const secFetchSite = String(req.headers['sec-fetch-site'] ?? '').trim().toLowerCase();
+          if (secFetchSite === 'cross-site' || (req.headers.origin && req.headers['x-dsh-wsl-client'] !== '1')) {
+            wrapNodeResponse(res).status(403).json({
+              ok: false,
+              error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin or unverified mutation rejected' },
+            });
+            return;
+          }
+        }
+      } else {
+        if (!isAllowedHostHeader(req, webServer.host)) {
+          wrapNodeResponse(res).status(403).json({
+            ok: false,
+            error: { code: 'FORBIDDEN_HOST', message: 'Non-loopback Host header rejected' },
+          });
+          return;
+        }
+        if (method !== 'GET' && method !== 'HEAD') {
+          if (!isSameOriginOrLoopback(req)) {
+            wrapNodeResponse(res).status(403).json({
+              ok: false,
+              error: { code: 'FORBIDDEN_ORIGIN', message: 'Cross-origin mutation rejected' },
+            });
+            return;
+          }
+        }
       }
+
+      const urlObj = new URL(req.url ?? '/', 'http://127.0.0.1');
+      const pathname = urlObj.pathname.replace(/\/+$/, '') || '/';
 
       const matched = table.find((r) => r.method === method && r.regex.test(pathname));
       if (!matched) {

@@ -164,7 +164,19 @@ export interface DshWebServerRoute {
 }
 
 export interface DshWebServer {
+  readonly host?: string;
+  readonly port?: number;
+  readonly protocol?: string;
   register(route: DshWebServerRoute): () => void;
+}
+
+export type DshConnectionAdmission =
+  | { readonly peer: unknown }
+  | { readonly rejection: number };
+
+export interface DshConnectionService {
+  readonly trustedHosts?: readonly string[];
+  admit?(req: IncomingMessage): DshConnectionAdmission;
 }
 
 export interface DshToolPreExecutePayload {
@@ -199,15 +211,44 @@ export interface DshCordisContext {
   readonly systemPrompt?: DshSystemPromptService;
   readonly approval?: DshApprovalService;
   readonly webServer?: DshWebServer;
+  readonly connection?: DshConnectionService;
   readonly http?: DshHttpRouter;
   readonly logger?: DshLoggerInput;
   get?(name: string): unknown;
   inject?(deps: readonly string[], callback: (ctx: DshCordisContext) => void): (() => void) | void;
+  /** Cordis 4 瀑布流事件订阅接口（必须优先用 `ctx.on`，`ctx.waterfall` 为派发而非订阅！） */
+  on?<TPayload = unknown, TResult = unknown>(
+    event: string,
+    listener: DshWaterfallListener<TPayload, TResult>,
+  ): Disposer | (() => boolean) | void;
+  /** 仅用于兼容早期独立测试桩；在真实 Cordis 宿主上请勿将其当成订阅函数调用 */
   waterfall?<TPayload = unknown, TResult = unknown>(
     event: string,
     listener: DshWaterfallListener<TPayload, TResult>,
   ): Disposer | void;
   effect?(setupOrDisposer: (() => Disposer | void) | Disposer, label?: string): void;
+}
+
+/**
+ * 统一订阅 Cordis 瀑布流钩子：
+ * - 在真实 `@deepseek-ai/dsh`（Cordis 4）中必须调用 `ctx.on(event, listener)`（若误调 `ctx.waterfall`
+ *   会直接触发空事件派发导致 `TypeError: next is not a function`）。
+ * - 仅当测试桩未实现 `ctx.on` 且显式提供 `ctx.waterfall` 注册方法时，兼容回退到 `ctx.waterfall`。
+ */
+export function subscribeCordisWaterfall<TPayload = unknown, TResult = unknown>(
+  ctx: DshCordisContext,
+  event: string,
+  listener: DshWaterfallListener<TPayload, TResult>,
+): (() => void) | undefined {
+  if (typeof ctx.on === 'function') {
+    const dispose = ctx.on(event, listener);
+    return typeof dispose === 'function' ? () => { void dispose(); } : undefined;
+  }
+  if (typeof ctx.waterfall === 'function') {
+    const dispose = ctx.waterfall(event, listener);
+    return typeof dispose === 'function' ? () => { void dispose(); } : undefined;
+  }
+  return undefined;
 }
 
 export function getOptionalService<K extends keyof DshCordisContext & string>(

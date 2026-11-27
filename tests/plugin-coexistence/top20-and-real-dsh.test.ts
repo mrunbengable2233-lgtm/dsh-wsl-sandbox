@@ -135,11 +135,23 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
       inject(_deps, cb) {
         cb(realLikeCtx);
       },
-      waterfall(event, listener) {
+      // 真实 Cordis 4：`on()` 注册监听并返回 disposer；若误调 `waterfall()` 注册则模拟真实派发报错！
+      on(event, listener) {
         if (event === 'tools/pre-execute') {
-          preExecuteListeners.push(listener as unknown as DshWaterfallListener<DshRealToolExecution, DshPreToolDecision>);
+          const typed = listener as unknown as DshWaterfallListener<DshRealToolExecution, DshPreToolDecision>;
+          preExecuteListeners.push(typed);
+          return () => {
+            const idx = preExecuteListeners.indexOf(typed);
+            if (idx >= 0) preExecuteListeners.splice(idx, 1);
+          };
         }
         return () => {};
+      },
+      waterfall(event) {
+        if (event === 'tools/pre-execute') {
+          throw new TypeError('next is not a function');
+        }
+        return Promise.resolve({ kind: 'allow' }) as never;
       },
       // Real Cordis `ctx.effect(setup)` invokes `setup()` immediately on mount and stores the returned disposer!
       effect(setupFn) {
@@ -289,10 +301,39 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
     // Switch environmentProfile via API -> verify doctor immediately respects 'universal'!
     const putProf = await fetch(`${serverOrigin}/wsl-sandbox/api/config`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-DSH-WSL-Client': '1',
+      },
       body: JSON.stringify({ environmentProfile: 'universal' }),
     });
     assert.equal(putProf.status, 200);
+
+    // 验证 OOBE 状态流转（dismiss / reopen / complete）
+    const oobeDismiss = await fetch(`${serverOrigin}/wsl-sandbox/api/oobe`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-DSH-WSL-Client': '1',
+      },
+      body: JSON.stringify({ action: 'dismiss' }),
+    });
+    assert.equal(oobeDismiss.status, 200);
+    const oobeDismissJson = (await oobeDismiss.json()) as { ok: boolean; config: { oobeDismissed?: boolean } };
+    assert.equal(oobeDismissJson.ok, true);
+    assert.equal(oobeDismissJson.config.oobeDismissed, true);
+
+    const oobeReopen = await fetch(`${serverOrigin}/wsl-sandbox/api/oobe`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-DSH-WSL-Client': '1',
+      },
+      body: JSON.stringify({ action: 'reopen' }),
+    });
+    assert.equal(oobeReopen.status, 200);
+    const oobeReopenJson = (await oobeReopen.json()) as { ok: boolean; config: { oobeDismissed?: boolean } };
+    assert.equal(oobeReopenJson.config.oobeDismissed, false);
 
     // Cross-origin CSRF attack from https://evil.example MUST be rejected with 403!
     const csrfRes = await fetch(`${serverOrigin}/wsl-sandbox/api/config`, {
@@ -304,6 +345,140 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
       body: JSON.stringify({ enabled: false }),
     });
     assert.equal(csrfRes.status, 403);
+  });
+
+  it('enforces DSH ctx.connection.admit authentication and supports clean disable/re-enable cycle', async () => {
+    const tmpAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-real-auth-'));
+    try {
+      const authRoutes: DshWebServerRoute[] = [];
+      const authTools = new Map<string, DshToolDefinition>();
+      const authPrompts = new Map<string, DshRealPromptSection>();
+      const authCleanups: Array<() => void | Promise<void>> = [];
+
+      const createAuthHostCtx = (authorizedRef: { ok: boolean; hostRejection?: number }): DshCordisContext => {
+        const hostCtx: DshCordisContext = {
+          tools: {
+            register(tool) {
+              assert.ok(!authTools.has(tool.name), `Duplicate tool on reload: ${tool.name}`);
+              authTools.set(tool.name, tool);
+              return () => authTools.delete(tool.name);
+            },
+            guard() {
+              return () => {};
+            },
+          },
+          systemPrompt: {
+            section(sec) {
+              assert.ok(!authPrompts.has(sec.name), `Duplicate prompt on reload: ${sec.name}`);
+              authPrompts.set(sec.name, sec);
+              return () => authPrompts.delete(sec.name);
+            },
+          },
+          webServer: {
+            host: '127.0.0.1',
+            register(route) {
+              const dup = authRoutes.find((r) => r.kind === route.kind && r.path === route.path);
+              assert.equal(dup, undefined, `Duplicate webServer route on reload: ${route.kind} ${route.path}`);
+              authRoutes.push(route);
+              return () => {
+                const idx = authRoutes.indexOf(route);
+                if (idx >= 0) authRoutes.splice(idx, 1);
+              };
+            },
+          },
+          connection: {
+            admit() {
+              if (authorizedRef.hostRejection) {
+                return { rejection: authorizedRef.hostRejection };
+              }
+              return authorizedRef.ok ? { peer: { id: 'owner-peer' } } : { rejection: 401 };
+            },
+          },
+          inject(_deps, cb) {
+            cb(hostCtx);
+          },
+          on() {
+            return () => {};
+          },
+          waterfall(event) {
+            if (event === 'tools/pre-execute') {
+              throw new TypeError('next is not a function');
+            }
+            return Promise.resolve({ kind: 'allow' }) as never;
+          },
+          effect(setupFn) {
+            const ret = (setupFn as () => (() => void | Promise<void>) | void)();
+            if (typeof ret === 'function') authCleanups.push(ret);
+          },
+        };
+        return hostCtx;
+      };
+
+      const authFlag = { ok: false, hostRejection: undefined as number | undefined };
+      const authCtx = createAuthHostCtx(authFlag);
+      const h1 = applyWslSandbox(authCtx, {
+        configPath: path.join(tmpAuthDir, 'cfg.json'),
+        persistConfig: true,
+        persistLogs: false,
+        initialConfig: { enabled: true, distro: 'Ubuntu-24.04', workspaceRoot: '/home/dev/workspace' },
+      });
+
+      const srv = http.createServer(async (req, res) => {
+        const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname.replace(/\/+$/, '') || '/';
+        const matched =
+          authRoutes.find((r) => r.kind === 'exact' && r.path === pathname) ??
+          authRoutes.find((r) => r.kind === 'prefix' && (pathname === r.path || pathname.startsWith(r.path + '/')));
+        if (!matched) {
+          res.writeHead(404).end();
+          return;
+        }
+        await matched.handler(req, res);
+      });
+      await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve));
+      const p = (srv.address() as { port: number }).port;
+
+      try {
+        // 1. Missing DSH auth cookie -> 401 on API, 200 on UI HTML
+        const apiUnauth = await fetch(`http://127.0.0.1:${p}/wsl-sandbox/api/status`);
+        assert.equal(apiUnauth.status, 401);
+        const uiAllowed = await fetch(`http://127.0.0.1:${p}/wsl-sandbox/ui`);
+        assert.equal(uiAllowed.status, 200);
+
+        // 2. Host policy 403 rejection blocks even /wsl-sandbox/ui
+        authFlag.hostRejection = 403;
+        const uiForbidden = await fetch(`http://127.0.0.1:${p}/wsl-sandbox/ui`);
+        assert.equal(uiForbidden.status, 403);
+
+        // 3. Authenticated DSH peer -> 200 OK
+        authFlag.hostRejection = undefined;
+        authFlag.ok = true;
+        const apiAuth = await fetch(`http://127.0.0.1:${p}/wsl-sandbox/api/status`);
+        assert.equal(apiAuth.status, 200);
+
+        // 4. Simulate clean Cordis disable (`setBundleEnabled(..., false)`) + re-enable (`setBundleEnabled(..., true)`)!
+        await Promise.all(authCleanups.splice(0).map((fn) => fn()));
+        assert.equal(authTools.size, 0, 'Tools must be removed on disable');
+        assert.equal(authRoutes.length, 0, 'Web routes must be removed on disable');
+        assert.equal(authPrompts.size, 0, 'Prompt section must be removed on disable');
+        await h1.dispose();
+
+        const h2 = applyWslSandbox(authCtx, {
+          configPath: path.join(tmpAuthDir, 'cfg.json'),
+          persistConfig: true,
+          persistLogs: false,
+          initialConfig: { enabled: true, distro: 'Ubuntu-24.04', workspaceRoot: '/home/dev/workspace' },
+        });
+        assert.equal(authTools.size, 7);
+        assert.equal(authRoutes.length, 2);
+        assert.equal(authPrompts.size, 1);
+        await Promise.all(authCleanups.splice(0).map((fn) => fn()));
+        await h2.dispose();
+      } finally {
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+      }
+    } finally {
+      fs.rmSync(tmpAuthDir, { recursive: true, force: true });
+    }
   });
 
   it('runs real local-linux doctor & aborts in-flight wsl_bash cleanly with zero leaked processes', { skip: BWRAP_SKIP_REASON }, async () => {
@@ -331,7 +506,23 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
     assert.equal(procsJson.active.length, 0, 'Zero active processes may remain after AbortController cancel');
   });
 
-  it('loads and mounts built client.js inside window.__ModuleLoader__ registering settings.section & icon cleanly', () => {
+  it('loads and mounts built client.js inside window.__ModuleLoader__ registering sidebar, OOBE overlay, plugin detail & settings cleanly', () => {
+    const pkgJson = JSON.parse(
+      fs.readFileSync(path.resolve(path.dirname(BUILT_CLIENT_PATH), 'package.json'), 'utf8'),
+    ) as {
+      dsh?: {
+        bundle?: { platforms?: string[] };
+        client?: { inject?: string[] };
+      };
+    };
+    assert.deepEqual(pkgJson.dsh?.bundle?.platforms, ['win32', 'linux']);
+    assert.ok(pkgJson.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-renderer'));
+    assert.ok(pkgJson.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-layout'));
+    assert.ok(pkgJson.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-sidebar'));
+    assert.ok(pkgJson.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-sidebar-right'));
+    assert.ok(pkgJson.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-plugin-manager'));
+    assert.equal(pkgJson.dsh?.client?.inject?.includes('@deepseek-ai/dsh-client-ui-slots'), false);
+
     assert.equal(fs.existsSync(BUILT_CLIENT_PATH), true, 'client.js must be generated by build.mjs');
     const code = fs.readFileSync(BUILT_CLIENT_PATH, 'utf8');
     assert.ok(code.startsWith('window.__ModuleLoader__.load('), 'client.js must start with single-line ModuleLoader header');
@@ -350,6 +541,7 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
     assert.equal(loadedEntry.id, 'dsh-wsl-sandbox');
 
     const mockReact = {
+      Fragment: Symbol.for('react.fragment'),
       createElement: (tag: unknown, props: unknown, ...children: unknown[]) => ({ tag, props, children }),
       useState: <T>(init: T) => [init, () => {}] as const,
       useEffect: () => {},
@@ -358,6 +550,7 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
 
     const mod = loadedEntry.factory((spec) => {
       if (spec === 'react') return mockReact;
+      if (spec === 'react-dom') return { createPortal: (n: unknown) => n };
       throw new Error(`Unexpected client require: ${spec}`);
     }) as {
       inject: string[];
@@ -366,17 +559,31 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
 
     assert.deepEqual(Array.from(mod.inject), ['slots', 'locale']);
 
-    const registeredSlots: Array<{ name: string; id: string; order?: number }> = [];
+    const registeredSlots: Array<{ name: string; id?: string; key?: string; order?: number }> = [];
+    const registeredRightTabs: Array<{ id: string; kind: string }> = [];
     const disposers: Array<() => void> = [];
 
-    mod.apply({
+    const mockClientCtx = {
       locale: {
         bind: () => (k: string) => k,
         register: () => () => {},
+        getLocale: () => ({ active: 'zh' }),
+      },
+      layout: {
+        selectPanel: () => {},
+      },
+      sidebarRightTabs: {
+        register: (def: { id: string; kind: string }) => {
+          registeredRightTabs.push(def);
+          return () => {
+            const idx = registeredRightTabs.indexOf(def);
+            if (idx >= 0) registeredRightTabs.splice(idx, 1);
+          };
+        },
       },
       slots: {
         inject: (_slot: string, fn: () => () => void) => fn(),
-        register: (opts: { name: string; id: string; order?: number }) => {
+        register: (opts: { name: string; id?: string; key?: string; order?: number }) => {
           registeredSlots.push(opts);
           return () => {
             const idx = registeredSlots.indexOf(opts);
@@ -384,20 +591,40 @@ describe('Real @deepseek-ai/dsh@0.2.2-rc.5 & Top-27 Marketplace Plugins Coexiste
           };
         },
       },
+      inject: (_deps: string[], cb: (c: unknown) => void) => {
+        cb(mockClientCtx);
+      },
       effect: (setup: () => (() => void) | void) => {
         const d = setup();
         if (typeof d === 'function') disposers.push(d);
       },
-    });
+    };
 
-    assert.equal(registeredSlots.length, 2);
+    mod.apply(mockClientCtx);
+
     assert.deepEqual(
-      registeredSlots.map((s) => `${s.name}:${s.id}`),
-      ['settings.section:dsh-wsl-sandbox', 'settings.section.icon:dsh-wsl-sandbox'],
+      registeredSlots.map((s) => `${s.name}:${s.id ?? s.key}`),
+      [
+        'main:wsl-sandbox',
+        'sidebar.panellist:wsl-sandbox',
+        'shell.overlay:dsh-wsl-sandbox.overlay',
+        'plugins.bundle.activation:dsh-wsl-sandbox',
+        'plugins.bundle.config:dsh-wsl-sandbox',
+        'plugins.row.config:dsh-wsl-sandbox#dsh-wsl-sandbox',
+        'plugins.detail.section:dsh-wsl-sandbox.detail',
+        'settings.section:dsh-wsl-sandbox',
+        'settings.section.icon:dsh-wsl-sandbox',
+        'sidebar.right.pane.tab:dsh-wsl-sandbox',
+      ],
+    );
+    assert.deepEqual(
+      registeredRightTabs.map((t) => `${t.id}:${t.kind}`),
+      ['dsh-wsl-sandbox:wsl-sandbox'],
     );
 
-    // Clean unmount removes all slots
+    // Clean unmount removes all slots & right-sidebar tabs
     for (const d of disposers) d();
     assert.equal(registeredSlots.length, 0);
+    assert.equal(registeredRightTabs.length, 0);
   });
 });

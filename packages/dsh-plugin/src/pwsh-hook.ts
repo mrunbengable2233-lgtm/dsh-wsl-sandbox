@@ -12,10 +12,11 @@ import {
 } from '../../core/src/index.ts';
 import type { ApprovalBridge } from './approval-bridge.ts';
 import type { WslSandboxConfig } from './config-store.ts';
-import type {
-  DshCordisContext,
-  DshPreToolDecision,
-  DshToolPreExecutePayload,
+import {
+  type DshCordisContext,
+  type DshPreToolDecision,
+  type DshToolPreExecutePayload,
+  subscribeCordisWaterfall,
 } from './cordis-types.ts';
 import type { BootstrapChannelState } from './tools.ts';
 
@@ -764,11 +765,11 @@ export function registerHostPwshGuardHook(
     }
   }
 
-  // 2. Polite `tools/pre-execute` waterfall listener
-  if (ctx.waterfall) {
-    const wfDispose = ctx.waterfall<DshToolPreExecutePayload, unknown>(
-      'tools/pre-execute',
-      async (payload, next) => {
+  // 2. 礼貌订阅 `tools/pre-execute` 瀑布流监听（通过 Cordis `ctx.on` 安全挂载）
+  const wfDispose = subscribeCordisWaterfall<DshToolPreExecutePayload, unknown>(
+    ctx,
+    'tools/pre-execute',
+    async (payload, next) => {
         const passThrough = () =>
           typeof next === 'function' ? next() : ({ kind: 'allow' } satisfies DshPreToolDecision);
 
@@ -876,9 +877,8 @@ export function registerHostPwshGuardHook(
         }
       },
     );
-    if (typeof wfDispose === 'function') {
-      disposers.push(() => void wfDispose());
-    }
+  if (typeof wfDispose === 'function') {
+    disposers.push(() => void wfDispose());
   }
 
   if (disposers.length === 0) return undefined;
