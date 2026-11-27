@@ -1,7 +1,8 @@
 # `dsh-wsl-sandbox` 技术交接与 Linux 内核隔离机制审计白皮书
 
+> **主页导航**：[**简体中文主页 (README.md)**](../README.md) | [**English Overview (README.en.md)**](../README.en.md)  
 > **读者对象**：Linux 内核驱动 / 系统安全工程师、沙箱协同测试与代码审计人员  
-> **目标宿主**：DeepSeek Harness (`@deepseek-ai/dsh@0.2.2-rc.5`, Cordis v4 DI 插件架构)  
+> **目标宿主**：DeepSeek Harness (`@deepseek-ai/dsh@0.2.2-rc.5`, Cordis v4 DI 插件架构，`dsh-wsl-sandbox v0.3.0`)  
 > **运行底座**：Windows 10/11 + WSL 2 (Hyper-V 轻量级 Utility VM Linux 内核) + `bubblewrap` (`bwrap`) + 原生 `seccomp-bpf` (`cBPF`) + `prlimit` + Unix Domain Socket (`AF_UNIX`) 白名单代理
 
 ---
@@ -21,45 +22,45 @@
 
 ```mermaid
 flowchart TB
-  subgraph WinHost["Trust Zone 0 - Windows Host Process (DSH Node.js or Electron)"]
-    Cordis["DSH Plugin Entry (packages/dsh-plugin)"]
-    HostGuards["Monotonic ctx.tools.guard + PwshGuard Single-Shell Dialect Linter"]
-    Approval["ApprovalBridge + SHA-256 Single-Use Ticket + 0600 ConfigStore"]
+  subgraph WinHost["信任边界 0 - Windows 宿主机 DSH 进程"]
+    Cordis["DSH 插件入口 (packages/dsh-plugin)"]
+    HostGuards["单调 ctx.tools.guard + PwshGuard 与微软官方 PS AST 解析器"]
+    Approval["ApprovalBridge + SHA-256 一次性票据 + 0600 ConfigStore"]
     Cordis --> HostGuards --> Approval
   end
 
-  subgraph WslDistro["Trust Zone 1 - WSL 2 Distro User Daemon (Non-root UID >= 1000)"]
-    Runner["Persistent NDJSON Runner (packages/wsl-runner/src/main.ts)"]
-    FsSvc["ConfinedFsService (Ancestor realpath + O_NOFOLLOW + .env masking)"]
-    ProcMgr["ConfinedProcManager (PGID tracking + refcounted mount placeholders)"]
-    UdsProxy["UdsAllowlistProxy (AF_UNIX proxy.sock + SSRF and DNS Rebinding Filter)"]
+  subgraph WslDistro["信任边界 1 - WSL 2 非 root 常驻守护进程 (UID >= 1000)"]
+    Runner["常驻 NDJSON Runner (packages/wsl-runner/src/main.ts)"]
+    FsSvc["ConfinedFsService (祖先链 realpath + O_NOFOLLOW + .env 遮蔽)"]
+    ProcMgr["ConfinedProcManager (PGID 追踪 + 挂载占位引用计数)"]
+    UdsProxy["UdsAllowlistProxy (AF_UNIX proxy.sock + SSRF 与 DNS Rebinding 防护)"]
     Runner --> FsSvc
     Runner --> ProcMgr
     Runner --> UdsProxy
   end
 
-  subgraph Sandbox["Trust Zone 2 - Ephemeral Sandboxed Child (Untrusted Model Code)"]
+  subgraph Sandbox["信任边界 2 - 临时受控子进程 (不可信模型代码)"]
     Bwrap["bwrap (--unshare-user --disable-userns --unshare-pid --unshare-ipc --unshare-net)"]
-    VfsLock["VFS Lock (--remount-ro / + --tmpfs /mnt /run + Checklist B ro-bind)"]
-    Seccomp["seccomp-bpf fd 3 (Block io_uring, AF_VSOCK, bpf, mount, x32) + prlimit"]
+    VfsLock["VFS 锁定 (--remount-ro / + --tmpfs /mnt /run + 清单 B 只读覆盖)"]
+    Seccomp["seccomp-bpf fd 3 (拦截 io_uring, AF_VSOCK, bpf, mount, x32) + prlimit"]
     Bwrap --> VfsLock --> Seccomp
   end
 
-  Approval <-->|"wsl.exe --exec NDJSON stdio"| Runner
-  ProcMgr -->|"spawn bwrap detached + bpfFd 3"| Bwrap
-  Seccomp -.->|"AF_UNIX /run/dsh-proxy/proxy.sock ONLY"| UdsProxy
+  Approval <-->|"wsl.exe --exec NDJSON 管道"| Runner
+  ProcMgr -->|"拉起隔离 bwrap + bpfFd 3"| Bwrap
+  Seccomp -.->|"仅允许 AF_UNIX /run/dsh-proxy/proxy.sock"| UdsProxy
 ```
 
 ### 关键信任不变量（Invariants）
-1. **模型零配置写权限**：持久化配置 `$DSH_HOME/dsh-wsl-sandbox/config.json`（权限 `0600`）仅暴露给同源/环回口带 `X-DSH-WSL-Client: 1` 头的人类 HTTP 控制面（`packages/dsh-plugin/src/web-api.ts:74-89`），没有任何 `wsl_*` 工具可读写该文件。
-2. **禁止 `root` 运行与禁止静默降级（Fail-Closed）**：`validateProbeAndCreateBinding`（`packages/core/src/binding.ts:296-380`）强制验证 `wslVersion === 2`、`uid > 0`（拒绝 `UID 0` 默认 root 发行版，防止容器内外 UID 映射等价于发行版 root）、非 Docker 内部发行版（拒绝 `docker-desktop` 等）以及 `sandboxReady === true`。任一探针失败直接抛出结构化 `SandboxError`，**绝不回退宿主机或无沙箱裸跑**。
+1. **模型零配置写权限**：持久化配置 `$DSH_HOME/dsh-wsl-sandbox/config.json`（权限 `0600`）仅暴露给同源/环回口带 `X-DSH-WSL-Client: 1` 头并经过 DNS Rebinding `Host` 校验的人类 HTTP 控制面（`isAllowedHostHeader` 与 `isSameOriginOrLoopback`，位于 `packages/dsh-plugin/src/web-api.ts`），没有任何 `wsl_*` 工具可读写该文件。
+2. **禁止 `root` 运行与禁止静默降级（Fail-Closed）**：`validateProbeAndCreateBinding` / `assertVerifiedProbe`（位于 `packages/core/src/binding.ts`）强制验证 `wslVersion === 2`、`uid > 0`（拒绝 `UID 0` 默认 root 发行版，防止容器内外 UID 映射等价于发行版 root）、非 Docker 内部发行版（拒绝 `docker-desktop` 等）以及 `sandboxReady === true`。任一探针失败直接抛出结构化 `SandboxError`，**绝不回退宿主机或无沙箱裸跑**。
 
 ---
 
 ## 3. Linux 内核隔离机制逐层剖析（供内核工程师重点审查）
 
 ### 3.1 Namespace 组合与 `--disable-userns` 防嵌套提权
-代码位置：`packages/core/src/bwrap-builder.ts:201-207`
+代码位置：`buildBwrapArgs`（`packages/core/src/bwrap-builder.ts`）
 
 每次 `proc.exec` 拉起子进程时构造的命名空间标志：
 - `--unshare-user` (`CLONE_NEWUSER`)：`bwrap` 建立单 UID 映射后执行挂载树组装，并在 `execve` 目标负载前调用 `prctl(PR_SET_NO_NEW_PRIVS, 1)` 且丢弃全部 `CAP_*`（包括 userns 内的 `CAP_SYS_ADMIN` / `CAP_NET_ADMIN`）。
@@ -69,7 +70,7 @@ flowchart TB
 - `--unshare-net` (`CLONE_NEWNET`)：沙箱内仅有未配外网路由的隔离 `lo` 环回口，内核路由表物理上不存在通往宿主机网卡或局域网的接口。
 
 ### 3.2 VFS 挂载树构造顺序与 `--remount-ro /` 时序细节
-代码位置：`packages/core/src/bwrap-builder.ts:215-356`
+代码位置：`buildBwrapArgs`（`packages/core/src/bwrap-builder.ts`）
 
 这是最容易写出挂载逃逸或挂载失败 bug 的地方，请重点审查以下严格顺序：
 1. **顶层目录选择性只读绑定**：遍历 `/` 下顶层条目，跳过 `dev, proc, sys, tmp, run, mnt, shares`（`SKIP_TOP_LEVEL`），对其余目录执行 `--ro-bind /usr /usr` 等或 `--symlink`。
@@ -150,12 +151,13 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
   4. **无挂起停机**：追踪全部 HTTP 与 `CONNECT` 上下游 `net.Socket`，`stop()` 时主动销毁所有隧道并 `unlink` 套接字文件。
 
 ### 4.3 单壳纯净度与预执行方言守卫（Single-Shell Purity & Dialect Guard）
-- **Windows 宿主侧 (`packages/core/src/pwsh-guard.ts`)**：
-  - 先解码 `-EncodedCommand`（UTF-16LE Base64）并剥离 PowerShell 反引号 `` ` `` 与未加引号的 CMD 脱字符 `^` 混淆。
-  - **L0 硬阻断**：外层 PowerShell 套内层 `cmd.exe` / `%COMSPEC%` / `--%`；混用 `pwsh.exe` 与 `powershell.exe` 子壳；交互挂起参数（`-NoExit`, `-Command -`, `Read-Host`, `pause`）；CMD 斜杠参数（`rmdir /s /q`, `del /f /q`, `move /y`）与 `2>nul` 保留名陷阱；`\\wsl.localhost\` / `\\wsl$\` 反向跨界写入；篡改 `.wslconfig` 或注册表。
-  - 同时兼容 `@linxin666/dsh-win-bash` (`win_bash`) 与 `dsh-ops` (`ops_bash`) 等宿主 POSIX 工具（按 POSIX 方言检查 UNC/`.wslconfig`/`wsl.exe`/驱动变更，不误报 PowerShell 规则，`packages/dsh-plugin/src/pwsh-hook.ts`）。
+- **Windows 宿主侧 (`packages/core/src/pwsh-guard.ts`, `packages/core/src/pwsh-system-parser.ts` & `packages/dsh-plugin/src/pwsh-hook.ts`)**：
+  - 通过持久化的微软官方 **`[System.Management.Automation.Language.Parser]::ParseInput` / `ParseFile`** 只读 AST Worker 提取真实 `CommandAst`、`PipelineAst`、`CommandExpressionAst`、`$(...)` 嵌套、作用域名空间与 UTF-16LE `-EncodedCommand` 解码，彻底避免纯正则误报与语义盲区。
+  - **L0 硬阻断**：外层 PowerShell 套内层 `cmd.exe` / `%COMSPEC%` / `--%` 停止解析符；混用 `pwsh.exe` 与 `powershell.exe` 子壳；交互挂起参数（`-NoExit`, `-Command -`, `Read-Host`, `pause`）；CMD 斜杠参数（`rmdir /s /q`, `del /f /q`, `move /y`）与 `2>nul` 保留名陷阱；`\\wsl.localhost\` / `\\wsl$\` 反向跨界写入；篡改 `.wslconfig` 或注册表；以及**常态安装脚本锁与卸载锁**（非 `-DryRun` 的 `uninstall-dsh-plugin.ps1` / `provision-wsl.sh --uninstall` 永远 L0 阻断；未在控制台显式开启「受控 AI 初始化引导通道」前，AI 调用 `install-dsh-plugin.ps1` / `stage-wsl-runner.mjs` / `provision-wsl.sh` 一律 L0 阻断；通道开启后仍强制先 `-DryRun` 预览解锁再逐条单次 `allow-once` 审批，并禁止拼接与跨发行版）。
+  - 同时兼容 `@linxin666/dsh-win-bash` (`win_bash`) 与 `dsh-ops` (`ops_bash`) 等宿主 POSIX 工具（按 POSIX 方言检查 UNC/`.wslconfig`/`wsl.exe`/安装卸载门禁/驱动变更，不误报 PowerShell 规则，`packages/dsh-plugin/src/pwsh-hook.ts`）。
 - **WSL 沙箱侧 (`packages/core/src/bash-ast-guard.ts`)**：
-  - 在 `wsl_bash` 执行前拦截误粘贴的 PowerShell Cmdlet（`Get-ChildItem`, `Move-Item` 等）、`$env:VAR`、`%VAR%` 以及 `.exe` 跨界调用。
+  - 在 `wsl_bash` 执行前通过 8 层剥壳 AST 拦截 `$'...'` ANSI-C 转义、here-string/heredoc 执行、隐含危险管道与误粘贴的 PowerShell Cmdlet（`Get-ChildItem`, `Move-Item` 等）、`$env:VAR`、`%VAR%` 以及 `.exe` 跨界调用。
+  - 仓库内置 3 组共 **246 条**零执行红队对抗用例（`dangerous-commands-seed.json` 30 条 + `audit-redteam-cases.json` 24 条 + `redteam-v021.json` 192 条），全部保持 0 漏报 / 0 误报。
 
 ### 4.4 动作哈希绑定的一次性审批票据与物理硬件/驱动单次降级锁
 代码位置：`packages/core/src/approval-controller.ts` & `packages/dsh-plugin/src/approval-bridge.ts`
@@ -189,6 +191,9 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
    - 默认白名单包含 `github.com`、`registry.npmjs.org`、`pypi.org` 等开发基础设施。若需执行完全断网的代码审计，请将 `networkMode` 切换为 **`offline`**（此时连 UDS 代理套接字也不会挂载进沙箱，且 `seccomp` 直接封禁 `AF_INET`/`AF_INET6`）。
 4. **WSL 底层 `drvfs` 自动挂载、共享配置路径与 `--terminate`**：
    - 默认状态下，`--tmpfs /mnt` 确保沙箱内的不可信进程看不到任何 Windows 盘符；若需连 WSL 宿主命名空间也彻底卸载 Windows 盘符，可运行 `bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --disable-automount` 后在 Windows 执行单发行版重启 `wsl.exe --terminate <当前发行版名称>`（不伤及其他 WSL 会话）。注意 `/etc/wsl.conf` 与 `%USERPROFILE%\.wslconfig` 与 Windows WSL Settings / WSL Manager 共用，本插件绝不静默修改。
+5. **多发行版、无 `systemd`、WSL `< 2.4` 与 `NAT` 网络模式审计边界**：
+   - **网络模式（`NAT` vs `mirrored`）**：本插件不要求配置 `mirrored`（Host <-> Runner 走 `wsl.exe` stdio，沙箱经 `AF_UNIX` 代理出海），硬件/USB 联调与常规测试环境优先推荐保持 WSL 2 默认 `NAT`（`doctor.ts` 在 `127.0.0.1` 上游代理不可达时自动探测 `NAT` 默认网关 `natGatewayHint` 并给出引导）；
+   - **无 `systemd` / NixOS / WSL `< 2.4`**：运行期 0 `systemd` 依赖且 `.ini` 模板已默认注释 `systemd = true`；`node-runtime.ts`、`env-sanitizer.ts`、`bwrap-builder.ts`（保留 `/run/current-system`）与 `doctor.ts` 已对主流发行版（含 Alpine `musl`）及 NixOS 路径、`wsl < 2.4` 行为（`cd "$HOME"`、`parseWslVersionOutput`）完成审计与防护注释。
 
 ---
 
@@ -204,7 +209,7 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 | 共用 Node 运行时与护盘脱敏日志 | `packages/core/src/node-runtime.ts`<br>`packages/core/src/logger.ts` | `ELECTRON_RUN_AS_NODE=1` 与 `NODE_OPTIONS` 剥离；WSL `/mnt/*` `.exe` 拦截；`2.5s`/`64 KiB` 合并批量落盘（空闲 `0` FD）；`3s` 去重折叠 + `120/10s` 限速；递归密钥脱敏 |
 | 受控文件读写与防软链逃逸 | `packages/wsl-runner/src/fs-service.ts` | `canonicalizeWithinRoot` 祖先链 `realpath`；`atomicWriteNoFollow` 的 `O_NOFOLLOW | O_EXCL` |
 | UDS 代理与防 SSRF / 隧道零泄漏 | `packages/core/src/uds-proxy.ts` | `PRIVATE_IPV4_CIDRS`、`::ffff:` IPv4 映射地址与 `dns.lookup` 全记录核验；`activeSockets` 全追踪与 `stop()` 快速撕毁 |
-| 单壳纯净度、硬件与驱动守卫 | `packages/core/src/pwsh-guard.ts`<br>`packages/core/src/bash-ast-guard.ts` | UTF-16LE `-EncodedCommand` / 反引号 / `^` 反混淆；嵌套 `cmd` / `powershell.exe` / UNC 拦截；手机 `fastboot`/`adb` 与 Windows `pnputil`/`devcon`/`NetAdapter` 单次审批锁 |
+| 单壳纯净度、硬件与驱动守卫 | `packages/core/src/pwsh-system-parser.ts`<br>`packages/core/src/pwsh-guard.ts`<br>`packages/core/src/bash-ast-guard.ts` | 官方 `[Parser]::ParseInput` / `ParseFile` 只读 AST Worker；UTF-16LE `-EncodedCommand` / 反引号 / `^` / `$'...'` / here-string 反混淆；手机 `fastboot`/`adb` 与 Windows `pnputil`/`devcon`/`NetAdapter` 单次审批锁 |
 | 审批单票状态机与防绕过桥接 | `packages/core/src/approval-controller.ts`<br>`packages/dsh-plugin/src/approval-bridge.ts` | `SHA-256` 动作绑定；`usedGrants` 一次性消费；`< 15ms` 合成审批检测；硬件与驱动单次降级锁 |
 | 配置权限加固、插件路由与资源管理器门禁 | `packages/dsh-plugin/src/config-store.ts`<br>`packages/dsh-plugin/src/web-api.ts` | `0700`/`0600`/`0400` + Windows `icacls /inheritance:r`；防 `backupDir` 指向配置目录或 VHDX 路径；`isSameOriginOrLoopback` 防 CSRF；`open-explorer` 无壳白名单 |
 
@@ -215,18 +220,23 @@ BPF 过滤器执行流（请核对 `seccomp-bpf.ts`）：
 审核人拿到仓库后，在任意安装有 `bubblewrap`、`socat`、Node `>=22.19`（或 Node 24 LTS）与 Python 3 的 Linux 或 WSL 2 环境中，可直接运行以下命令验证真实内核拦截、多会话隔离、护盘日志限流与零残留回收效果：
 
 ```bash
-# 1. 运行全量自动化测试套件（59 项测试：同时支持 `npm test`、`node test` 与裸 `node --test`）
+# 1. 运行全量自动化测试套件（81 项测试：同时支持 `npm test`、`node test` 与裸 `node --test`）
 npm test
 node test
 
-# 2. 运行按档位分级的内核隔离、配置遮蔽、USB/驱动能力与 Codex 工具链实机探针
+# 2. 运行零执行 246 条红队门禁对抗矩阵
+npm run fuzz:check
+node scripts/run-dangerous-cmd-matrix.mjs --input tests/fixtures/audit-redteam-cases.json
+node scripts/run-dangerous-cmd-matrix.mjs --input tests/fixtures/redteam-v021.json
+
+# 3. 运行按档位分级的内核隔离、配置遮蔽、USB/驱动能力与 Codex 工具链实机探针
 node dist/packages/bootstrap/src/doctor.js --profile standard
 node dist/packages/bootstrap/src/doctor.js --profile universal --json
 
-# 3. 单独运行真实 Linux 内核沙箱逃逸阻断、多会话隔离与零残留测试
+# 4. 单独运行真实 Linux 内核沙箱逃逸阻断、多会话隔离与零残留测试
 npm run test:linux-sandbox
 
-# 4. 在 Windows + WSL 2 实机上运行端到端跨界验收脚本（自动探测已安装或 WSL Manager 迁移实例，零 /mnt 依赖）
+# 5. 在 Windows + WSL 2 实机上运行端到端跨界验收脚本（自动探测已安装或 WSL Manager 迁移实例，零 /mnt 依赖）
 pwsh -File ./tests/windows-wsl-verify/verify-wsl2.ps1
 ```
 

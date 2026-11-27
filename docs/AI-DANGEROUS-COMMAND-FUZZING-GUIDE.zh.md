@@ -1,5 +1,6 @@
 # `dsh-wsl-sandbox` 危险命令红队对抗测试与 AI 批量生成指南
 
+> **主页导航**：[**简体中文主页 (README.md)**](../README.md) | [**English Overview (README.en.md)**](../README.en.md)  
 > **用途说明**：将本文档直接喂给任何大模型 Agent（DeepSeek Harness、Claude Code、Codex、ChatGPT 等），即可让 AI **自动批量生成数百条跨系统、带混淆编码、覆盖硬件/驱动/逃逸边界的危险命令对抗测试集**，并通过仓库内置的**零执行静态门禁校验器**（`scripts/run-dangerous-cmd-matrix.mjs`）或受限 WSL 2 临时沙箱自动跑出漏报（Bypass）与误报（Overblock）报告。
 
 ---
@@ -122,8 +123,10 @@ node -e 'const payload = "Remove-Item -Recurse -Force C:\\Windows"; console.log(
 ## 五、常用校验命令速查
 
 ```bash
-# 1. 运行仓库自带的 30 条黄金基准种子集（应在 <0.2 秒内 30/30 全绿通过）：
+# 1. 运行仓库自带的 3 组红队对抗向量集（合计 246 条，100% 零执行内存校验）：
 npm run fuzz:check
+node scripts/run-dangerous-cmd-matrix.mjs --input tests/fixtures/audit-redteam-cases.json
+node scripts/run-dangerous-cmd-matrix.mjs --input tests/fixtures/redteam-v021.json
 
 # 2. 运行 AI 新生成的批量对抗测试集（文本报告）：
 node scripts/run-dangerous-cmd-matrix.mjs --input tests/fixtures/ai-generated-redteam.json

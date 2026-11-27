@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   Complete, manifest-driven uninstaller for `dsh-wsl-sandbox` across Windows Host, WSL 2, `AGENTS.md`, and DSH Profiles.
@@ -58,6 +58,28 @@ if (-not $Distro) {
   elseif ($cfg -and $cfg.distro) { $Distro = [string]$cfg.distro }
 }
 
+$linuxUser = if ($manifest -and $manifest.linuxUser) {
+  [string]$manifest.linuxUser
+} elseif ($cfg -and $cfg.username) {
+  [string]$cfg.username
+} else {
+  ""
+}
+
+$workspaceRoot = if ($manifest -and $manifest.workspaceRoot) {
+  [string]$manifest.workspaceRoot
+} elseif ($cfg -and $cfg.workspaceRoot) {
+  [string]$cfg.workspaceRoot
+} else {
+  ""
+}
+
+$createdDefaultWorkspace = if ($manifest -and $null -ne $manifest.createdDefaultWorkspace) {
+  [bool]$manifest.createdDefaultWorkspace
+} else {
+  $false
+}
+
 $backupDir = if ($cfg -and $cfg.backupDir) {
   [string]$cfg.backupDir
 } elseif ($manifest -and $manifest.backupDir) {
@@ -98,19 +120,26 @@ if (-not $DryRun -and -not $Yes) {
   }
 }
 
-# 1. Remove plugin from DSH CLI profiles (`web` and `desktop`) if `dsh` CLI is available
+# 1. Remove plugin from DSH CLI profiles (`web`, `desktop`, and `headless`) if `dsh` CLI is available
 $dshCmd = Get-Command dsh -ErrorAction SilentlyContinue
 if ($dshCmd) {
-  foreach ($prof in @("web", "desktop")) {
+  foreach ($prof in @("web", "desktop", "headless")) {
     if ($DryRun) {
       Write-Host "[dry-run] dsh plugin --profile $prof remove dsh-wsl-sandbox" -ForegroundColor DarkGray
     } else {
       Write-Host "[1/5] Removing dsh-wsl-sandbox from DSH '$prof' profile..." -ForegroundColor Cyan
-      try { & dsh plugin --profile $prof remove dsh-wsl-sandbox 2>$null | Out-Null } catch {}
+      $prevEap = $ErrorActionPreference
+      $ErrorActionPreference = "Continue"
+      try {
+        & dsh plugin --profile $prof remove dsh-wsl-sandbox 2>$null | Out-Null
+      } catch {
+      } finally {
+        $ErrorActionPreference = $prevEap
+      }
     }
   }
 } else {
-  Write-Host "[1/5] 'dsh' CLI not on PATH — if using DSH Desktop GUI, also click Remove on 'dsh-wsl-sandbox' in Settings -> Plugins." -ForegroundColor Yellow
+  Write-Host "[1/5] 'dsh' CLI not on PATH - if using DSH Desktop GUI, also click Remove on 'dsh-wsl-sandbox' in Settings -> Plugins." -ForegroundColor Yellow
 }
 
 # 2. Cleanly strip `<!-- dsh-wsl-sandbox:start/begin --> ... <!-- dsh-wsl-sandbox:end -->` from recorded AGENTS.md files
@@ -150,13 +179,15 @@ foreach ($f in $agentsMdTargets) {
 }
 
 # 3. Clean WSL 2 artifacts (via staged provision-wsl.sh --uninstall, with inline POSIX fallback if runner was already deleted)
+$wslCleanupOk = $true
 if ($Distro) {
   Write-Host "[3/5] Cleaning WSL 2 artifacts inside '$Distro'..." -ForegroundColor Cyan
   $wslFlags = @("--uninstall")
   if ($PurgeToolchains) { $wslFlags += "--purge-toolchains" }
   if ($SkipRestoreConfigs) { $wslFlags += "--skip-restore" }
   if ($DryRun) { $wslFlags += "--dry-run" }
-  $flagStr = $wslFlags -join " "
+  if ($workspaceRoot) { $wslFlags += @("--workspace-root", $workspaceRoot) }
+  if ($createdDefaultWorkspace) { $wslFlags += "--created-default-workspace" }
 
   $inlineFallbackSh = @'
 PROV="$HOME/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh"
@@ -164,16 +195,26 @@ if [ -f "$PROV" ]; then
   exec bash "$PROV" "$@"
 fi
 DRY="false"
-for a in "$@"; do [ "$a" = "--dry-run" ] && DRY="true"; done
+WS_ROOT=""
+CREATED_WS="false"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY="true"; shift ;;
+    --workspace-root) WS_ROOT="$2"; shift 2 ;;
+    --created-default-workspace) CREATED_WS="true"; shift ;;
+    *) shift ;;
+  esac
+done
 for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
-  if [ -f "$rc" ] && grep -Fq '.dsh-wsl-env.sh' "$rc"; then
+  if [ -f "$rc" ] && [ ! -L "$rc" ] && [ -w "$rc" ] && grep -Fq '.dsh-wsl-env.sh' "$rc"; then
     if [ "$DRY" = "true" ]; then echo "[dry-run] Strip hook from $rc"; else
       tmp="$(mktemp)"; grep -Fv '.dsh-wsl-env.sh' "$rc" > "$tmp" || true; cat "$tmp" > "$rc"; rm -f "$tmp"
     fi
   fi
 done
+TARGET_WS="${WS_ROOT:-$HOME/workspace}"
 if [ "$DRY" = "true" ]; then
-  echo "[dry-run] Remove ~/.dsh-wsl-env.sh, /tmp|/dev/shm|/run/user dsh-wsl-*, ~/.cache/dsh-wsl-sandbox, ~/.local/share/dsh-wsl-sandbox, ~/.config/dsh-wsl-sandbox, and empty ~/workspace"
+  echo "[dry-run] Remove ~/.dsh-wsl-env.sh, /tmp|/dev/shm|/run/user dsh-wsl-*, ~/.cache/dsh-wsl-sandbox, ~/.local/share/dsh-wsl-sandbox, ~/.config/dsh-wsl-sandbox, and empty $TARGET_WS"
 else
   rm -f "$HOME/.dsh-wsl-env.sh"
   for tb in "/run/user/$(id -u)" "/dev/shm" "/tmp"; do
@@ -187,14 +228,32 @@ else
   for pd in "$HOME/.cache/dsh-wsl-sandbox" "$HOME/.local/share/dsh-wsl-sandbox" "$HOME/.config/dsh-wsl-sandbox"; do
     if [ -e "$pd" ]; then chmod -R u+w "$pd" 2>/dev/null || true; rm -rf "$pd"; fi
   done
-  [ -d "$HOME/workspace" ] && rmdir "$HOME/workspace" 2>/dev/null || true
+  if [ "$CREATED_WS" = "true" ] || [ "$TARGET_WS" = "$HOME/workspace" ]; then
+    [ -d "$TARGET_WS" ] && rmdir "$TARGET_WS" 2>/dev/null || true
+  fi
 fi
 '@ -replace "`r`n", "`n"
 
+  $wslArgs = @("-d", $Distro, "--cd", "~")
+  if ($linuxUser -and $linuxUser -match '^[a-z_][a-z0-9_.-]{0,31}$') {
+    $wslArgs += @("-u", $linuxUser)
+  }
+  $wslArgs += @("--", "sh", "-c", $inlineFallbackSh, "dsh-uninstall")
+  $wslArgs += $wslFlags
+
+  $prevEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
   try {
-    & wsl.exe -d $Distro --cd ~ -- sh -c $inlineFallbackSh dsh-uninstall @wslFlags
+    & wsl.exe @wslArgs
+    if ($LASTEXITCODE -ne 0) {
+      $wslCleanupOk = $false
+      Write-Warning "WSL-side uninstall inside '$Distro' exited with code $LASTEXITCODE; preserving host backups so manual restore remains possible."
+    }
   } catch {
-    Write-Warning "Could not reach WSL distro '$Distro' ($($_.Exception.Message)); continuing host cleanup."
+    $wslCleanupOk = $false
+    Write-Warning "Could not reach WSL distro '$Distro' ($($_.Exception.Message)); preserving host backups."
+  } finally {
+    $ErrorActionPreference = $prevEap
   }
 } else {
   Write-Host "[3/5] No WSL distro recorded; skipping WSL-side cleanup." -ForegroundColor Yellow
@@ -210,7 +269,17 @@ if ($RestoreHostWslConfig -and -not $SkipRestoreConfigs) {
     if ($DryRun) {
       Write-Host "[dry-run] Restore $wslConfigHostPath from $origWslConfigBackup" -ForegroundColor DarkGray
     } else {
-      Copy-Item -Force -LiteralPath $origWslConfigBackup -Destination $wslConfigHostPath
+      $prevEap = $ErrorActionPreference
+      $ErrorActionPreference = "Continue"
+      try {
+        if (Test-Path -LiteralPath $wslConfigHostPath) {
+          & attrib.exe -R $wslConfigHostPath 2>$null | Out-Null
+        }
+        Copy-Item -Force -LiteralPath $origWslConfigBackup -Destination $wslConfigHostPath
+        & attrib.exe -R $wslConfigHostPath 2>$null | Out-Null
+      } finally {
+        $ErrorActionPreference = $prevEap
+      }
       Write-Host "[4/5] Restored $wslConfigHostPath from $origWslConfigBackup" -ForegroundColor Green
     }
   } elseif (Test-Path -LiteralPath $absentWslConfigMarker) {
@@ -218,6 +287,13 @@ if ($RestoreHostWslConfig -and -not $SkipRestoreConfigs) {
       if ($DryRun) {
         Write-Host "[dry-run] Remove $wslConfigHostPath (host had no .wslconfig at initial snapshot)" -ForegroundColor DarkGray
       } else {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+          & attrib.exe -R $wslConfigHostPath 2>$null | Out-Null
+        } finally {
+          $ErrorActionPreference = $prevEap
+        }
         Remove-Item -Force -LiteralPath $wslConfigHostPath
         Write-Host "[4/5] Removed $wslConfigHostPath (host originally had no .wslconfig)" -ForegroundColor Green
       }
@@ -243,7 +319,7 @@ function Remove-ReadOnlyTree([string]$TargetDir) {
 }
 
 Write-Host "[4/5] Removing Windows host plugin state & backups..." -ForegroundColor Cyan
-if ($KeepBackups) {
+if ($KeepBackups -or (-not $wslCleanupOk)) {
   foreach ($sub in @("config.json", "install-manifest.json", "logs")) {
     $subPath = Join-Path $cfgDir $sub
     if (Test-Path -LiteralPath $subPath) {

@@ -15,6 +15,8 @@ export interface DshLogger {
   debug?(msg: string, ...args: unknown[]): void;
 }
 
+export type DshLoggerInput = Partial<DshLogger> | ((name: string) => Partial<DshLogger>);
+
 export interface DshContentBlock {
   readonly type: 'text';
   readonly text: string;
@@ -115,10 +117,20 @@ export interface DshHostApprovalResult {
   readonly source?: string;
 }
 
-export type DshRealApprovalOutcome = 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable';
+export type DshRealApprovalOutcome =
+  | 'allowed-once'
+  | 'allowed-always'
+  | 'allowed-session'
+  | 'allow-once'
+  | 'allow-session-rule'
+  | 'allowed'
+  | 'allow'
+  | 'rejected'
+  | 'cancelled'
+  | 'unavailable';
 
 export interface DshApprovalService {
-  request(req: DshHostApprovalRequest): Promise<DshHostApprovalResult | DshRealApprovalOutcome>;
+  request(req: DshHostApprovalRequest): Promise<DshHostApprovalResult | DshRealApprovalOutcome | (string & {})>;
 }
 
 export interface DshHttpRequest {
@@ -188,7 +200,7 @@ export interface DshCordisContext {
   readonly approval?: DshApprovalService;
   readonly webServer?: DshWebServer;
   readonly http?: DshHttpRouter;
-  readonly logger?: DshLogger;
+  readonly logger?: DshLoggerInput;
   get?(name: string): unknown;
   inject?(deps: readonly string[], callback: (ctx: DshCordisContext) => void): (() => void) | void;
   waterfall?<TPayload = unknown, TResult = unknown>(

@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-// Universal `node test` AND bare `node --test` entrypoint.
-// - When invoked as `node test` (or `node test.js`): `process.env.NODE_TEST_CONTEXT` is undefined,
-//   so we delegate directly to `scripts/run-tests.mjs`.
-// - When discovered automatically by bare `node --test`: `process.env.NODE_TEST_CONTEXT` is set
-//   by Node's test runner, so we build `.cache/compiled-tests/test-env.mjs` if missing and
-//   dynamically import it without recursively spawning `node --test`.
+// 通用 `node test` 与直接 `node --test` 兼容入口：
+// - 直接运行 `node test` / `node test.js` 时，`process.env.NODE_TEST_CONTEXT` 未设置，
+//   将直接转交 `scripts/run-tests.mjs` 执行全套测试（Windows 默认启用 `DSH_WSL_NO_HOST_SPAWN=1`）。
+// - 通过 `node --test` 自动发现本文件时，`NODE_TEST_CONTEXT` 已由 Node 测试器注入，
+//   此时仅按需预编译并检查 `dist/` 与 `client.js` 产物就绪，避免递归套娃拉起 `node --test`。
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

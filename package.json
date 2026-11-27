@@ -1,7 +1,7 @@
 {
   "name": "dsh-wsl-sandbox",
-  "version": "0.2.0",
-  "description": "Codex-grade WSL 2 execution backend & OS sandbox for DeepSeek Harness (DSH) with shared DSH/WSL Node 22/24 runtime, SSD-safe coalesced structured logging, single-shell dialect guard, zero-token Bash/PowerShell approval, physical hardware single-shot lock, and zero host plugin conflicts.",
+  "version": "0.3.0",
+  "description": "DeepSeek Harness (DSH) WSL 2 内核级沙箱与执行后端 | Codex-grade WSL 2 Linux kernel sandbox & execution backend (bwrap + seccomp-bpf + UDS proxy, official PowerShell AST & Bash guard, DIY distro auto-staging, zero host plugin conflicts).",
   "icon": "./icon.svg",
   "license": "GPL-3.0-only",
   "type": "module",
@@ -59,7 +59,8 @@
     "docs",
     "LICENSE",
     "INSTALL.zh.md",
-    "README.md"
+    "README.md",
+    "README.en.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

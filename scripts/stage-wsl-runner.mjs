@@ -1,17 +1,14 @@
 #!/usr/bin/env node
 /**
- * Stages the built `dist/` runner bundle and `packages/bootstrap/provision-wsl.sh`
- * directly into native WSL ext4 (`$HOME/.local/share/dsh-wsl-sandbox/runner/`) via
- * a pure-JS POSIX ustar tar stream piped to `wsl.exe -d <Distro> --cd ~ -- sh -c ...`.
+ * 通过纯 Node.js POSIX ustar 归档流与 `wsl.exe -d <Distro> --cd ~ -- sh -c ...`，
+ * 将已编译的 `dist/` Runner 与 `packages/bootstrap/provision-wsl.sh` 直接部署进
+ * WSL 原生 `ext4`（`$HOME/.local/share/dsh-wsl-sandbox/runner/`）。
  *
- * Why this exists:
- * 1. Works with ZERO `/mnt/c` dependency (works even when `[automount] enabled = false`).
- * 2. Works seamlessly with WSL Manager imported/moved VHDX instances that disappear from
- *    Windows Explorer's left "Linux" sidebar.
- * 3. Holds ZERO Windows NTFS file handles on the host plugin directory (prevents undeletable
- *    folder locks when disabling or uninstalling the plugin).
- * 4. Avoids Windows PowerShell 5.1 binary pipeline corruption (`tar | wsl` breaks in PS 5.1).
- * 5. Requires only POSIX `sh` + `tar` inside WSL (works before Node.js is installed in WSL).
+ * 设计原因：
+ * 1. 零 `/mnt/c` 依赖（即使在 `[automount] enabled = false` 下也可正常部署）。
+ * 2. 兼容经 WSL Manager 导入/迁移磁盘后从 Windows 资源管理器左侧栏消失的实例。
+ * 3. 不在宿主机插件目录留下任何 Windows NTFS 打开句柄锁，卸载/禁用插件绝不卡死文件夹。
+ * 4. 规避 Windows PowerShell 5.1 管道二进制损毁问题，且 WSL 侧仅需基础 `sh` + `tar`（无需预装 Node）。
  */
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -206,6 +203,7 @@ function buildStageInvocation(options) {
   const tarBuf = buildTarBuffer(entries);
 
   const shCmd = [
+    'cd "$HOME" 2>/dev/null || true',
     'set -eu',
     'umask 077',
     'SUBDIR="$1"',

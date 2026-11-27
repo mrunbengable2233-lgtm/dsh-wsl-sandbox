@@ -1,10 +1,10 @@
-# dsh-wsl-sandbox Cordis bundle patch
+# dsh-wsl-sandbox Cordis 插件声明补丁
 #
-# Coexistence invariants (verified against official @deepseek-ai/dsh@0.2.2-rc.5 + Top 27 Marketplace plugins):
-# - NEVER disables or overwrites DSH stock rows (`system-prompt`, `fs-local`, `subprocess-local`,
-#   `sandbox-local`, `tool-pwsh`, `tool-bash`, or `preset-*`).
-# - Single package-root entry (`name: 'dsh-wsl-sandbox'`) so both the Node Host half (`exports["."]`)
-#   and Browser GUI half (`exports["./client"]` -> `client.js`) are discovered cleanly by `ClientModuleRegistry`.
+# 插件共存不变量（已针对 @deepseek-ai/dsh@0.2.2-rc.5 及 Top-27 市场插件完成验证）：
+# - 绝不禁用或覆写 DSH 原生内置组件行（system-prompt、fs-local、subprocess-local、
+#   sandbox-local、tool-pwsh、tool-bash 或任意 preset-*）。
+# - 使用单一包根入口（name: 'dsh-wsl-sandbox'），使 ClientModuleRegistry 可同时干净发现
+#   Node 宿主侧插件（exports["."]）与浏览器端界面模块（exports["./client"] -> client.js）。
 
 - insert:
     - id: dsh-wsl-sandbox

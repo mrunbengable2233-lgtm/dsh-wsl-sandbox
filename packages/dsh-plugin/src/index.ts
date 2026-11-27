@@ -7,7 +7,7 @@ import {
 } from '../../core/src/index.ts';
 import { ApprovalBridge } from './approval-bridge.ts';
 import { ConfigStore, hardenPrivatePath, type WslSandboxConfig } from './config-store.ts';
-import { type DshCordisContext, getOptionalService } from './cordis-types.ts';
+import { type DshCordisContext, type DshLogger, getOptionalService } from './cordis-types.ts';
 import { registerWslPromptSection } from './prompt-injector.ts';
 import { registerHostPwshGuardHook } from './pwsh-hook.ts';
 import { registerWslSandboxTools, WslSandboxSessionManager } from './tools.ts';
@@ -16,19 +16,18 @@ import { registerWslSandboxWebApi } from './web-api.ts';
 export const name = 'dsh-wsl-sandbox';
 
 /**
- * Cordis injection list MUST be a string array (`[]`), NEVER an object (`{ optional: [...] }`)!
- * Optional/surface-specific services (`tools`, `systemPrompt`, `approval`, `webServer`) are
- * bound both directly (when already present) and reactively via `ctx.inject([...], ...)` so
- * headless, TUI, Desktop, and Web profiles all boot cleanly without ever parking on missing services.
+ * Cordis 依赖注入列表 `inject` 必须保持为字符串数组（`[]`），严禁改为 `{ optional: [...] }` 对象！
+ * 可选或分端服务（`tools`、`systemPrompt`、`approval`、`webServer`）均同时通过直接读取（已就绪时）与
+ * `ctx.inject([...], ...)` 响应式绑定挂载，确保 Headless、TUI、Desktop 与 Web 模式均可无阻塞启动。
  */
 export const inject: string[] = [];
 
 export interface WslSandboxPluginOptions {
   readonly configPath?: string;
   readonly persistConfig?: boolean;
-  /** Optional override for disk log persistence (`false` keeps logs in RAM only; defaults to `persistConfig ?? true`). */
+  /** 可选覆盖磁盘日志持久化开关（设 `false` 时仅驻留内存；默认跟随 `persistConfig ?? true`）。 */
   readonly persistLogs?: boolean;
-  /** Custom flush interval for SSD-friendly batched disk writes (default: 2500ms). */
+  /** SSD 友好型批量合并刷盘间隔（毫秒，默认 2500ms）。 */
   readonly logFlushIntervalMs?: number;
   readonly initialConfig?: Partial<WslSandboxConfig>;
   readonly sessionId?: string;
@@ -81,8 +80,10 @@ function resolveInitialConfig(options: WslSandboxPluginOptions): Partial<WslSand
   if (options.injectSystemPromptSection !== undefined) {
     mutable.enablePromptInjection = options.injectSystemPromptSection;
   }
-  if (options.enableHostPwshGuard !== undefined) {
-    mutable.enablePwshGuard = options.enablePwshGuard;
+  const hostPwshGuard =
+    options.enableHostPwshGuard ?? (options as { enablePwshGuard?: boolean }).enablePwshGuard;
+  if (hostPwshGuard !== undefined) {
+    mutable.enablePwshGuard = hostPwshGuard;
   }
   if (options.advanced !== undefined) {
     mutable.advanced = {
@@ -94,6 +95,18 @@ function resolveInitialConfig(options: WslSandboxPluginOptions): Partial<WslSand
     };
   }
   return { ...fromYaml, ...(options.initialConfig ?? {}) };
+}
+
+function normalizeHostLogger(rawLogger: unknown): Partial<DshLogger> | undefined {
+  if (typeof rawLogger === 'function') {
+    try {
+      const scoped = (rawLogger as (name: string) => unknown)('dsh-wsl-sandbox');
+      return scoped && typeof scoped === 'object' ? (scoped as Partial<DshLogger>) : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return rawLogger && typeof rawLogger === 'object' ? (rawLogger as Partial<DshLogger>) : undefined;
 }
 
 function registerSafeEffect(ctx: DshCordisContext, cleanup: () => void | Promise<void>): void {
@@ -118,7 +131,7 @@ export function apply(
     initial: resolveInitialConfig(options),
   });
 
-  const hostLoggerService = getOptionalService(ctx, 'logger');
+  const hostLoggerService = normalizeHostLogger(getOptionalService(ctx, 'logger'));
   const persistLogs = options.persistLogs ?? persistConfig;
   const logSink = persistLogs
     ? new RotatingNdjsonSink({
@@ -138,15 +151,16 @@ export function apply(
     preloadFromDisk: persistLogs,
     onEntry: (entry) => {
       if (!hostLoggerService) return;
-      if (entry.level === 'error') {
+      if (entry.level === 'error' && typeof hostLoggerService.error === 'function') {
         hostLoggerService.error(`[dsh-wsl-sandbox][${entry.component}] ${entry.message}`);
-      } else if (entry.level === 'warn') {
+      } else if (entry.level === 'warn' && typeof hostLoggerService.warn === 'function') {
         hostLoggerService.warn(`[dsh-wsl-sandbox][${entry.component}] ${entry.message}`);
       }
     },
   });
 
   const approvalBridge = new ApprovalBridge({
+    configStore,
     getPolicyMode: () => configStore.get().approvalPolicyMode,
     ttlMs: configStore.get().approvalTimeoutMs,
     hostApproval: getOptionalService(ctx, 'approval'),
@@ -160,7 +174,11 @@ export function apply(
     sessionId: options.sessionId,
     allowLinuxDevMode: options.allowLinuxDevMode,
     logger,
-    onStderr: (line) => hostLoggerService?.warn(`[dsh-wsl-runner] ${line}`),
+    onStderr: (line) => {
+      if (typeof hostLoggerService?.warn === 'function') {
+        hostLoggerService.warn(`[dsh-wsl-runner] ${line}`);
+      }
+    },
   });
 
   const disposers: Array<() => void | Promise<void>> = [];
@@ -170,13 +188,20 @@ export function apply(
 
   const isRealCordis = typeof ctx.inject === 'function';
 
-  // 1. Tools + Host Shell Guard
+  // 1. 工具注册 + 宿主机单壳方言与受控引导门禁守卫
   if (isRealCordis) {
     ctx.inject!(['tools'], (toolCtx) => {
       const toolDisposers = registerWslSandboxTools(toolCtx, sessionManager, configStore, approvalBridge);
       const pwshDispose = registerHostPwshGuardHook(toolCtx, {
         getConfig: () => configStore.get(),
-        getBinding: () => sessionManager.ensureBound(),
+        getBinding: () => sessionManager.getBindingSnapshot(),
+        getBootstrapState: () => sessionManager.getBootstrapChannelState(),
+        onBootstrapPreviewExecuted: (distro) => {
+          sessionManager.markBootstrapPreviewCompleted(distro);
+        },
+        onBootstrapInstallExecuted: () => {
+          sessionManager.markBootstrapInstallStarted();
+        },
         approvalBridge,
         logger,
       });
@@ -188,7 +213,14 @@ export function apply(
   } else {
     const pwshDispose = registerHostPwshGuardHook(ctx, {
       getConfig: () => configStore.get(),
-      getBinding: () => sessionManager.ensureBound(),
+      getBinding: () => sessionManager.getBindingSnapshot(),
+      getBootstrapState: () => sessionManager.getBootstrapChannelState(),
+      onBootstrapPreviewExecuted: (distro) => {
+        sessionManager.markBootstrapPreviewCompleted(distro);
+      },
+      onBootstrapInstallExecuted: () => {
+        sessionManager.markBootstrapInstallStarted();
+      },
       approvalBridge,
       logger,
     });
@@ -196,14 +228,22 @@ export function apply(
     disposers.push(...registerWslSandboxTools(ctx, sessionManager, configStore, approvalBridge));
   }
 
-  // 2. SystemPrompt Routing Section (order: 4200, interpolate: false)
+  // 2. 系统提示词增量路由注入（order: 4200, interpolate: false）
   if (isRealCordis) {
     ctx.inject!(['systemPrompt'], (spCtx) => {
-      const promptDispose = registerWslPromptSection(spCtx, () => configStore.get());
+      const promptDispose = registerWslPromptSection(
+        spCtx,
+        () => configStore.get(),
+        () => sessionManager.getBootstrapChannelState(),
+      );
       registerSafeEffect(spCtx, () => promptDispose?.());
     });
   } else {
-    const promptDispose = registerWslPromptSection(ctx, () => configStore.get());
+    const promptDispose = registerWslPromptSection(
+      ctx,
+      () => configStore.get(),
+      () => sessionManager.getBootstrapChannelState(),
+    );
     if (promptDispose) disposers.push(promptDispose);
   }
 
@@ -217,20 +257,35 @@ export function apply(
 
   // 4. Web UI & Control API (`ctx.webServer` on real DSH Web, `ctx.http` on standalone harnesses)
   if (isRealCordis) {
+    let httpRegistered = false;
+    if (getOptionalService(ctx, 'http')) {
+      httpRegistered = true;
+      disposers.push(
+        ...registerWslSandboxWebApi(ctx, {
+          configStore,
+          sessionManager,
+          approvalBridge,
+          logger,
+          skipWebServer: true,
+        }),
+      );
+    }
     ctx.inject!(['webServer'], (webCtx) => {
+      const skipHttpRouter = httpRegistered;
+      if (!skipHttpRouter && getOptionalService(webCtx, 'http')) {
+        httpRegistered = true;
+      }
       const webDisposers = registerWslSandboxWebApi(webCtx, {
         configStore,
         sessionManager,
         approvalBridge,
         logger,
+        skipHttpRouter,
       });
       registerSafeEffect(webCtx, () => {
         for (const fn of webDisposers.splice(0)) fn();
       });
     });
-    if (getOptionalService(ctx, 'http')) {
-      disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge, logger }));
-    }
   } else {
     disposers.push(...registerWslSandboxWebApi(ctx, { configStore, sessionManager, approvalBridge, logger }));
   }
@@ -267,9 +322,11 @@ export function apply(
       logFilePath: logger.getLogFilePath() ?? null,
     },
   });
-  hostLoggerService?.info(
-    `[dsh-wsl-sandbox] loaded (distro=${cfg.distro}, approval=${cfg.approvalPolicyMode}, network=${cfg.networkMode}, hostNode=${hostRuntime.nodeVersion})`,
-  );
+  if (typeof hostLoggerService?.info === 'function') {
+    hostLoggerService.info(
+      `[dsh-wsl-sandbox] loaded (distro=${cfg.distro}, approval=${cfg.approvalPolicyMode}, network=${cfg.networkMode}, hostNode=${hostRuntime.nodeVersion})`,
+    );
+  }
 
   return {
     configStore,

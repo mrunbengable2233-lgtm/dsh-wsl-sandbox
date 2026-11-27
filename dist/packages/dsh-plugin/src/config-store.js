@@ -10,7 +10,8 @@ import {
                  
                           
   failSandbox,
-  isValidIdentifier,
+  isValidDistroName,
+  isValidLinuxUsername,
   isValidLogLevel,
                 
                    
@@ -126,12 +127,12 @@ export function hardenPrivatePath(targetPath        , kind                      
   if (process.platform === 'win32') {
     const user = process.env.USERNAME;
     if (user && /^[A-Za-z0-9_.\- ]+$/.test(user)) {
-      const perm = kind === 'dir' ? '(OI)(CI)F' : kind === 'readonly-file' ? 'R' : 'F';
+      const perm = kind === 'dir' ? '(OI)(CI)F' : 'F';
       const args = [
         targetPath,
         '/inheritance:r',
         '/grant:r',
-        `*S-1-5-18:${kind === 'dir' ? '(OI)(CI)F' : 'F'}`,
+        `*S-1-5-18:${perm}`,
         `${user}:${perm}`,
       ];
       spawnSync('icacls.exe', args, { stdio: 'ignore', shell: false, windowsHide: true, timeout: 4000 });
@@ -215,7 +216,7 @@ function inferDefaultLinuxUser()         {
   if (process.platform !== 'win32') {
     try {
       const u = os.userInfo().username;
-      if (u && u !== 'root' && /^[a-z_][a-z0-9_-]{0,31}$/.test(u)) {
+      if (u && u !== 'root' && isValidLinuxUsername(u)) {
         return u;
       }
     } catch {
@@ -311,16 +312,28 @@ function validateDomain(domain        )         {
 }
 
 export function validateFullConfig(raw                  )                   {
-  if (!isValidIdentifier(raw.distro)) {
+  if (!isValidDistroName(raw.distro)) {
     failSandbox('INVALID_SETUP', `Invalid WSL distro name: ${raw.distro}`);
   }
-  if (raw.username !== undefined && raw.username !== '' && !/^[a-z_][a-z0-9_-]{0,31}$/.test(raw.username)) {
+  if (raw.username !== undefined && raw.username !== '' && !isValidLinuxUsername(raw.username)) {
     failSandbox('INVALID_SETUP', `Invalid Linux username: ${raw.username}`);
   }
   validateWorkspaceRoot(raw.workspaceRoot, raw.username);
 
   if (!VALID_TRANSPORT_MODES.has(raw.transportMode)) {
     failSandbox('INVALID_SETUP', `Invalid transportMode: ${String(raw.transportMode)}`);
+  }
+  const runnerPath = typeof raw.runnerPath === 'string' ? raw.runnerPath.trim() : '';
+  if (!runnerPath || runnerPath.includes('\0') || /[\r\n]/.test(runnerPath)) {
+    failSandbox('INVALID_SETUP', `Invalid runnerPath: ${String(raw.runnerPath)}`);
+  }
+  if (raw.transportMode === 'wsl') {
+    if (!runnerPath.startsWith('/') || runnerPath === '/mnt' || runnerPath.startsWith('/mnt/') || /\.exe$/i.test(runnerPath)) {
+      failSandbox(
+        'POLICY_BLOCK',
+        `WSL runnerPath must be a native Linux ext4 path (starting with '/', not '/mnt/*' or '.exe'): ${runnerPath}`,
+      );
+    }
   }
   const environmentProfile                     = raw.environmentProfile ?? 'standard';
   if (!VALID_ENV_PROFILES.has(environmentProfile)) {
@@ -371,6 +384,7 @@ export function validateFullConfig(raw                  )                   {
 
   return {
     ...raw,
+    runnerPath,
     wslNodePath,
     environmentProfile,
     logLevel,
@@ -430,7 +444,22 @@ export class ConfigStore {
     if (this.persistToDisk && fs.existsSync(this.filePath)) {
       try {
         const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'))                             ;
-        return createDefaultConfig({ ...parsed, ...initial });
+        const mergedAdvanced =
+          initial?.advanced || parsed.advanced
+            ? {
+                shares: parsed.advanced?.shares ?? initial?.advanced?.shares ?? [],
+                deviceNodes: parsed.advanced?.deviceNodes ?? initial?.advanced?.deviceNodes ?? [],
+                localLabCidrs: parsed.advanced?.localLabCidrs ?? initial?.advanced?.localLabCidrs ?? [],
+                localLabPorts: parsed.advanced?.localLabPorts ?? initial?.advanced?.localLabPorts ?? [],
+                customAllowedDomains:
+                  parsed.advanced?.customAllowedDomains ?? initial?.advanced?.customAllowedDomains ?? [],
+              }
+            : undefined;
+        return createDefaultConfig({
+          ...initial,
+          ...parsed,
+          ...(mergedAdvanced ? { advanced: mergedAdvanced } : {}),
+        });
       } catch {
         // Fall through to defaults if corrupted
       }
@@ -475,6 +504,49 @@ export class ConfigStore {
 
   get()                   {
     return this.config;
+  }
+
+  /**
+   * 从磁盘重新读取并校验 `config.json`（用于同步外部安装向导落盘的最新配置，无变更时不触发递增）。
+   */
+  reloadFromDisk()                   {
+    if (!this.persistToDisk || !fs.existsSync(this.filePath)) {
+      return this.config;
+    }
+    const prev = this.config;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'))                             ;
+      const mergedAdvanced =
+        parsed.advanced
+          ? {
+              shares: parsed.advanced.shares ?? prev.advanced.shares,
+              deviceNodes: parsed.advanced.deviceNodes ?? prev.advanced.deviceNodes,
+              localLabCidrs: parsed.advanced.localLabCidrs ?? prev.advanced.localLabCidrs,
+              localLabPorts: parsed.advanced.localLabPorts ?? prev.advanced.localLabPorts,
+              customAllowedDomains: parsed.advanced.customAllowedDomains ?? prev.advanced.customAllowedDomains,
+            }
+          : prev.advanced;
+      const loaded = createDefaultConfig({
+        ...prev,
+        ...parsed,
+        advanced: mergedAdvanced,
+      });
+      const stripRev = (c                  ) => ({ ...c, revision: '' });
+      if (JSON.stringify(stripRev(loaded)) === JSON.stringify(stripRev(prev))) {
+        return this.config;
+      }
+      const next = validateFullConfig({
+        ...loaded,
+        revision: nextRevision(prev.revision),
+      });
+      this.config = next;
+      for (const listener of this.listeners) {
+        listener(next, prev);
+      }
+      return next;
+    } catch {
+      return this.config;
+    }
   }
 
   onChange(listener                      )             {

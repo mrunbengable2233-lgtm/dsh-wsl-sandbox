@@ -33,7 +33,7 @@
 | **Q18** | **笔记本轻量化建环境策略** | **零 Docker / 零内核构建 + Agent 提示词驱动建环境** — 放弃重型本地 Docker 镜像构建与任何内核编译；交付专用 **Agent 建环境引导 Skill & 提示词（`dsh-wsl-env-setup`）** + 轻量幂等 `provision-wsl.sh` + `dsh-wsl-doctor` 自检工具，让用户在笔记本上由 Agent 引导操作官方现成 WSL 2 发行版按步配齐环境（每步可控、可断点续跑、零重负载构建） |
 
 ## Acceptance Criteria
-- [ ] 完整版 Spec（[specification.md](file:///home/antigravity/.gemini/jetski/brain/v1/default/jetski_remote_agents_3p_devbox/5d04c271-d126-4358-9d3b-ff5a5e3911b6/specification.md) + `.trellis/spec/` 全部 5 层可执行代码规范 + `.agents/skills/` 10 个便携 Skill）交付并通过用户审阅。
+- [x] 完整版 Spec（[specification-v2.0.md](../../../../docs/specification-v2.0.md) + `.trellis/spec/` 全部 5 层可执行代码规范 + `.agents/skills/` 10 个便携 Skill）交付并通过用户审阅。
 - [ ] `packages/core`、`packages/wsl-runner`、`packages/dsh-plugin`、`packages/bootstrap` 全部无错构建（零原生 `node-gyp` 依赖）。
 - [ ] 全量单元测试通过：`BashAstGuard`、`PwshGuard`（含 Base64 `-EncodedCommand` 解码与反引号去混淆）、`ApprovalController`（并发、防重放、篡改、TTL、撤权、跳板黑名单、物理设备自动降级）、`SeccompBpf`（`x86_64` + `aarch64`）、`BwrapBuilder`、`EnvSanitizer`、`UdsProxy`。
 - [ ] 本机真实 Linux 内核 `bwrap --seccomp <fd>` + `prlimit` + `wsl-runner` + `UdsProxy` 集成测试全绿。

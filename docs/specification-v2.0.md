@@ -1,8 +1,9 @@
-# DeepSeek Harness (DSH) WSL 2 后端与 Codex 级命令沙盒——完整工程规格书（v2.0 定稿）
+# DeepSeek Harness (DSH) WSL 2 后端与 Codex 级命令沙盒——完整工程规格书（v2.0 定稿 / v0.3.0 归档）
 
-> **文档版本**：v2.0（经 `grill-me` 3 轮拷打 + Q18 笔记本约束确认，**18 项核心架构决策 Q1–Q18 全部锁定**）  
-> **同步记忆库**：所有可执行代码契约、接口签名、系统调用号表与错误矩阵已同步沉淀至 Trellis 规范树 [`.trellis/spec/`](file:///home/antigravity/dsh-wsl-sandbox/.trellis/spec/guides/index.md) 与任务 PRD [prd.md](file:///home/antigravity/dsh-wsl-sandbox/.trellis/tasks/11-23-dsh-wsl-sandbox/prd.md)  
-> **便携技能包**：[`.agents/skills/`](file:///home/antigravity/dsh-wsl-sandbox/.agents/skills) 已内置全套 10 个 Skill（Trellis × 8 + `grill-me` + `dsh-wsl-env-setup`）
+> **主页导航**：[**简体中文主页 (README.md)**](../README.md) | [**English Overview (README.en.md)**](../README.en.md)  
+> **文档版本**：v2.0 锁定规格（经 `grill-me` 多轮决策锁定 Q1–Q18，对应已交付实现的 **`v0.3.0`**）  
+> **同步记忆库**：所有可执行代码契约、接口签名、系统调用号表与错误矩阵已同步沉淀至 Trellis 规范树 [`.trellis/spec/`](../.trellis/spec/guides/index.md) 与已归档任务 PRD [`prd.md`](../.trellis/tasks/archive/11-23-dsh-wsl-sandbox/prd.md)  
+> **便携技能包**：[`.agents/skills/dsh-wsl-env-setup/SKILL.md`](../.agents/skills/dsh-wsl-env-setup/SKILL.md) 已内置轻量化 WSL 2 环境引导建置技能包
 
 ---
 
@@ -27,7 +28,7 @@
 | **Q15** | 宿主 PowerShell 完整高危守卫 | 在 `tools/pre-execute` 为宿主机 `pwsh`/`cmd` 补齐**完整零 Token `PwshGuard`**（Base64 `-EncodedCommand` UTF-16LE 解码、反引号去混淆、L0 毁灭/改 `.wslconfig`/root WSL 硬禁、L3 `wsl.exe` 绕过拦截/删库/提权/下载执行/物理设备 `usbipd` 单次审批），正常宿主查询（`usbipd list`、`Get-PnpDevice`）与 `dsh-purge` 透明放行 |
 | **Q16** | UDS 代理防 SSRF & 本地靶场 | **默认严禁转发任何私网/回环/元数据 IP**（`127.0.0.0/8`, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `::1`, `fc00::/7`, `fe80::/10`）；高级选项支持人类手动添加本地实验 CIDR/端口白名单（供本地 Dev Server / 合法靶场联调，模型无权修改） |
 | **Q17** | 实测验证边界 | 本机 Linux x86_64 完成全量 4 包实现 + **真实 Linux 内核 `bwrap + seccomp-bpf + prlimit + UDS 代理` 正反逃逸测试** + **模拟 `dsh-purge` 同装共存测试** + 交付 Windows 真实 WSL 2 一键真机验收脚本 |
-| **Q18** | **笔记本零重构建建环境方案** | **不跑本地 Docker 镜像构建、不编译内核、不源码编译 Python**；交付专门注入给 Agent 的 **WSL 环境置备 Skill & 提示词（`dsh-wsl-env-setup`）** + 分步幂等 `provision-wsl.sh` + `dsh-wsl-doctor` 自检闭环，由用户在笔记本上让 Agent 引导操作官方现成 WSL 2 发行版按步配齐二进制工具链 |
+| **Q18** | **笔记本零重构建与受控引导方案** | **不跑本地 Docker 镜像构建、不编译内核、不源码编译 Python**；交付「前置 `install-dsh-plugin.ps1` + **控制台预览 SHA-256 -> 开启受控引导通道（强制 1 探测 -> 2 `-DryRun` 确认卡片 -> 3 单次审批安装 -> 4 `doctor` 闭环自动关闸）**」双入口协同机制，默认 `L0` 锁死未授权安装/卸载，网络默认保持 `NAT` |
 
 ---
 
@@ -83,9 +84,9 @@ flowchart TD
 
 ## 三、宿主机插件（`dsh-purge` 等）零冲突、不失效保障规格
 
-详见可执行规范 [`.trellis/spec/plugin/coexistence.md`](file:///home/antigravity/dsh-wsl-sandbox/.trellis/spec/plugin/coexistence.md) 与 [`.trellis/spec/guides/host-plugin-coexistence.md`](file:///home/antigravity/dsh-wsl-sandbox/.trellis/spec/guides/host-plugin-coexistence.md)：
+详见可执行规范 [`.trellis/spec/plugin/coexistence.md`](../.trellis/spec/plugin/coexistence.md) 与 [`.trellis/spec/guides/host-plugin-coexistence.md`](../.trellis/spec/guides/host-plugin-coexistence.md)：
 
-1. **零核心服务覆写（根治 `Big-Dao` Issue `#39`）**：[`cordis.patch.yml`](file:///home/antigravity/dsh-wsl-sandbox/cordis.patch.yml) **只做增量 `- insert:`**（独占命名空间 `dsh-wsl-sandbox` 与 `dsh-wsl-sandbox-web-ui`），**绝不禁用或覆盖** `system-prompt`、`fs-local`、`subprocess-local`、`sandbox-local`、`pwsh-local` 或任何内置 Agent Preset。
+1. **零核心服务覆写（根治 `Big-Dao` Issue `#39`）**：[`cordis.patch.yml`](../cordis.patch.yml) **只做增量 `- insert:`**（采用单一包根入口 `id: dsh-wsl-sandbox`、`name: 'dsh-wsl-sandbox'`），**绝不禁用或覆盖** `system-prompt`、`fs-local`、`subprocess-local`、`sandbox-local`、`pwsh-local` 或任何内置 Agent Preset。
 2. **零封闭 `preset-wsl` 隔绝**：与 `dsh-purge`、主题、压缩、MCP 插件共处同一宿主机进程与同一活跃 Preset，`dsh-purge` 的提示词改写、`postPrompt`（`order: 5100`）、技能库、自动重试 100% 原样生效。
 3. **非侵入式提示词协作（Q14=A）**：使用 DSH 增量 section API 注册 `id: 'dsh-wsl-sandbox-routing'`（`order: 4200`），绝不覆写 `id: system-prompt`；同时提供 `upsertAgentsMdWslSection()` 安全追加/更新 `AGENTS.md` 标记块。
 4. **`hooksDenyBypass` 下的安全双轨兜底（Q4=A）**：
@@ -97,7 +98,7 @@ flowchart TD
 
 ## 四、内核硬隔离规格（`bwrap` + 纯 TS `seccomp-bpf` + `prlimit` + UDS 代理）
 
-详见可执行规范 [`.trellis/spec/core/contracts.md`](file:///home/antigravity/dsh-wsl-sandbox/.trellis/spec/core/contracts.md)（核心模块 [`seccomp-bpf.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/seccomp-bpf.ts)、[`bwrap-builder.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/bwrap-builder.ts)、[`dangerous-paths.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/dangerous-paths.ts)、[`env-sanitizer.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/env-sanitizer.ts) 已按此规格对齐）：
+详见可执行规范 [`.trellis/spec/core/contracts.md`](../.trellis/spec/core/contracts.md)（核心模块 [`seccomp-bpf.ts`](../packages/core/src/seccomp-bpf.ts)、[`bwrap-builder.ts`](../packages/core/src/bwrap-builder.ts)、[`dangerous-paths.ts`](../packages/core/src/dangerous-paths.ts)、[`env-sanitizer.ts`](../packages/core/src/env-sanitizer.ts) 已按此规格对齐）：
 
 - **命名空间**：`--unshare-user`、`--disable-userns`、`--unshare-pid`、`--unshare-ipc`、`--unshare-net`、`--new-session`（防 `TIOCSTI`）、`--die-with-parent`。
 - **临时空间与 WSL 2 逃逸面**：私有 `--tmpfs /tmp --tmpfs /var/tmp`（绝不禁用 `/tmp`）；强制遮蔽 `/run/WSL`、`/mnt`、`/mnt/wsl`、`/mnt/wslg/distro`、`/tmp/.X11-unix`、`/mnt/wslg/.X11-unix`、`/mnt/wslg/PulseServer`；`readlink -f` 解析后 `--ro-bind /dev/null` 遮蔽 D-Bus / systemd private / Docker / Podman / containerd / cri-o / k3s / `$SSH_AUTH_SOCK` / `$GPG_AGENT_INFO`（探测异常 fail-closed）。
@@ -116,18 +117,18 @@ flowchart TD
 
 ## 五、双引擎零 Token 命令审批系统规格（Bash + PowerShell + 物理设备降级）
 
-1. **WSL 侧 `BashAstGuard`**（[`bash-ast-guard.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/bash-ast-guard.ts)）：
+1. **WSL 侧 `BashAstGuard`**（[`bash-ast-guard.ts`](../packages/core/src/bash-ast-guard.ts)）：
    - 纯 TS 零原生依赖词法/AST 解析：`$IFS` 归一化、64KB 长度上限、引号/转义/注释边界、`$()`/反引号/`<()`/`>()` 递归提取、重定向目标检测、8 层包装器递归剥壳（`sudo`/`doas`/`env`/`trap`/`eval`/`command`/`exec`/`nohup`/`nice`/`ionice`/`time`/`timeout`/`stdbuf`/`setsid`/`runuser`/`xargs`/嵌套 shell）。
    - L0 硬禁止：磁盘格式化擦除（`mkfs*`/`wipefs`/`mkswap`/`blkdiscard`/`shred`/`fdisk`/`parted` 写操作）、裸块设备写（`/dev/sd*`/`nvme*` 等）、电源/内核/挂载控制、Fork 炸弹、`rm` 删系统根/主目录、修改 `/etc/wsl.conf` 或 `/etc/fstab`、读 `gha-creds-*.json`。
    - L3 审批：`rm` 含 `-f`/`-r`/`-R`、`find -delete`/`-exec rm`、`git clean -fdx`、`git reset --hard`、`git checkout -- .`、`git push --force`、`git -C`/`--work-tree`/`--git-dir`/`git config` 敏感键、`| sh`/`| bash` 管道执行、越出 `workspaceRoot` 路径。
-2. **宿主侧 `PwshGuard`**（[`pwsh-guard.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/pwsh-guard.ts)）：
-   - 自动解码 PowerShell **`-EncodedCommand` / `-enc` / `-e`（UTF-16LE Base64）**并递归复检、自动剥离反引号混淆（`` i`ex `` → `iex`、`` w`sl.exe `` → `wsl.exe`）、穿透 `pwsh -c` / `cmd /c` / `iex`。
+2. **宿主侧 `PwshGuard` 与微软官方 AST 解析器**（[`pwsh-guard.ts`](../packages/core/src/pwsh-guard.ts) & [`pwsh-system-parser.ts`](../packages/core/src/pwsh-system-parser.ts)）：
+   - 结合微软官方 `[System.Management.Automation.Language.Parser]::ParseInput` / `ParseFile` 只读 AST Worker，自动解码 PowerShell **`-EncodedCommand` / `-enc` / `-e`（UTF-16LE Base64）**并递归复检、剥离反引号混淆（`` i`ex `` → `iex`、`` w`sl.exe `` → `wsl.exe`）、穿透 `pwsh -c` / `cmd /c` / `iex`。
    - L0 硬禁止：`Format-Volume`/`Clear-Disk`/`Initialize-Disk`/`Remove-Partition`/`diskpart`/`format.com`/`bcdedit`/`cipher /w`、`Stop-Computer`/`Restart-Computer`/`shutdown /s|/r`、`Set-MpPreference -DisableRealtimeMonitoring`、`vssadmin delete shadows`、`wevtutil cl`、`reg save HKLM\SAM|SYSTEM|SECURITY`、LSASS dump、修改 `.wslconfig`/`wsl.conf`/`fstab`、`wsl --import|--unregister|--shutdown|--set-default|--terminate|--mount`、`wsl -u root`。
    - L3 审批：宿主 `pwsh` 偷调 `wsl.exe`/`bash.exe` 绕过沙盒、`Remove-Item -Recurse/-Force`、`cmd /c rd /s /q`、`reg delete`、`Set-ExecutionPolicy Bypass|Unrestricted`、`Start-Process -Verb RunAs`、`schtasks /create`/`Register-ScheduledTask`、`New-Service`/`sc create|delete`、`icacls`/`takeown`/`Set-Acl`、`iwr|iex`、`certutil -urlcache`、`bitsadmin /transfer`。
    - 友好直通：`usbipd list` / `usbipd state`、`Get-PnpDevice` 等只读查询透明放行。
 3. **物理设备操作自动强制降级为单次手动审批（Q13）**：
    - 凡命中：高级选项已开启 `--dev-bind` 设备节点、WSL 命令触及 `/dev/ttyUSB*`/`/dev/ttyACM*`/`/dev/bus/usb/*` 或调用 `esptool`/`idf.py flash|monitor|erase-flash|efuse`/`openocd`/`avrdude`/`st-flash`/`dfu-util`/`minicom`/`picocom`/`pio upload`，或宿主调用 `usbipd bind|unbind|attach|detach`——**`touchesPhysicalDevice = true`，强制禁用会话记忆放行，每次必须人类手动 `allow-once`**！
-4. **并发单次审批控制面（[`approval-controller.ts`](file:///home/antigravity/dsh-wsl-sandbox/packages/core/src/approval-controller.ts)）**：
+4. **并发单次审批控制面（[`approval-controller.ts`](../packages/core/src/approval-controller.ts)）**：
    - `Map<requestId, PendingEntry>` 彻底消除并发 `REVIEW_BUSY` 冲突；
    - 不可变 `SHA-256 actionHash` 绑定 `{ binding (含 generation/revision), action }` + 短 TTL（默认 60s）+ 一次性原子消费 `consume()`；
    - POSIX + PowerShell 合并 `BANNED_PREFIX_SUGGESTIONS` 硬黑名单（永不允许将 `bash`/`sh`/`env`/`git`/`node -e`/`python -c`/`pwsh`/`cmd`/`wsl`/`iex`/`Start-Process` 等沉淀为会话免审前缀）；
@@ -137,28 +138,24 @@ flowchart TD
 
 ## 六、笔记本零重构建建环境方案（Q18：Agent 引导提示词 + 二进制快装 + Doctor 闭环）
 
-针对**笔记本无法承受本地 Docker 镜像构建或内核/源码编译**的现实约束，彻底取消 Dockerfile 重构建，改用 **三件套轻量建环境体系**（详见 [`.trellis/spec/bootstrap/toolchains.md`](file:///home/antigravity/dsh-wsl-sandbox/.trellis/spec/bootstrap/toolchains.md) 与 [wsl-env-setup.md](file:///home/antigravity/dsh-wsl-sandbox/packages/bootstrap/prompts/wsl-env-setup.md)）：
+针对**笔记本无法承受本地 Docker 镜像构建或内核/源码编译**的现实约束，彻底取消 Dockerfile 重构建，改用 **三件套轻量建环境体系**（详见 [`.trellis/spec/bootstrap/toolchains.md`](../.trellis/spec/bootstrap/toolchains.md) 与 [`wsl-env-setup.md`](../packages/bootstrap/prompts/wsl-env-setup.md)）：
 
-1. **官方现成 WSL 2 发行版**：直接复用现有 Ubuntu 22.04/24.04 / Debian WSL 2 发行版，或通过微软官方命令 `wsl.exe --install Ubuntu-24.04 --name dsh-sandbox`（~300MB，零 Docker）一键拉起干净发行版。
-2. **专用 Agent 引导建环境 Skill & 提示词（[`dsh-wsl-env-setup`](file:///home/antigravity/dsh-wsl-sandbox/.agents/skills/dsh-wsl-env-setup/SKILL.md)）**：
-   - 由你电脑上已跑起来的 DSH Agent 在人类确认下操作 `wsl.exe` 按步配环境：
-     - **Phase 1 只读探测**：`wsl -l -v` + 发行版内工具扫描，不改任何文件；
-     - **Phase 2 人类确认选型**：选择档位（`core` ~350MB / `standard` ~1.2GB / `universal` ~3.5GB）与国内加速（`--mirror cn` 清华 APT/PyPI、`npmmirror`、`goproxy.cn`、`rsproxy.cn` 及可选本机代理）；
-     - **Phase 3 纯预编译二进制分步安装**（`provision-wsl.sh --step ...`，绝不用 `pyenv` 源码编译 Python，改用 Astral **`uv`** 秒下预编译 Python 二进制；Go/Rust/Node 22/Clang/JDK 全部预编译直装，单步失败可断点续跑）；
-     - **Phase 4 `dsh-wsl-doctor --json` 强制验收门禁**：逐项核验 `WSL 2`、`uid > 0`、`bwrap`、`unprivileged userns`、`seccomp` (`AF_VSOCK` & `io_uring`)、逃逸面遮蔽与 Codex 工具链矩阵。
+1. **官方现成 WSL 2 发行版**：直接复用现有 Ubuntu 26.04/24.04 / Debian / Fedora / `archlinux` / WSL Manager 迁移实例，或通过微软官方命令 `wsl.exe --install -d Ubuntu-26.04` 一键拉起干净发行版。
+2. **专用 Agent 引导建环境 Skill & 提示词（[`dsh-wsl-env-setup`](../.agents/skills/dsh-wsl-env-setup/SKILL.md)）与宿主 `pwsh-hook` 顺序门禁**：
+   - **常态 `L0` 锁死**：未在控制面手动开启「受控 AI 初始化引导通道」前，AI 私自调用安装/staging/卸载脚本直接触发 `L0 deny`；
+   - **开启后严格四步强制审批**：
+     - **步骤 1/4 只读探测**：`wsl.exe -l -v` + 只读 Lxss 注册表探测，确认目标发行版、档位（`core` ~350MB / `standard` ~1.2GB / `universal` ~3.5GB）与镜像/代理（默认推荐保持 WSL `NAT`）；
+     - **步骤 2/4 `-DryRun` 预览与固定格式 confirmation card**：必须先经单次审批运行 `-DryRun` 预览并向人类输出固定格式《安装脚本与变更预览卡片》确认，未执行前真实安装/staging/`--install`/`--terminate` 一律 `L0 deny`；
+     - **步骤 3/4 纯预编译二进制分步单次审批安装**（支持 `install-dsh-plugin.ps1 -NonInteractive -Step ...` 与 `provision-wsl.sh --step ...`）；
+     - **步骤 4/4 `dsh-wsl-doctor --json` 强制验收门禁**：逐项核验 `WSL 2`、`uid > 0`、`bwrap`、`unprivileged userns`、`seccomp` (`AF_VSOCK` & `io_uring`)、逃逸面遮蔽与 Codex 工具链矩阵，首次绑定就绪后引导通道自动关闸。
 
 ---
 
-## 七、后续开工实施路线（等你确认完整 Spec 后立刻继续）
+## 七、v0.3.0 工程实现与验收状态归档
 
-> 注：目前阶段 1 的 `packages/core` 前 6 个核心模块（`errors.ts`、`binding.ts`、`env-sanitizer.ts`、`dangerous-paths.ts`、`seccomp-bpf.ts`、`bwrap-builder.ts`、`bash-ast-guard.ts`、`pwsh-guard.ts`、`approval-controller.ts`）已按本规格写出，已按你的要求暂停继续编码，等你审阅完这份完整 Spec 后立即继续完成：
+以上 Q1–Q18 架构与安全设计已全部在 **`v0.3.0`** 完整落地并通过自动化验证：
 
-1. **补齐 `packages/core` 收尾**：`uds-proxy.ts`（HTTP CONNECT + SOCKS5 上游级联 + SSRF 私网拦截 + 本地靶场白名单）、`protocol.ts`、`index.ts`。
-2. **实现 `packages/wsl-runner`**：常驻 NDJSON 主循环、真实 `probe.ts`、`fs-service.ts`（`O_NOFOLLOW` + 清单 B + `.env` 遮蔽）、`proc-manager.ts`（真实 `bwrap --seccomp <fd>` + `prlimit` + UDS 桥接 + PGID 清理 + spill）、`pty-manager.ts`。
-3. **实现 `packages/dsh-plugin`**：7 个 `wsl_*` 沙盒工具、`prompt-injector.ts`（增量 section + `AGENTS.md` 生成器）、`pwsh-hook.ts`、`approval-bridge.ts`（`balanced`/`strict`/`trust-workspace` 含 `hooksDenyBypass` 兜底）、`config-store.ts`（基础页隐藏 `/mnt` + 高级页单目录/单设备/本地靶场）、独立 Web 控制台 UI/API（`/wsl-sandbox/api/*`，`z-index <= 850`）。
-4. **实现 `packages/bootstrap`**：幂等分步 `provision-wsl.sh`（零 Docker / 零内核构建）、`install-dsh-plugin.ps1`、`doctor.ts`（`dsh-wsl-doctor` CLI）。
-5. **全量实测验收（`trellis-check`）**：
-   - 单元测试（`tests/unit/`）
-   - 本机 **真实 Linux 内核 `bwrap + seccomp-bpf + prlimit + UDS 代理` 正反逃逸集成测试**（`tests/linux-sandbox/`）
-   - **模拟 `dsh-purge` 同装共存测试**（`tests/plugin-coexistence/`）
-   - Windows 真实 WSL 2 一键验收脚本（`tests/windows-wsl-verify/verify-wsl2.ps1`）
+1. **`packages/core`**：完整交付 `errors.ts`、`binding.ts`、`env-sanitizer.ts`、`dangerous-paths.ts`、`seccomp-bpf.ts`、`bwrap-builder.ts`、`bash-ast-guard.ts`、`pwsh-system-parser.ts`、`pwsh-guard.ts`、`approval-controller.ts`、`uds-proxy.ts`、`protocol.ts`、`logger.ts`、`node-runtime.ts`。
+2. **`packages/wsl-runner`**：完整交付常驻 NDJSON `main.ts`、`probe.ts`、`fs-service.ts`、`proc-manager.ts`、`pty-manager.ts` 与 `hygiene.ts`。
+3. **`packages/dsh-plugin`**：完整交付 7 个 `wsl_*` 工具与会话管理器（`tools.ts`）、支持 DIY 发行版与自动 staging 的 `wsl-discovery.ts`/`wsl-transport.ts`、`prompt-injector.ts`、`pwsh-hook.ts`、`approval-bridge.ts`、`config-store.ts`、带 DNS Rebinding/CSRF 防护的 `web-api.ts`、以及内置中英文概览切换的 `web-ui-entry.ts` & `client-src.js`。
+4. **`packages/bootstrap` & 测试验收**：完整交付 `provision-wsl.sh`、`install-dsh-plugin.ps1`、`uninstall-dsh-plugin.ps1`、`doctor.ts`（`dsh-wsl-doctor`）及 `tests/windows-wsl-verify/verify-wsl2.ps1`；全库具备 **81 项自动化测试**（Windows 宿主防误触锁下 71 通过、0 失败；WSL 2 Linux 内核下 81 项全量覆盖真实 `bwrap + seccomp-bpf` 与 `dsh-purge` 共存）及 **246 条零执行红队门禁向量**（30 + 24 + 192，0 漏报 / 0 误报）。

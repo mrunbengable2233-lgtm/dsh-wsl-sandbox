@@ -1,49 +1,56 @@
-# DSH WSL 2 沙盒环境建置引导提示词（笔记本轻量化 · 零 Docker / 零内核构建）
+# DSH WSL 2 沙箱环境受控建置引导提示词（四步预览门禁 · 零 Docker / 零内核编译）
 
-> 将本提示词注入或发送给宿主机上的 DSH Agent（或启用 `.agents/skills/dsh-wsl-env-setup/SKILL.md`），即可让 Agent 在你的审批下分步在 WSL 2 中配齐对标 Codex 的沙盒开发环境，**全程不跑 Docker 镜像构建、不编译 Linux 内核、不源码编译 Python**。
+> **推荐使用方式**：在 DSH **「设置 -> WSL 2 沙箱」**（或 `/wsl-sandbox/ui`）点击 **「预览安装脚本与 SHA-256」** 并点击 **「开启受控引导通道并复制会话指令」** 后，将自动复制好的会话指令（或本文档标准指令）发送给 DSH Agent。常态下 `L0` 单调守卫默认拦截 AI 私自调用安装脚本，只有人类手动开启 20 分钟限时引导通道并完成 `-DryRun` 预览确认卡片后，才会放行单次人工审批安装。
 
 ---
 
-## 注入给 Agent 的标准执行指令
+## 注入给 Agent 的标准执行约束（不可逾越）
 
-你现在负责在用户的 Windows 笔记本上，为 `dsh-wsl-sandbox` 插件配置一个安全、轻快、可验证的 WSL 2 沙盒环境。严格遵守以下 6 条红线：
+你现在在用户手动开启的 **「受控 AI 初始化引导通道」** 中协助配置 `dsh-wsl-sandbox` 所需的 WSL 2 沙箱环境，必须严格遵守以下规则：
 
-1. **禁止重构建**：绝不在笔记本上构建 Docker 镜像、绝不编译 Linux 内核、绝不使用 `pyenv` 源码编译 Python。一律使用任意已注册的 WSL 2 发行版（Ubuntu 26.04/24.04/22.04、Debian、Fedora、Arch、openSUSE、Alpine，以及通过 WSL Manager 导入/迁移磁盘的自定义实例）+ 预编译二进制包（系统包管理器、优先复用已有 Linux Node `>=22` 或安装预编译 Node 24 Active LTS、Astral `uv`、官方 Go tarball、`rustup --profile minimal`）。
-2. **先探测、后确认、再安装**：先执行只读探测（同时检查 `wsl.exe -l -v` 与只读 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*`，确保能识别经 WSL Manager 导入/迁移 VHDX 且从资源管理器左侧消失的实例），向用户展示发现结果和计划安装的档位、体积与镜像/代理方案，**获得用户明确确认后**才执行安装命令。
-3. **禁止私改共享系统配置 & 禁止使用 `wsl --shutdown`**：Windows 官方 **WSL Settings** 与第三方 **WSL Manager** 共享同一套 `/etc/wsl.conf` 与 `%USERPROFILE%\.wslconfig`。严禁自动修改它们；任何配置备份以只读权限 (`0400`/`+R`) 保存到受保护目录（严禁指向 `%USERPROFILE%`、`~/.dsh` 或 VHDX `BasePath`）。如确需重启目标发行版，一律只用 `wsl.exe --terminate <目标发行版>`，**严禁使用 `wsl.exe --shutdown`** 以免关掉其他 WSL 会话！
-4. **原生 ext4 落地（零 `/mnt` 依赖、零 Windows 文件夹占用）**：使用 `node scripts/stage-wsl-runner.mjs --distro <目标发行版>`（或脚本内置免安装复用宿主 DSH Node / `tar.exe` 通道）将 Runner 与安装脚本部署到 WSL 原生 `$HOME/.local/share/dsh-wsl-sandbox/runner/`，既兼容 `[automount] enabled = false`，又避免卸载/禁用插件时出现不可解除的文件夹占用。
-5. **必须非 root 运行**：确认目标发行版存在并默认使用非 root 普通用户（`uid > 0`），绝不以 `root` 作为日常沙盒执行身份。
-6. **以 `dsh-wsl-doctor --profile <所选档位>` 实测为准**：安装完成后必须运行 `dsh-wsl-doctor --strict-wsl2 --profile <所选档位> --json`，逐项核验 `WSL 2`、`uid > 0`、`bwrap`、`unprivileged userns`、`seccomp`（`AF_VSOCK` & `io_uring` EPERM）、`/mnt` 与 `~/.dsh`/`~/.config/dsh-wsl-sandbox` 遮蔽自检全绿后才宣告完成；如遇 AppArmor 限制无特权 userns，禁止降级裸跑，给出精确修复命令请用户确认。
+1. **严禁跳步与命令拼接**：严格按 **步骤 1（只读探测） -> 步骤 2（`-DryRun` 预览 + 固定格式确认卡片） -> 步骤 3（人工单次审批安装） -> 步骤 4（`dsh-wsl-doctor` 闭环验收）** 执行。宿主门禁会在未完成 `-DryRun` 预览前机械拦截一切真实安装与部署命令；所有命令不得包含 `;`、`|`、`&&`、`||`、`$()` 或输出重定向拼接。
+2. **保证主流发行版开箱即用，零 Docker / 零源码编译**：全面支持 Ubuntu (26.04/24.04/22.04)、Debian、Kali、Fedora、Arch (`archlinux`)、openSUSE、Alpine 及 WSL Manager 迁移实例；如遇 NixOS 或 WSL `< 2.4`，须清晰告知官方声明式包/`wsl --update` 提示，不下载不兼容的 glibc 二进制或私自改系统配置。
+3. **WSL 网络模式保持默认 `NAT` 即可**：本插件基于宿主机 `wsl.exe` 管道与 WSL 内 `AF_UNIX` UDS 代理运行，**完全不强制要求 `mirrored` 网络模式**；日常开发及手机/USB 联调测试优先推荐保持默认 `NAT`。
+4. **严禁私改共享配置、严禁使用 `--shutdown`、严禁卸载脚本**：`/etc/wsl.conf` 与 `%USERPROFILE%\.wslconfig` 由官方 WSL Settings / WSL Manager 共用，只作 `0400`/只读备份；如确需重启目标发行版仅使用 `wsl.exe --terminate <目标发行版>`；绝对禁止 `wsl --shutdown`、`--unregister` 或非 `-DryRun` 卸载命令。
 
-### 执行步骤
+---
 
-#### 第一步：只读探测（无需修改任何文件）
-1. 在 Windows 宿主机运行 `wsl.exe -l -v`（以及只读查询 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss\*` 获取迁移后的 `BasePath`），过滤掉 `docker-desktop` / `docker-desktop-data` 等内部发行版。
-2. 如果已有目标 WSL 2 发行版，执行只读探针（务必带 `--cd ~` 避免锁定当前 Windows 目录）：
+### 强制四步执行清单
+
+#### 步骤 1/4：只读探测并确认 3 项选型
+1. 独立执行 `wsl.exe -l -v`（如需识别 WSL Manager 迁移磁盘路径，再独立查询只读 `HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss`），过滤掉 `docker-desktop` 等容器内部实例。
+2. 对用户指定的目标发行版执行单条只读探针（必须带 `--cd ~`）：
    ```powershell
-   wsl.exe -d <distro> --cd ~ -- sh -c 'id; cat /etc/os-release 2>/dev/null | head -n 3; uname -r; uname -m; command -v bwrap prlimit socat node python3 git rg fdfind fd jq uv go cargo mise || true'
+   wsl.exe -d <distro> --cd ~ -- sh -c 'id; head -n 3 /etc/os-release 2>/dev/null; uname -r; uname -m; command -v bwrap prlimit socat node python3 git rg fdfind fd jq uv go cargo mise || true'
    ```
-3. 向用户确认 3 个选项：
-   - **目标发行版**：复用现有任意 WSL 2 发行版（含 WSL Manager 迁移实例），还是安装干净的官方新发行版（默认推荐 `Ubuntu-26.04`，也可选 `Ubuntu-24.04`、`Debian`、`FedoraLinux-42`、`Arch`、`kali-linux` 等）？
-   - **环境档位（真正按档位安装并持久化到 `profile.json`）**：
-     - `core`（~350MB，约 2 分钟）：`bwrap` + `prlimit` + `socat` + Codex 高频 CLI（`git`/`rg`/`fd`/`jq`/`sqlite3`/`rsync`/`ctags` 等）+ C/C++ 基础 + `python3` + 共用已有 Linux Node `>=22`（若无则装 Node 24 Active LTS）。
-     - `standard`（~1.2GB，推荐）：`core` + `ccache`/`protobuf`/`libpq`/`libxml2` + `mise` + `uv`/`pytest`/`ruff`/`mypy`/`pyright`/`black` + `pnpm`/`yarn`/`bun`/`typescript`/`eslint`/`prettier` + Go/`golangci-lint` + Rust（`rustc`/`cargo`/`rustfmt`/`clippy`）。
-     - `universal`（~3.5GB，纯预编译二进制）：`standard` + `clang`/`clang-format`/`clang-tidy` + `bazelisk` + `mise` Node 22/24 LTS（默认 `node@24`）+ `poetry`/`isort` + OpenJDK 21 + `maven`/`gradle` + `ruby` + `php-cli`/`composer`。
-   - **国内网络加速**：是否开启 `--mirror cn`（清华 APT/PyPI、`UV_PYTHON_INSTALL_MIRROR`、`npmmirror`、`goproxy.cn`、`rsproxy.cn`），以及是否需要透传宿主机本地代理（例如 `http://127.0.0.1:7890`）？
+3. 与用户确认：**目标 WSL 2 发行版**、**工具链档位（`core` ~350MB / `standard` ~1.2GB / `universal` ~3.5GB）**、以及**是否开启 `--mirror cn` / `--proxy`**。
 
-#### 第二步：原生 ext4 部署与分步幂等安装（每步可断点续跑）
-在 Windows PowerShell 一步完成动态探测、原生 ext4 分发（零 `/mnt` 锁定）与按档位安装：
+#### 步骤 2/4：强制 `-DryRun` 预览与固定格式确认卡片
+先独立运行一次 `-DryRun` 预览命令（不写入配置、不改动系统）：
 ```powershell
-.\packages\bootstrap\install-dsh-plugin.ps1 -Distro <目标发行版> -Profile <core|standard|universal> -Mirror <global|cn> -Provision
+.\packages\bootstrap\install-dsh-plugin.ps1 -NonInteractive -Distro <目标发行版> -Profile <core|standard|universal> -Mirror <global|cn> -Provision -DryRun
 ```
-或在 WSL 内直接调用分步脚本（支持 `--step all|base|cli|node|python|go|rust|go-rust|extra`）：
-```bash
-bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --profile <core|standard|universal> [--mirror cn] [--proxy <代理>] [--step all|base|cli|node|python|go|rust|extra]
+执行完成后，按固定格式向用户展示确认卡片并**等待用户回复同意**：
+```markdown
+### 【安装脚本与变更预览卡片】
+- **目标 WSL 2 发行版**：<Distro>
+- **环境档位 / 镜像源 / 代理**：<core|standard|universal> / <global|cn> / <无或代理URL>
+- **WSL 网络模式建议**：保持默认 `NAT`（无需改 `mirrored`）
+- **原始 WSL 配置只读备份**：`%USERPROFILE%\.wslconfig` 与 `/etc/wsl.conf` -> `<backupDir>`
+- **原生 ext4 部署路径**：`$HOME/.local/share/dsh-wsl-sandbox/runner/`
+- **脚本 SHA-256 与 `-DryRun` 摘要**：<附上刚才 -DryRun 输出的 SHA-256 与计划命令>
+- **将申请单次审批的命令**：`.\packages\bootstrap\install-dsh-plugin.ps1 -NonInteractive -Distro <Distro> -Profile <...> -Mirror <...> -Provision`
+请确认后回复“确认安装”。
 ```
 
-#### 第三步：闭环验证
-在目标 WSL 2 发行版内运行：
-```bash
-node ~/.local/share/dsh-wsl-sandbox/runner/dist/packages/bootstrap/src/doctor.js --strict-wsl2 --profile <所选档位> --json
+#### 步骤 3/4：分步单次人工审批安装
+仅在用户明确回复同意后，申请执行真实安装（每次均走人类单次 `allow-once` 审批；若需分步可加 `-Step base|cli|node|python|go|rust|extra`）：
+```powershell
+.\packages\bootstrap\install-dsh-plugin.ps1 -NonInteractive -Distro <目标发行版> -Profile <core|standard|universal> -Mirror <global|cn> -Provision
 ```
-汇总输出沙盒内核自检结果、配置目录遮蔽与 ACL 状态、USBIP/内核驱动提示（区分手机 ADB/Fastboot/EDL `libusb` 节点与依赖 Windows 驱动的网卡/OEM 工具）以及当前档位对应的工具链版本矩阵；如有任一安全红线未通过，明确标注 `blocked` 原因与最小修复命令。
+
+#### 步骤 4/4：闭环实机验收
+```powershell
+wsl.exe -d <目标发行版> --cd ~ -- node ~/.local/share/dsh-wsl-sandbox/runner/dist/packages/bootstrap/src/doctor.js --strict-wsl2 --profile <所选档位> --json
+```
+核验 `os.isWsl2`、`user.nonRoot`、`sandbox.unprivilegedUserns`、`seccompIoUringBlocked`、`seccompAfVsockBlocked`、`escapeMaskSelfTest`、`configMaskSelfTest` 与 `configDirPermsOk` 全部通过；随后首次 `wsl_bash` 绑定成功后引导通道自动关闭。

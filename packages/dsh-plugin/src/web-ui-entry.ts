@@ -1,14 +1,12 @@
 /**
- * Self-contained HTML/CSS/JS control panel served at `/wsl-sandbox/ui`.
+ * `/wsl-sandbox/ui` 独立 HTML/CSS/JS 控制面板。
  *
- * Visual design strictly matches official DSH Purge / DSH Marketplace dark obsidian hierarchy:
- * - Zero emojis, zero Tailwind dependency, pure scoped `.dsh-wsl-sbx-*` CSS (`z-index <= 850`).
- * - Internal `revision` and `generation` counters stay strictly under the hood; the UI displays
- *   clear human-friendly sync state (`已生效` / `待点击应用`).
- * - Basic settings expose all 16 configuration controls while completely hiding `/mnt` full-drive mounts.
- * - Advanced controls remain collapsed inside `<details class="dsh-wsl-sbx-advanced">` by default.
- * - Live `/wsl-sandbox/api/*` wiring for Status, 4-Decision Approvals, Shares, Devices, SSRF Network,
- *   WSL Doctor, Package Cache Clear, Emergency Kill, and Audit Log.
+ * 视觉规范严格对齐 DSH Purge / DSH Marketplace 暗色层级：
+ * - 零 Emoji、零 Tailwind 外部依赖，全局部隔离 `.dsh-wsl-sbx-*` 样式类（`z-index <= 850`）。
+ * - 内部 `revision` 与 `generation` 计数器严格收拢在后端，主界面仅展示友好同步状态（`已生效` / `待点击应用`）。
+ * - 基础策略页暴露全部基础开关，但彻底隐藏 `/mnt` 全盘挂载入口。
+ * - 高级共享与物理硬件控制默认折叠于 `<details class="dsh-wsl-sbx-advanced">` 内部。
+ * - 内置 **简体中文 | English** 界面概览与主导航一键切换，实时联动 `/wsl-sandbox/api/*`。
  */
 
 import type { DshCordisContext } from './cordis-types.ts';
@@ -38,9 +36,16 @@ export function apply(ctx: DshCordisContext, config: WebUiPluginConfig = {}): vo
       }
     }
   } catch {
-    // Route already registered by main host entry (`web-api.ts`) — idempotent no-op
+    // 路由已由主宿主入口（`web-api.ts`）注册，此处保持幂等跳过
   }
-  ctx.logger?.info(`[dsh-wsl-sandbox-web-ui] UI active at ${uiPath} (z-index cap ${config.zIndexCap ?? 850})`);
+  const rawLogger = ctx.logger as unknown;
+  const scopedLogger =
+    typeof rawLogger === 'function'
+      ? (rawLogger as (n: string) => { info?: (m: string) => void })('dsh-wsl-sandbox-web-ui')
+      : (rawLogger as { info?: (m: string) => void } | undefined);
+  if (typeof scopedLogger?.info === 'function') {
+    scopedLogger.info(`[dsh-wsl-sandbox-web-ui] UI active at ${uiPath} (z-index cap ${config.zIndexCap ?? 850})`);
+  }
 }
 
 export function renderWslSandboxUiHtml(): string {
@@ -173,19 +178,23 @@ export function renderWslSandboxUiHtml(): string {
   <div class="dsh-wsl-sbx-shell">
     <div class="dsh-wsl-sbx-brand">
       <div class="dsh-wsl-sbx-brand-title">
-        <span>WSL 2 沙箱</span>
-        <span style="font-size:12.5px;font-weight:400;color:var(--text-secondary)">内核命名空间执行后端、单壳方言防呆与物理硬件单次门禁</span>
+        <span id="brandTitle">WSL 2 沙箱</span>
+        <span id="brandSub" style="font-size:12.5px;font-weight:400;color:var(--text-secondary)">内核命名空间执行后端、单壳方言防呆与物理硬件单次门禁</span>
       </div>
-      <span class="dsh-wsl-sbx-mono" style="font-size:12px;color:var(--text-secondary)">dsh-wsl-sandbox v0.2.0</span>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="dsh-wsl-sbx-mono" style="font-size:12px;color:var(--text-secondary)">dsh-wsl-sandbox v0.3.0</span>
+        <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" id="langBtn-zh" style="padding:3px 9px;font-size:11.5px" onclick="setUiLang('zh')">简体中文</button>
+        <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" id="langBtn-en" style="padding:3px 9px;font-size:11.5px" onclick="setUiLang('en')">English</button>
+      </div>
     </div>
 
     <div class="dsh-wsl-sbx-tabs">
-      <button class="dsh-wsl-sbx-tab is-active" onclick="sbxTab('status', this)">状态</button>
-      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('approvals', this)">审批队列 <span id="tabCnt">(0)</span></button>
-      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('settings', this)">基础策略与高级共享</button>
-      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('doctor', this)">内核体检</button>
-      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('logs', this)">运行日志</button>
-      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('audit', this)">审计明细</button>
+      <button class="dsh-wsl-sbx-tab is-active" onclick="sbxTab('status', this)"><span id="tabLbl-status">状态</span></button>
+      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('approvals', this)"><span id="tabLbl-approvals">审批队列</span> <span id="tabCnt">(0)</span></button>
+      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('settings', this)"><span id="tabLbl-settings">基础策略与高级共享</span></button>
+      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('doctor', this)"><span id="tabLbl-doctor">内核体检</span></button>
+      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('logs', this)"><span id="tabLbl-logs">运行日志</span></button>
+      <button class="dsh-wsl-sbx-tab" onclick="sbxTab('audit', this)"><span id="tabLbl-audit">审计明细</span></button>
     </div>
 
     <div class="dsh-wsl-sbx-tel">
@@ -196,20 +205,26 @@ export function renderWslSandboxUiHtml(): string {
       <span>配置状态 <b id="telSync">已生效</b></span>
     </div>
 
-    <div class="dsh-wsl-sbx-notice" id="notice"><span id="noticeMsg"></span><button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="document.getElementById('notice').classList.remove('is-visible')">关闭</button></div>
+    <div class="dsh-wsl-sbx-notice" id="notice"><span id="noticeMsg"></span><button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" id="btn-notice-close" onclick="document.getElementById('notice').classList.remove('is-visible')">关闭</button></div>
 
     <main class="dsh-wsl-sbx-panel">
       <div class="dsh-wsl-sbx-head">
         <h1 class="dsh-wsl-sbx-title" id="pTitle">沙箱状态</h1>
         <div class="dsh-wsl-sbx-actions">
-          <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" onclick="saveBasic()">应用</button>
-          <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="loadStatus()">还原</button>
-          <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-danger" onclick="emergencyKill()">熔断强杀</button>
+          <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" id="btn-apply" onclick="saveBasic()">应用</button>
+          <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" id="btn-reset" onclick="loadStatus(true)">还原</button>
+          <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-danger" id="btn-kill" onclick="emergencyKill()">熔断强杀</button>
         </div>
       </div>
 
       <!-- Status -->
       <section class="dsh-wsl-sbx-pane is-active" id="pane-status">
+        <div class="dsh-wsl-sbx-card" id="sbxIntroBanner" style="border-color:var(--border-default);margin-bottom:14px">
+          <div style="font-weight:600;margin-bottom:4px" id="introTitle">WSL 2 沙箱后端概览 (v0.3.0)</div>
+          <div style="color:var(--text-secondary);font-size:12.5px;line-height:1.55" id="introBody">
+            将 AI 的文件读写、构建与终端执行统一收敛到 WSL 2 原生 Linux 命名空间内（bubblewrap + seccomp-bpf + UDS 白名单代理），自动遮蔽 Windows 全盘（/mnt）与敏感配置目录（~/.dsh / ~/.ssh），并在宿主侧挂载微软官方 PowerShell AST 单壳防呆守卫与物理硬件/驱动单次人工审批锁。右上角可切换简体中文与英文说明。
+          </div>
+        </div>
         <div class="dsh-wsl-sbx-hero">
           <div><span style="font-size:26px;font-weight:700" class="dsh-wsl-sbx-mono" id="layerBig">6</span> <span>/ 6 层内核与单壳防线就位</span></div>
           <div class="dsh-wsl-sbx-bar"><i id="layerBar" style="width:100%"></i></div>
@@ -306,6 +321,38 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
               <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" onclick="quickAddShare()">挂载此目录</button>
             </div>
             <div id="quickSharesBox" style="margin-top:10px"></div>
+          </div>
+        </div>
+
+        <!-- Controlled AI Bootstrap Channel + Script Preview (Eliminates dual-entry conflict) -->
+        <div class="dsh-wsl-sbx-card" id="bootstrapCard" style="border-color:var(--border-default)">
+          <div style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px">
+            <div>
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <b id="bsCardTitle">受控 AI 初始化引导与安装脚本预览</b>
+                <span class="dsh-wsl-sbx-pill" id="bsPhasePill">已锁定关闭（仅授权人工手动或先开闸）</span>
+              </div>
+              <div style="color:var(--text-secondary);font-size:12px;margin-top:4px" id="bsCardDesc">
+                彻底消除「人工脚本 vs AI Skill」冲突：默认态 L0 机械锁定安装脚本（<code>install-dsh-plugin.ps1</code> / <code>provision-wsl.sh</code>）；点击下方按钮可先审阅完整安装脚本与 SHA-256 哈希，再开启限时 20 分钟「受控引导通道」（严格强制 1 探测 -&gt; 2 <code>-DryRun</code> 预览确认卡 -&gt; 3 单次审批安装 -&gt; 4 <code>doctor</code> 闭环自动关闸）。常规测试与 USB 联调推荐保持 WSL 2 默认 <b>NAT</b> 网络模式。
+              </div>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+              <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" id="bsBtnPreview" onclick="loadBootstrapPreview(true)">预览安装脚本与 SHA-256</button>
+              <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" id="bsBtnOpen" onclick="toggleBootstrapChannel(true)">开启受控引导通道并复制会话指令</button>
+              <button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" id="bsBtnClose" style="display:none" onclick="toggleBootstrapChannel(false)">关闭引导通道</button>
+            </div>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:8px">
+            <span style="font-size:12px;color:var(--text-secondary)">锁定目标发行版（留空则探测后再确认）:</span>
+            <input class="dsh-wsl-sbx-input dsh-wsl-sbx-mono" style="max-width:260px" id="bs-target-distro" placeholder="如 Ubuntu-26.04 / Debian" />
+            <span class="dsh-wsl-sbx-mono" id="bsTimerHint" style="font-size:11.5px;color:var(--text-secondary)"></span>
+          </div>
+          <div id="bsPreviewWrap" style="display:none;border-top:1px solid var(--border-subtle);padding-top:10px;margin-top:8px">
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px" id="bsScriptTabs"></div>
+            <div class="dsh-wsl-sbx-mono" id="bsScriptMeta" style="font-size:11.5px;color:var(--text-secondary);margin-bottom:6px"></div>
+            <pre class="dsh-wsl-sbx-cmd" id="bsScriptCode" style="max-height:260px;overflow:auto;white-space:pre"></pre>
+            <div style="font-size:11.5px;color:var(--text-secondary);margin-top:6px">可直接复制给 AI 会话的受控初始化指令：</div>
+            <pre class="dsh-wsl-sbx-cmd" id="bsPromptBox" style="white-space:pre-wrap"></pre>
           </div>
         </div>
       </section>
@@ -465,8 +512,107 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
     const H = { 'Content-Type': 'application/json', 'X-DSH-WSL-Client': '1' };
     let discoveredDistros = [];
     let currentTab = 'status';
+    let uiLang = 'zh';
+    let formDirty = false;
+    const UI_I18N = {
+      zh: {
+        brandTitle: 'WSL 2 沙箱',
+        brandSub: '内核命名空间执行后端、单壳方言防呆与物理硬件单次门禁',
+        introTitle: 'WSL 2 沙箱后端概览 (v0.3.0)',
+        introBody: '将 AI 的文件读写、构建与终端执行统一收敛到 WSL 2 原生 Linux 命名空间内（bubblewrap + seccomp-bpf + UDS 白名单代理），自动遮蔽 Windows 全盘（/mnt）与敏感配置目录（~/.dsh / ~/.ssh），并在宿主侧挂载微软官方 PowerShell AST 单壳防呆守卫与物理硬件/驱动单次人工审批锁。右上角可切换简体中文与英文说明。',
+        apply: '应用',
+        reset: '还原',
+        kill: '熔断强杀',
+        close: '关闭',
+        tabs: {
+          status: '状态',
+          approvals: '审批队列',
+          settings: '基础策略与高级共享',
+          doctor: '内核体检',
+          logs: '运行日志',
+          audit: '审计明细'
+        },
+        titles: {
+          status: '沙箱状态',
+          approvals: '审批队列',
+          settings: '基础策略与高级共享',
+          doctor: '内核体检',
+          logs: '运行日志',
+          audit: '审计明细'
+        },
+        bsTitle: '受控 AI 初始化引导与安装脚本预览',
+        bsPreviewBtn: '预览安装脚本与 SHA-256',
+        bsOpenBtn: '开启受控引导通道并复制会话指令',
+        bsCloseBtn: '关闭引导通道'
+      },
+      en: {
+        brandTitle: 'WSL 2 Sandbox',
+        brandSub: 'Linux namespace execution backend, single-shell AST dialect guard & single-shot hardware approval',
+        introTitle: 'WSL 2 Sandbox Overview (v0.3.0)',
+        introBody: 'Confines agent file operations, builds, and shell execution inside a WSL 2 Linux namespace (bubblewrap + seccomp-bpf + UDS allowlist proxy), masks Windows drives (/mnt) and sensitive directories (~/.dsh / ~/.ssh), and enforces official Microsoft PowerShell AST guards plus physical hardware single-shot approvals.',
+        apply: 'Apply',
+        reset: 'Reset',
+        kill: 'Emergency Kill',
+        close: 'Close',
+        tabs: {
+          status: 'Status',
+          approvals: 'Approvals',
+          settings: 'Policy & Shares',
+          doctor: 'WSL Doctor',
+          logs: 'Logs',
+          audit: 'Audit Log'
+        },
+        titles: {
+          status: 'Sandbox Status',
+          approvals: 'Approval Queue',
+          settings: 'Basic Policy & Advanced Shares',
+          doctor: 'Kernel & Toolchain Doctor',
+          logs: 'Runtime Logs',
+          audit: 'Audit Records'
+        },
+        bsTitle: 'Controlled AI Bootstrap Channel & Script Preview',
+        bsPreviewBtn: 'Preview Installer Scripts & SHA-256',
+        bsOpenBtn: 'Open Bootstrap Channel & Copy Session Prompt',
+        bsCloseBtn: 'Close Bootstrap Channel'
+      }
+    };
+    let bootstrapPreviewData = null;
+    let activePreviewIdx = 0;
+    function setUiLang(lang) {
+      uiLang = lang === 'en' ? 'en' : 'zh';
+      const d = UI_I18N[uiLang];
+      const byId = (id) => document.getElementById(id);
+      if (byId('brandTitle')) byId('brandTitle').textContent = d.brandTitle;
+      if (byId('brandSub')) byId('brandSub').textContent = d.brandSub;
+      if (byId('introTitle')) byId('introTitle').textContent = d.introTitle;
+      if (byId('introBody')) byId('introBody').textContent = d.introBody;
+      if (byId('btn-apply')) byId('btn-apply').textContent = d.apply;
+      if (byId('btn-reset')) byId('btn-reset').textContent = d.reset;
+      if (byId('btn-kill')) byId('btn-kill').textContent = d.kill;
+      if (byId('btn-notice-close')) byId('btn-notice-close').textContent = d.close;
+      if (byId('bsCardTitle')) byId('bsCardTitle').textContent = d.bsTitle;
+      if (byId('bsBtnPreview')) byId('bsBtnPreview').textContent = d.bsPreviewBtn;
+      if (byId('bsBtnOpen')) byId('bsBtnOpen').textContent = d.bsOpenBtn;
+      if (byId('bsBtnClose')) byId('bsBtnClose').textContent = d.bsCloseBtn;
+      for (const k of ['status', 'approvals', 'settings', 'doctor', 'logs', 'audit']) {
+        const el = byId('tabLbl-' + k);
+        if (el) el.textContent = d.tabs[k];
+      }
+      if (byId('pTitle')) byId('pTitle').textContent = d.titles[currentTab] || d.titles.status;
+      if (byId('langBtn-zh')) {
+        byId('langBtn-zh').className = 'dsh-wsl-sbx-btn ' + (uiLang === 'zh' ? 'dsh-wsl-sbx-btn-apply' : 'dsh-wsl-sbx-btn-sec');
+      }
+      if (byId('langBtn-en')) {
+        byId('langBtn-en').className = 'dsh-wsl-sbx-btn ' + (uiLang === 'en' ? 'dsh-wsl-sbx-btn-apply' : 'dsh-wsl-sbx-btn-sec');
+      }
+    }
     function esc(s) {
-      return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
     }
     function msg(t) {
       document.getElementById('noticeMsg').textContent = t;
@@ -474,13 +620,26 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
     }
     function sbxTab(id, btn) {
       currentTab = id;
+      const d = UI_I18N[uiLang] || UI_I18N.zh;
+      const titleEl = document.getElementById('pTitle');
+      if (titleEl) titleEl.textContent = d.titles[id] || d.titles.status;
       document.querySelectorAll('.dsh-wsl-sbx-pane').forEach(p => p.classList.toggle('is-active', p.id === 'pane-' + id));
       document.querySelectorAll('.dsh-wsl-sbx-tab').forEach(b => b.classList.toggle('is-active', b === btn));
       if (id === 'logs') loadLogs();
     }
     async function api(method, url, body) {
       const r = await fetch(url, { method, headers: H, body: body ? JSON.stringify(body) : undefined });
-      return r.json();
+      const text = await r.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch {
+        data = { ok: false, error: { message: text || ('HTTP ' + r.status) } };
+      }
+      if (!r.ok && data && data.ok !== false) {
+        return { ok: false, error: data.error || { message: 'HTTP ' + r.status } };
+      }
+      return data;
     }
     async function refreshDistros(notify) {
       const r = await api('GET', '/wsl-sandbox/api/distros');
@@ -497,7 +656,7 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
           if (d.isDefault) tags.push('默认');
           if (d.isCustomDiskLocation) tags.push('已迁移/WSL Manager: ' + d.basePath);
           const selected = d.name === cur ? ' selected' : '';
-          return '<option value="' + d.name.replace(/"/g, '&quot;') + '"' + selected + '>' + d.name + ' (' + tags.join(' · ') + ')</option>';
+          return '<option value="' + esc(d.name) + '"' + selected + '>' + esc(d.name) + ' (' + esc(tags.join(' · ')) + ')</option>';
         }).join('');
       }
       if (notify) msg('已探测到 ' + discoveredDistros.length + ' 个 WSL 发行版。');
@@ -506,6 +665,7 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
       const sel = document.getElementById('in-distro-select');
       const name = sel ? sel.value : '';
       if (!name) return;
+      formDirty = true;
       document.getElementById('in-distro').value = name;
       const meta = discoveredDistros.find(d => d.name === name);
       const hint = document.getElementById('distroMetaHint');
@@ -583,23 +743,25 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
       msg('已清空内存与本地轮转日志。');
       loadLogs();
     }
-    async function loadStatus() {
+    async function loadStatus(forceSync) {
       const [st, ap, au] = await Promise.all([
         api('GET', '/wsl-sandbox/api/status'),
         api('GET', '/wsl-sandbox/api/approvals'),
         api('GET', '/wsl-sandbox/api/audit')
       ]);
       if (!st.ok) return;
+      if (forceSync) formDirty = false;
       const c = st.config;
       const nr = st.nodeRuntime || {};
       document.getElementById('telDistro').textContent = c.distro + (c.username ? ' · ' + c.username : '') + ' · ' + (c.environmentProfile || 'standard');
       document.getElementById('telWs').textContent = c.workspaceRoot;
       document.getElementById('telNode').textContent = 'Host ' + (nr.hostNodeVersion || '-') + (nr.wslNodeVersion ? (' / WSL ' + nr.wslNodeVersion) : ' (DSH 进程共用)');
-      document.getElementById('telSync').textContent = c.enabled ? '已生效' : '已停用';
+      document.getElementById('telSync').textContent = formDirty ? '待点击应用' : (c.enabled ? '已生效' : '已停用');
       document.getElementById('tabCnt').textContent = '(' + (ap.pending || []).length + ')';
       document.getElementById('stPending').textContent = String((ap.pending || []).length);
       document.getElementById('stRules').textContent = String((ap.sessionRules || []).length);
       document.getElementById('stAdv').textContent = c.advanced.shares.length + ' / ' + c.advanced.deviceNodes.length;
+      renderBootstrapStatus(st.bootstrap, c);
 
       const cmdPre = document.getElementById('wslConfCmdPre');
       if (cmdPre) {
@@ -617,48 +779,50 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
         bkInput.value = c.backupDir || '';
       }
 
-      document.getElementById('in-enabled').checked = c.enabled;
-      document.getElementById('in-pwsh').checked = c.enablePwshGuard;
-      document.getElementById('in-prompt').checked = c.enablePromptInjection;
-      document.getElementById('in-mirror').checked = c.mirrorCn;
-      document.getElementById('in-transport').value = c.transportMode;
-      document.getElementById('in-distro').value = c.distro;
-      document.getElementById('in-profile').value = c.environmentProfile || 'standard';
-      document.getElementById('in-user').value = c.username || '';
-      document.getElementById('in-ws').value = c.workspaceRoot;
-      document.getElementById('in-runner').value = c.runnerPath;
-      document.getElementById('in-ttl').value = c.approvalTimeoutMs;
-      document.getElementById('in-smode').value = c.sandboxMode;
-      document.getElementById('in-amode').value = c.approvalPolicyMode;
-      document.getElementById('in-nmode').value = c.networkMode;
-      document.getElementById('in-proxy').value = c.upstreamProxy || '';
-      document.getElementById('in-cmode').value = c.cacheMode;
-      document.getElementById('in-loglevel').value = c.logLevel || 'info';
-      document.getElementById('in-unmask').value = (c.unmaskedEnvWorkspaces || []).join(', ');
-      document.getElementById('dev-list').value = c.advanced.deviceNodes.map(d => d.path).join(', ');
-      document.getElementById('adv-cidrs').value = c.advanced.localLabCidrs.join(', ');
-      document.getElementById('adv-ports').value = c.advanced.localLabPorts.join(', ');
-      document.getElementById('adv-domains').value = c.advanced.customAllowedDomains.join(', ');
+      if (forceSync || !formDirty) {
+        document.getElementById('in-enabled').checked = c.enabled;
+        document.getElementById('in-pwsh').checked = c.enablePwshGuard;
+        document.getElementById('in-prompt').checked = c.enablePromptInjection;
+        document.getElementById('in-mirror').checked = c.mirrorCn;
+        document.getElementById('in-transport').value = c.transportMode;
+        document.getElementById('in-distro').value = c.distro;
+        document.getElementById('in-profile').value = c.environmentProfile || 'standard';
+        document.getElementById('in-user').value = c.username || '';
+        document.getElementById('in-ws').value = c.workspaceRoot;
+        document.getElementById('in-runner').value = c.runnerPath;
+        document.getElementById('in-ttl').value = c.approvalTimeoutMs;
+        document.getElementById('in-smode').value = c.sandboxMode;
+        document.getElementById('in-amode').value = c.approvalPolicyMode;
+        document.getElementById('in-nmode').value = c.networkMode;
+        document.getElementById('in-proxy').value = c.upstreamProxy || '';
+        document.getElementById('in-cmode').value = c.cacheMode;
+        document.getElementById('in-loglevel').value = c.logLevel || 'info';
+        document.getElementById('in-unmask').value = (c.unmaskedEnvWorkspaces || []).join(', ');
+        document.getElementById('dev-list').value = c.advanced.deviceNodes.map(d => d.path).join(', ');
+        document.getElementById('adv-cidrs').value = c.advanced.localLabCidrs.join(', ');
+        document.getElementById('adv-ports').value = c.advanced.localLabPorts.join(', ');
+        document.getElementById('adv-domains').value = c.advanced.customAllowedDomains.join(', ');
+      }
 
       const shareRowsHtml = c.advanced.shares.map(s =>
         '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border-subtle)">' +
         '<span class="dsh-wsl-sbx-mono">/shares/' + esc(s.alias) + ' &lt;- ' + esc(s.sourceLinuxPath) + ' (' + esc(s.mode) + ')</span>' +
-        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="delShare(\\'' + s.id + '\\')">取消挂载</button></div>'
+        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" data-share-id="' + esc(s.id) + '" onclick="delShare(this.dataset.shareId)">取消挂载</button></div>'
       ).join('') || '<span style="color:var(--text-muted);font-size:12px">当前未挂载任何外部目录（所有 Windows 盘符对 AI 完全不可见）</span>';
       document.getElementById('sharesBox').innerHTML = shareRowsHtml;
       const qkBox = document.getElementById('quickSharesBox');
       if (qkBox) qkBox.innerHTML = shareRowsHtml;
 
       document.getElementById('pendingBox').innerHTML = (ap.pending || []).map(p =>
-        '<div class="dsh-wsl-sbx-card">' +
+        '<div class="dsh-wsl-sbx-card" data-req-id="' + esc(p.requestId) + '">' +
         '<div style="display:flex;justify-content:space-between"><b>' + esc(p.summary) + '</b><span class="dsh-wsl-sbx-mono" style="color:var(--text-muted)">' + esc(p.requestId) + '</span></div>' +
         '<pre class="dsh-wsl-sbx-cmd">' + esc(p.command || '') + '</pre>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">' +
-        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" onclick="decide(\\'' + p.requestId + '\\',\\'allow-once\\')">允许一次</button>' +
-        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" ' + (p.touchesPhysicalDevice || !p.allowSessionRuleOption ? 'disabled' : '') + ' onclick="decide(\\'' + p.requestId + '\\',\\'allow-session-rule\\')">' + (p.touchesPhysicalDevice ? '硬件锁死单次' : '允许会话前缀') + '</button>' +
-        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" onclick="decide(\\'' + p.requestId + '\\',\\'deny\\')">拒绝</button>' +
-        '<input class="dsh-wsl-sbx-input" style="max-width:220px" id="gd-' + p.requestId + '" placeholder="输入修改意见..." />' +
-        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" onclick="decide(\\'' + p.requestId + '\\',\\'deny-with-guidance\\')">附意见打回</button>' +
+        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-apply" data-decision="allow-once" onclick="decideFromBtn(this)">允许一次</button>' +
+        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" ' + (p.touchesPhysicalDevice || !p.allowSessionRuleOption ? 'disabled' : '') + ' data-decision="allow-session-rule" onclick="decideFromBtn(this)">' + (p.touchesPhysicalDevice ? '硬件锁死单次' : '允许会话前缀') + '</button>' +
+        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-out-danger" data-decision="deny" onclick="decideFromBtn(this)">拒绝</button>' +
+        '<input class="dsh-wsl-sbx-input" style="max-width:220px" data-role="guidance" placeholder="输入修改意见..." />' +
+        '<button class="dsh-wsl-sbx-btn dsh-wsl-sbx-btn-sec" data-decision="deny-with-guidance" onclick="decideFromBtn(this)">附意见打回</button>' +
         '</div></div>'
       ).join('') || '<div class="dsh-wsl-sbx-card" style="color:var(--text-secondary)">当前无待处理的审批请求。</div>';
 
@@ -688,14 +852,21 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
         unmaskedEnvWorkspaces: document.getElementById('in-unmask').value.split(',').map(s => s.trim()).filter(Boolean)
       });
       msg(r.ok ? '基础配置已保存并生效。' : ('保存失败: ' + (r.error && r.error.message)));
-      loadStatus();
+      loadStatus(Boolean(r.ok));
     }
-    async function decide(id, decision) {
-      const g = document.getElementById('gd-' + id);
+    function decideFromBtn(btn) {
+      const card = btn && btn.closest ? btn.closest('[data-req-id]') : null;
+      if (!card) return;
+      const id = card.getAttribute('data-req-id') || '';
+      const decision = btn.getAttribute('data-decision') || '';
+      const g = card.querySelector('[data-role="guidance"]');
+      return decide(id, decision, g ? g.value.trim() : undefined);
+    }
+    async function decide(id, decision, guidance) {
       await api('POST', '/wsl-sandbox/api/approvals/' + encodeURIComponent(id) + '/decide', {
-        decision, guidance: g ? g.value.trim() : undefined
+        decision, guidance
       });
-      loadStatus();
+      loadStatus(false);
     }
     async function clearSessionRules() { await api('DELETE', '/wsl-sandbox/api/session-rules'); msg('已清空会话规则。'); loadStatus(); }
     async function emergencyKill() { await api('POST', '/wsl-sandbox/api/session/invalidate'); msg('已仅熔断当前 DSH 会话内的沙箱进程组（不影响其他会话或人工 WSL 终端）。'); loadStatus(); }
@@ -760,18 +931,113 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
         : ('拦截: ' + (r.error && r.error.message)));
     }
     document.addEventListener('input', function (ev) {
-      if (ev.target && ev.target.id === 'bk-dir') ev.target.dataset.dirty = '1';
+      if (!ev.target) return;
+      if (ev.target.id === 'bk-dir') ev.target.dataset.dirty = '1';
+      if (/^(?:in-|dev-list$|adv-)/.test(ev.target.id || '')) {
+        formDirty = true;
+        const syncEl = document.getElementById('telSync');
+        if (syncEl) syncEl.textContent = '待点击应用';
+      }
+    });
+    document.addEventListener('change', function (ev) {
+      if (ev.target && /^(?:in-|dev-list$|adv-)/.test(ev.target.id || '')) {
+        formDirty = true;
+        const syncEl = document.getElementById('telSync');
+        if (syncEl) syncEl.textContent = '待点击应用';
+      }
     });
     function toggleWslConfCmd() {
       const el = document.getElementById('wslConfCmdBox');
       if (el) el.style.display = el.style.display === 'none' ? 'block' : 'none';
     }
-    async function delShare(id) { await api('DELETE', '/wsl-sandbox/api/advanced/shares/' + encodeURIComponent(id)); msg('已取消挂载并仅终止当前会话的旧沙箱进程。'); loadStatus(); }
+    function renderBootstrapStatus(bs, cfg) {
+      const pill = document.getElementById('bsPhasePill');
+      const closeBtn = document.getElementById('bsBtnClose');
+      const timerHint = document.getElementById('bsTimerHint');
+      const distroIn = document.getElementById('bs-target-distro');
+      if (distroIn && !distroIn.dataset.dirty && !distroIn.value && cfg && cfg.distro) {
+        distroIn.value = cfg.distro;
+      }
+      if (!pill) return;
+      if (!bs || !bs.active) {
+        pill.textContent = '已锁定关闭（常态 L0 禁用 AI 自主运行安装脚本）';
+        pill.style.color = 'var(--text-secondary)';
+        if (closeBtn) closeBtn.style.display = 'none';
+        if (timerHint) timerHint.textContent = '';
+        return;
+      }
+      const phaseNames = {
+        '1-probe': '步骤 1/4: 探测就绪 · 等待 -DryRun 预览',
+        '2-previewed': '步骤 2/4: 已预览 -DryRun · 可申请单次安装审批',
+        '3-installing': '步骤 3/4: 受控单次安装确认'
+      };
+      pill.textContent = (phaseNames[bs.phase] || bs.phase) + (bs.targetDistro ? (' [' + bs.targetDistro + ']') : '');
+      pill.style.color = 'var(--ok)';
+      if (closeBtn) closeBtn.style.display = 'inline-block';
+      if (timerHint) {
+        const mins = Math.max(0, Math.ceil((bs.remainingMs || 0) / 60000));
+        timerHint.textContent = '限时通道剩余 ' + mins + ' 分钟（首次绑定就绪后自动关闭）';
+      }
+    }
+    function selectPreviewScript(idx) {
+      activePreviewIdx = idx;
+      if (!bootstrapPreviewData || !bootstrapPreviewData.scripts) return;
+      const list = bootstrapPreviewData.scripts;
+      const tabs = document.getElementById('bsScriptTabs');
+      const meta = document.getElementById('bsScriptMeta');
+      const code = document.getElementById('bsScriptCode');
+      const cur = list[idx] || list[0];
+      if (tabs) {
+        tabs.innerHTML = list.map((s, i) =>
+          '<button class="dsh-wsl-sbx-btn ' + (i === idx ? 'dsh-wsl-sbx-btn-apply' : 'dsh-wsl-sbx-btn-sec') + '" onclick="selectPreviewScript(' + i + ')">' + esc(s.relPath) + '</button>'
+        ).join('');
+      }
+      if (cur && meta && code) {
+        meta.textContent = cur.title + ' · SHA-256: ' + (cur.sha256 || 'N/A') + ' · ' + cur.lines + ' 行 (' + cur.bytes + ' 字节) · 路径: ' + cur.fullPath;
+        code.textContent = cur.content || '';
+      }
+    }
+    async function loadBootstrapPreview(showNotice) {
+      const d = (document.getElementById('bs-target-distro').value || '').trim();
+      const qs = d ? ('?distro=' + encodeURIComponent(d)) : '';
+      const r = await api('GET', '/wsl-sandbox/api/bootstrap-preview' + qs);
+      if (!r.ok) { msg('加载脚本预览失败'); return; }
+      bootstrapPreviewData = r;
+      const wrap = document.getElementById('bsPreviewWrap');
+      if (wrap) wrap.style.display = 'block';
+      selectPreviewScript(activePreviewIdx);
+      const pbox = document.getElementById('bsPromptBox');
+      if (pbox) pbox.textContent = r.recommendedSessionPrompt || '';
+      if (showNotice) msg('已加载安装脚本源码与 SHA-256 摘要（零宿主进程执行）。');
+    }
+    async function toggleBootstrapChannel(open) {
+      const targetDistro = (document.getElementById('bs-target-distro').value || '').trim() || undefined;
+      const r = await api('POST', '/wsl-sandbox/api/bootstrap-session', {
+        action: open ? 'open' : 'close',
+        targetDistro
+      });
+      if (!r.ok) {
+        msg('操作失败: ' + (r.error && r.error.message));
+        return;
+      }
+      if (open) {
+        await loadBootstrapPreview(false);
+        const promptText = (bootstrapPreviewData && bootstrapPreviewData.recommendedSessionPrompt) || '';
+        if (promptText && navigator.clipboard && navigator.clipboard.writeText) {
+          try { await navigator.clipboard.writeText(promptText); } catch {}
+        }
+        msg('已开启 20 分钟受控引导通道并复制初始化会话指令（仍强制先 -DryRun 预览 + 单次审批）。');
+      } else {
+        msg('已关闭受控 AI 初始化引导通道。');
+      }
+      loadStatus(false);
+    }
+    async function delShare(id) { await api('DELETE', '/wsl-sandbox/api/advanced/shares/' + encodeURIComponent(id)); msg('已取消挂载并仅终止当前会话的旧沙箱进程。'); loadStatus(false); }
     async function saveDevices() {
       const nodes = document.getElementById('dev-list').value.split(',').map(s => s.trim()).filter(Boolean).map(p => ({ path: p }));
       const r = await api('PUT', '/wsl-sandbox/api/advanced/devices', { deviceNodes: nodes });
       msg(r.ok ? '已更新物理设备白名单。' : ('拦截: ' + (r.error && r.error.message)));
-      loadStatus();
+      loadStatus(Boolean(r.ok));
     }
     async function saveAdvNet() {
       const r = await api('PUT', '/wsl-sandbox/api/advanced/network', {
@@ -780,7 +1046,7 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
         customAllowedDomains: document.getElementById('adv-domains').value.split(',').map(s => s.trim()).filter(Boolean)
       });
       msg(r.ok ? '已更新高级网络白名单。' : ('拦截: ' + (r.error && r.error.message)));
-      loadStatus();
+      loadStatus(Boolean(r.ok));
     }
     async function loadFootprint() {
       const box = document.getElementById('footprintBox');
@@ -810,10 +1076,10 @@ wsl.exe --terminate &lt;当前发行版&gt;</pre>
         d.tools.map(t => '<tr><td class="dsh-wsl-sbx-mono">' + esc(t.name) + '</td><td>' + esc(t.tier) + '</td><td class="dsh-wsl-sbx-mono">' + esc(t.version || '-') + '</td><td>' + (t.present ? '就绪' : '未安装') + '</td></tr>').join('') +
         '</tbody></table>';
     }
-    loadStatus().then(() => { refreshBackups(); refreshDistros(false); });
+    loadStatus(true).then(() => { refreshBackups(); refreshDistros(false); });
     setInterval(function () {
       if (document.hidden) return;
-      loadStatus();
+      loadStatus(false);
       if (currentTab === 'logs') loadLogs();
     }, 5000);
   </script>

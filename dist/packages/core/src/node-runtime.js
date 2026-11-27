@@ -5,22 +5,18 @@ import { isValidDistroName, isValidLinuxUsername } from './binding.js';
 import { failSandbox } from './errors.js';
 
 /**
- * Shared Node.js runtime discovery & carrier helpers for `dsh-wsl-sandbox`.
+ * `dsh-wsl-sandbox` 共用 Node.js 运行时探测与进程载体工具。
  *
- * Design goals:
- * 1. Host side (Windows / Desktop / Web / Headless CLI):
- *    - `dsh-wsl-sandbox` runs 100% in-process inside DeepSeek Harness (`@deepseek-ai/dsh`, Node 20.11+ /
- *      22 LTS / 24 LTS) with ZERO native C++ addons and ZERO external npm runtime dependencies,
- *      sharing the exact same Node instance as DSH core and all peer DSH plugins.
- *    - Any local helper subprocess (`local-linux` runner, doctor, tests) reuses DSH's own carrier
- *      (`process.execPath`), automatically injecting `ELECTRON_RUN_AS_NODE=1` when hosted inside
- *      Electron (DSH Desktop) and scrubbing host `NODE_OPTIONS`/`TSX_*` inspector flags (matching
- *      `@deepseek-ai/dsh-subprocess-local`).
- * 2. WSL 2 Linux side:
- *    - Automatically discovers and shares any compatible Linux `node` (`>= 20`) already installed
- *      inside WSL by DSH headless/remote (`~/.dsh/runtime/bin`), `mise`, `nvm`, `fnm`, `volta`,
- *      `asdf`, or distro packages (`/usr/local/bin/node`, `/usr/bin/node`), avoiding duplicate Node
- *      installs and strictly rejecting `/mnt/*` Windows `.exe` binaries (including via symlinks).
+ * 设计目标：
+ * 1. Windows 宿主机侧（Desktop / Web / Headless CLI）：
+ *    - 本插件以纯 TypeScript 在 DeepSeek Harness（`@deepseek-ai/dsh`，Node >=20.11 / 22 LTS / 24 LTS）
+ *      进程内直接运行，零 C++ 原生扩展、零第三方 npm 运行时依赖，与核心框架及其他插件共用同一运行时实例。
+ *    - 子进程按需复用宿主 `process.execPath`（Electron 桌面端自动注入 `ELECTRON_RUN_AS_NODE=1`），并剥离
+ *      `NODE_OPTIONS` / `TSX_*` 等调试 Hook 注入面。
+ * 2. WSL 2 Linux 侧：
+ *    - 在非登录 Shell 中主动发现并复用已安装的原生 Linux `node`（`>= 20`，优先 DSH `~/.dsh/runtime/bin`、
+ *      `mise`、`nvm`、`fnm`、`volta`、`asdf`、NixOS `/run/current-system/sw/bin` 与 `~/.nix-profile/bin`
+ *      以及发行版系统包），严格拦截并拒绝任何 `/mnt/*` 下的 Windows `.exe`（含符号链接穿透）。
  */
 
                                         
@@ -104,11 +100,14 @@ export const WSL_SHARED_NODE_REL_DIRS                    = [
   '.fnm/aliases/default/bin',
   '.volta/bin',
   '.asdf/shims',
+  '.nix-profile/bin',
 ];
 
 export const WSL_SYSTEM_NODE_DIRS                    = [
   '/opt/dsh-toolchain/shims',
   '/opt/dsh-toolchain/bin',
+  '/run/current-system/sw/bin',
+  '/nix/var/nix/profiles/default/bin',
   '/usr/local/bin',
   '/usr/bin',
   '/bin',
@@ -166,6 +165,11 @@ export function findLocalLinuxSharedNode(homeDir = os.homedir())                
   pushSortedVersions(path.join(homeDir, '.fnm', 'node-versions'), ['installation', 'bin', 'node']);
   pushSortedVersions(path.join(homeDir, '.asdf', 'installs', 'nodejs'), ['bin', 'node']);
 
+  const homeUser = path.posix.basename(homeDir.replace(/\/+$/, ''));
+  if (homeUser && homeUser !== '/') {
+    candidates.push(`/etc/profiles/per-user/${homeUser}/bin/node`);
+  }
+
   for (const sysDir of WSL_SYSTEM_NODE_DIRS) {
     candidates.push(path.posix.join(sysDir, 'node'));
   }
@@ -188,28 +192,26 @@ export function findLocalLinuxSharedNode(homeDir = os.homedir())                
 }
 
 /**
- * POSIX `sh -c` bootstrap script used after `wsl.exe -d <Distro> --cd ~ --` to locate a shared
- * Linux `node` (`>= 20`) across `.dsh-wsl-env.sh`, DSH runtime dirs, `mise`, `nvm`, `fnm`, `volta`,
- * `asdf`, and `/usr/bin`, then `exec` in-place (preserving exact PID and clean stdio, ZERO shell interpolation).
- *
- * Positional args passed to `sh -c <script> dsh-wsl-node <nodeSpec> <scriptPath> [...extraArgs]`:
- *   $1 = nodeExecutable ('auto' | 'node' | '/abs/path/to/node')
- *   $2 = target JS script path (e.g. runner `main.js` or `doctor.js`)
- *   $@ (after shift 2) = arguments forwarded to target JS script
+ * 在 `wsl.exe -d <Distro> --cd ~ --` 后执行的 POSIX `sh -c` 启动脚本：
+ * 主动切回 `$HOME`（兼容 `< 2.4` 旧版 WSL）、剥离 `/mnt/*` 宿主机 `PATH`，并跨 `.dsh-wsl-env.sh`、
+ * `~/.dsh/runtime/bin`、`mise`、`nvm`、`fnm`、`volta`、`asdf`、NixOS profile 与 `/usr/bin` 查找共享 Linux Node，
+ * 随后以 `exec` 原地替换进程（保持精确 PID，零 Shell 字符串插值）。
  */
 export const WSL_SHARED_NODE_EXEC_SH = [
+  'cd "$HOME" 2>/dev/null || true',
   'NODE_SPEC="$1"',
   'TARGET_SCRIPT="$2"',
   'shift 2',
   '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true',
-  // Strip any /mnt/* Windows PATH entries before resolving Linux `node` so we never hit Windows node.exe
+  'NIX_USER="${USER:-${HOME##*/}}"',
+  // 剥离所有 /mnt/* Windows PATH 条目，杜绝误调 Windows node.exe
   'CLEAN_PATH=""',
   'OLD_IFS="$IFS"; IFS=":"',
   'for p in $PATH; do',
   '  case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac',
   'done',
   'IFS="$OLD_IFS"',
-  'EXTRA_PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.local/share/fnm/aliases/default/bin:$HOME/.fnm/aliases/default/bin:$HOME/.volta/bin:$HOME/.asdf/shims:/opt/dsh-toolchain/shims:/opt/dsh-toolchain/bin:/usr/local/bin:/usr/bin:/bin"',
+  'EXTRA_PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/go/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.local/share/fnm/aliases/default/bin:$HOME/.fnm/aliases/default/bin:$HOME/.volta/bin:$HOME/.asdf/shims:$HOME/.nix-profile/bin:/etc/profiles/per-user/$NIX_USER/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/opt/dsh-toolchain/shims:/opt/dsh-toolchain/bin:/usr/local/bin:/usr/bin:/bin"',
   'export PATH="$EXTRA_PATH${CLEAN_PATH:+:$CLEAN_PATH}"',
   'is_valid_node() {',
   '  c="$1"',
@@ -228,7 +230,7 @@ export const WSL_SHARED_NODE_EXEC_SH = [
   'if [ -n "$NODE_SPEC" ] && [ "$NODE_SPEC" != "auto" ] && [ "$NODE_SPEC" != "node" ]; then',
   '  NODE_BIN="$NODE_SPEC"',
   'else',
-  '  for d in "$HOME/.dsh/runtime/bin" "$HOME/.local/share/dsh/node/bin" "$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin" "$HOME/.local/share/mise/shims" "$HOME/.local/bin" "$HOME/.nvm/current/bin" "$HOME/.local/share/fnm/aliases/default/bin" "$HOME/.fnm/aliases/default/bin" "$HOME/.volta/bin" "$HOME/.asdf/shims"; do',
+  '  for d in "$HOME/.dsh/runtime/bin" "$HOME/.local/share/dsh/node/bin" "$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin" "$HOME/.local/share/mise/shims" "$HOME/.local/bin" "$HOME/.nvm/current/bin" "$HOME/.local/share/fnm/aliases/default/bin" "$HOME/.fnm/aliases/default/bin" "$HOME/.volta/bin" "$HOME/.asdf/shims" "$HOME/.nix-profile/bin" "/etc/profiles/per-user/$NIX_USER/bin" "/run/current-system/sw/bin"; do',
   '    if is_valid_node "$d/node"; then NODE_BIN="$d/node"; break; fi',
   '  done',
   '  if [ -z "$NODE_BIN" ] && [ -d "$HOME/.nvm/versions/node" ]; then',

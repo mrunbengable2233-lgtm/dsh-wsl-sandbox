@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-// Zero-dependency ESM + DSH Client Bundle build script.
-// 1. Dynamically loads Node built-in `stripTypeScriptTypes` (falls back gracefully to prebuilt `dist/`
-//    when running on an older Node runtime if `dist/` + `client.js` are already present).
-// 2. Compiles `packages/**.ts` -> `dist/packages/**.js` AND `tests/**.ts` -> `.cache/compiled-tests/**.mjs`
-//    so the test suite can run even on Node runtimes without native `.ts` execution.
-// 3. Emits normalized root `client.js` with single-line `window.__ModuleLoader__.load(...)` header.
+// 零第三方依赖 ESM 与 DSH 前端模块构建脚本：
+// 1. 动态加载 Node 内置 `stripTypeScriptTypes`（若旧版 Node 不支持且 `dist/` 与 `client.js` 已存在则安全复用预编译产物）。
+// 2. 将 `packages/**.ts` 编译为 `dist/packages/**.js`，并将 `tests/**.ts` 预编译至 `.cache/compiled-tests/**.mjs`，
+//    使整套测试无需额外 TypeScript 工具即可在主流 Node 运行时直接执行。
+// 3. 输出带单行 `window.__ModuleLoader__.load(...)` 头部标记的根目录 `client.js`。
 import fs from 'node:fs';
 import path from 'node:path';
 
