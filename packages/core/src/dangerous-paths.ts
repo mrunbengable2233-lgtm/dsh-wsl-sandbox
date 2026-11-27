@@ -15,6 +15,9 @@ export const DANGEROUS_FILES = [
   '.profile',
   '.ripgreprc',
   '.mcp.json',
+  '.envrc',
+  '.ignore',
+  '.rgignore',
 ] as const;
 
 export const DANGEROUS_DIRECTORIES = [
@@ -25,6 +28,9 @@ export const DANGEROUS_DIRECTORIES = [
   '.idea',
   '.claude/commands',
   '.claude/agents',
+  '.claude/settings.json',
+  '.claude/settings.local.json',
+  '.cursor/mcp.json',
   '.agents',
   '.codex',
   '.gemini',
@@ -108,14 +114,25 @@ export function isMaskedEnvRead(
 }
 
 /**
- * Scan workspace up to maxDepth (default 3) for .env / .env.* secret files.
+ * Scan workspace up to maxDepth (default 8) for .env / .env.* secret files,
+ * safely following symlinks with cycle detection via visited realpaths.
  * Returns paths sorted by ascending length so shallow bindings apply first.
  */
-export function scanEnvSecretFiles(workspaceRoot: string, maxDepth = 3): string[] {
+export function scanEnvSecretFiles(workspaceRoot: string, maxDepth = 8): string[] {
   const found: string[] = [];
+  const visitedDirs = new Set<string>();
 
   function walk(currentDir: string, depth: number): void {
     if (depth > maxDepth) return;
+    let realDir: string;
+    try {
+      realDir = fs.realpathSync(currentDir);
+    } catch {
+      return;
+    }
+    if (visitedDirs.has(realDir)) return;
+    visitedDirs.add(realDir);
+
     let entries: fs.Dirent[];
     try {
       entries = fs.readdirSync(currentDir, { withFileTypes: true });
@@ -124,11 +141,16 @@ export function scanEnvSecretFiles(workspaceRoot: string, maxDepth = 3): string[
     }
     for (const entry of entries) {
       const fullPath = posix.join(currentDir, entry.name);
-      if (entry.isSymbolicLink()) continue;
-      if (entry.isDirectory()) {
+      let st: fs.Stats;
+      try {
+        st = fs.statSync(fullPath);
+      } catch {
+        continue; // Broken symlink or inaccessible entry
+      }
+      if (st.isDirectory()) {
         if (ENV_SCAN_SKIP_DIRS.has(entry.name)) continue;
         walk(fullPath, depth + 1);
-      } else if (entry.isFile() && isEnvSecretFilename(entry.name)) {
+      } else if (st.isFile() && isEnvSecretFilename(entry.name)) {
         found.push(fullPath);
       }
     }

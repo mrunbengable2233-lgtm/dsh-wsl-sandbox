@@ -8,6 +8,7 @@ import { failSandbox } from './errors.js';
 
 // Classic BPF opcodes (<linux/filter.h>)
 const BPF_LD_W_ABS = 0x20;
+const BPF_ALU_AND_K = 0x54;
 const BPF_JMP_JA = 0x05;
 const BPF_JMP_JEQ_K = 0x15;
 const BPF_JMP_JGE_K = 0x35;
@@ -18,6 +19,7 @@ const OFF_NR = 0;
 const OFF_ARCH = 4;
 const OFF_ARG0_LO = 16;
 const OFF_ARG0_HI = 20;
+const OFF_ARG1_LO = 24;
 
 // Audit architecture identifiers (<linux/audit.h>)
 export const AUDIT_ARCH_X86_64 = 0xc000003e;
@@ -26,9 +28,18 @@ export const X32_SYSCALL_BIT = 0x40000000;
 
 // Socket address families (<linux/socket.h>)
 export const AF_UNIX = 1;
+export const AF_INET = 2;
+export const AF_INET6 = 10;
 export const AF_NETLINK = 16;
 export const AF_PACKET = 17;
 export const AF_VSOCK = 40;
+
+// Dangerous terminal ioctl request codes
+export const TIOCSTI = 0x5412;
+export const TIOCLINUX = 0x541c;
+
+// CLONE_NEWNS | CLONE_NEWCGROUP | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET
+export const CLONE_NEW_FLAGS_MASK = 0x7e020000;
 
 // Seccomp verdicts (<linux/seccomp.h>)
 export const SECCOMP_RET_KILL_PROCESS = 0x80000000;
@@ -36,24 +47,32 @@ export const SECCOMP_RET_ERRNO = 0x00050000;
 export const SECCOMP_RET_ALLOW = 0x7fff0000;
 export const EPERM = 1;
 export const EACCES = 13;
+export const ENOSYS = 38;
 
                                
                              
                               
+                         
                           
                               
+                         
+                          
                                              
  
 
 export const X86_64_SYSCALLS               = {
   auditArch: AUDIT_ARCH_X86_64,
   rejectX32: true,
+  ioctl: 16,
   socket: 41,
   socketpair: 53,
+  clone: 56,
+  clone3: 435,
   deniedSyscalls: [
     101, // ptrace
     155, // pivot_root
     161, // chroot
+    163, // acct
     165, // mount
     166, // umount2
     167, // swapon
@@ -61,11 +80,13 @@ export const X86_64_SYSCALLS               = {
     169, // reboot
     175, // init_module
     176, // delete_module
+    179, // quotactl
     246, // kexec_load
     248, // add_key
     249, // request_key
     250, // keyctl
     272, // unshare
+    298, // perf_event_open
     308, // setns
     310, // process_vm_readv
     311, // process_vm_writev
@@ -73,26 +94,36 @@ export const X86_64_SYSCALLS               = {
     313, // finit_module
     320, // kexec_file_load
     321, // bpf
+    323, // userfaultfd
     425, // io_uring_setup
     426, // io_uring_enter
     427, // io_uring_register
     428, // open_tree
     429, // move_mount
     430, // fsopen
+    431, // fsconfig
     432, // fsmount
+    433, // fspick
+    442, // mount_setattr
+    443, // quotactl_fd
   ],
 };
 
 export const AARCH64_SYSCALLS               = {
   auditArch: AUDIT_ARCH_AARCH64,
   rejectX32: false,
+  ioctl: 29,
   socket: 198,
   socketpair: 199,
+  clone: 220,
+  clone3: 435,
   deniedSyscalls: [
     39,  // umount2
     40,  // mount
     41,  // pivot_root
     51,  // chroot
+    60,  // quotactl
+    89,  // acct
     97,  // unshare
     104, // kexec_load
     105, // init_module
@@ -104,12 +135,14 @@ export const AARCH64_SYSCALLS               = {
     219, // keyctl
     224, // swapon
     225, // swapoff
+    241, // perf_event_open
     268, // setns
     270, // process_vm_readv
     271, // process_vm_writev
     272, // kcmp
     273, // finit_module
     280, // bpf
+    282, // userfaultfd
     294, // kexec_file_load
     425, // io_uring_setup
     426, // io_uring_enter
@@ -117,7 +150,11 @@ export const AARCH64_SYSCALLS               = {
     428, // open_tree
     429, // move_mount
     430, // fsopen
+    431, // fsconfig
     432, // fsmount
+    433, // fspick
+    442, // mount_setattr
+    443, // quotactl_fd
   ],
 };
 
@@ -138,6 +175,10 @@ class BpfAssembler {
 
   ldWordAbs(offset        )       {
     this.items.push({ kind: 'inst', inst: { code: BPF_LD_W_ABS, k: offset } });
+  }
+
+  aluAnd(value        )       {
+    this.items.push({ kind: 'inst', inst: { code: BPF_ALU_AND_K, k: value >>> 0 } });
   }
 
   jeq(value        , jtLabel         , jfLabel         )       {
@@ -217,18 +258,26 @@ class BpfAssembler {
      
                                                                                 
                                                                                       
-                                                                                        
+                                                                                                   
      
                                         
+     
+                                                                                       
+                                                                                            
+                                                                               
+     
+                                      
  
 
 export function compileSeccompBpf(options                       )         {
   const table = options.arch === 'aarch64' ? AARCH64_SYSCALLS : X86_64_SYSCALLS;
   const asm = new BpfAssembler();
 
-  // 1. Validate architecture strictly
+  // 1. Validate architecture strictly (inline KILL right after check so jf never exceeds 255)
   asm.ldWordAbs(OFF_ARCH);
-  asm.jeq(table.auditArch, undefined, 'kill');
+  asm.jeq(table.auditArch, 'arch_ok');
+  asm.ret(SECCOMP_RET_KILL_PROCESS);
+  asm.label('arch_ok');
 
   // 2. Load syscall number
   asm.ldWordAbs(OFF_NR);
@@ -242,12 +291,21 @@ export function compileSeccompBpf(options                       )         {
   asm.jeq(table.socket, 'check_socket');
   asm.jeq(table.socketpair, 'check_socket');
 
-  // 5. Block dangerous syscalls unconditionally (io_uring, ptrace, mount, bpf, keyctl, ...)
+  // 5. Inspect ioctl request against TIOCSTI / TIOCLINUX
+  asm.jeq(table.ioctl, 'check_ioctl');
+
+  // 6. Optional user-namespace clone / clone3 defense when --disable-userns is unavailable
+  if (options.blockUsernsClone) {
+    asm.jeq(table.clone3, 'deny_enosys');
+    asm.jeq(table.clone, 'check_clone');
+  }
+
+  // 7. Block dangerous syscalls unconditionally (io_uring, ptrace, mount, bpf, keyctl, ...)
   for (const nr of table.deniedSyscalls) {
     asm.jeq(nr, 'deny_eperm');
   }
 
-  // 6. Default allow
+  // 8. Default allow
   asm.jmp('allow');
 
   // Socket domain validation
@@ -258,13 +316,30 @@ export function compileSeccompBpf(options                       )         {
   // Always block AF_VSOCK (WSL 2 Hyper-V/host escape channel) and AF_PACKET (raw packet sniffing)
   asm.jeq(AF_VSOCK, 'deny_eperm');
   asm.jeq(AF_PACKET, 'deny_eperm');
+  // Allow AF_UNIX (UDS proxy & local IPC) and AF_NETLINK (isolated empty netns glibc compat)
+  asm.jeq(AF_UNIX, 'allow');
+  asm.jeq(AF_NETLINK, 'allow');
   if (options.blockNetworkSockets) {
-    // Allow AF_UNIX (UDS proxy & local IPC) and AF_NETLINK (isolated empty netns glibc compat)
-    asm.jeq(AF_UNIX, 'allow');
-    asm.jeq(AF_NETLINK, 'allow');
     asm.jmp('deny_eacces');
   } else {
-    asm.jmp('allow');
+    // Allow only AF_INET / AF_INET6 inside isolated --unshare-net loopback bridge; reject exotic families
+    asm.jeq(AF_INET, 'allow');
+    asm.jeq(AF_INET6, 'allow');
+    asm.jmp('deny_eacces');
+  }
+
+  // ioctl TIOCSTI / TIOCLINUX validation
+  asm.label('check_ioctl');
+  asm.ldWordAbs(OFF_ARG1_LO);
+  asm.jeq(TIOCSTI, 'deny_eperm');
+  asm.jeq(TIOCLINUX, 'deny_eperm');
+  asm.jmp('allow');
+
+  if (options.blockUsernsClone) {
+    asm.label('check_clone');
+    asm.ldWordAbs(OFF_ARG0_LO);
+    asm.aluAnd(CLONE_NEW_FLAGS_MASK);
+    asm.jeq(0, 'allow', 'deny_eperm');
   }
 
   asm.label('allow');
@@ -276,8 +351,10 @@ export function compileSeccompBpf(options                       )         {
   asm.label('deny_eacces');
   asm.ret(SECCOMP_RET_ERRNO | EACCES);
 
-  asm.label('kill');
-  asm.ret(SECCOMP_RET_KILL_PROCESS);
+  if (options.blockUsernsClone) {
+    asm.label('deny_enosys');
+    asm.ret(SECCOMP_RET_ERRNO | ENOSYS);
+  }
 
   return asm.assemble();
 }

@@ -38,9 +38,9 @@ export const WSL_DISPLAY_AUDIO_PATHS = [
  
 
 export const DEFAULT_RLIMITS               = Object.freeze({
-  nproc: 256,
-  nofile: 1024,
-  fsizeBytes: 512 * 1024 * 1024, // 512 MiB
+  nproc: 4096,
+  nofile: 8192,
+  fsizeBytes: 8 * 1024 * 1024 * 1024, // 8 GiB
 });
 
                             
@@ -57,6 +57,10 @@ export const SENSITIVE_HOME_CONFIG_DIRS = [
   '.aws',
   '.kube',
   '.docker',
+  '.config/gh',
+  '.claude',
+  '.codex',
+  '.gemini',
 ]         ;
 
 export const SENSITIVE_HOME_CREDENTIAL_FILES = [
@@ -66,6 +70,11 @@ export const SENSITIVE_HOME_CREDENTIAL_FILES = [
   '.pypirc',
   '.bash_history',
   '.zsh_history',
+  '.dsh-wsl-env.sh',
+  '.cargo/credentials.toml',
+  '.cargo/credentials',
+  '.yarnrc.yml',
+  '.gem/credentials',
 ]         ;
 
                                   
@@ -96,6 +105,10 @@ export const SENSITIVE_HOME_CREDENTIAL_FILES = [
                                                 
                                                                            
                                                                                              
+                                                                                       
+                                                                                            
+                                                                                   
+                                                
                                                                                                  
                                                   
  
@@ -161,11 +174,24 @@ function defaultLstatKind(p        )                                            
   }
 }
 
+function defaultStatKind(p        )                                                         {
+  try {
+    const st = fs.statSync(p);
+    if (st.isDirectory()) return 'dir';
+    if (st.isFile()) return 'file';
+    if (st.isSocket()) return 'socket';
+    return 'other';
+  } catch {
+    return null;
+  }
+}
+
 export function discoverSocketsToMask(
   env                                              ,
   extraSockets                    = [],
   realpathSync                        = (p) => fs.realpathSync(p),
   existsSync                         = (p) => fs.existsSync(p),
+  homeDir         ,
 )           {
   const candidates = new Set        (HIGH_RISK_SYSTEM_SOCKETS);
   const xdg = env.XDG_RUNTIME_DIR;
@@ -181,6 +207,11 @@ export function discoverSocketsToMask(
     if (gpgSock && gpgSock.startsWith('/')) {
       candidates.add(gpgSock);
     }
+  }
+  const effectiveHome = homeDir ?? env.HOME;
+  if (effectiveHome && effectiveHome.startsWith('/') && effectiveHome !== '/') {
+    candidates.add(posix.join(effectiveHome, '.1password', 'agent.sock'));
+    candidates.add(posix.join(effectiveHome, '.ssh', 'agent.sock'));
   }
   for (const s of extraSockets) {
     if (s.startsWith('/')) candidates.add(s);
@@ -215,7 +246,24 @@ export function buildBwrapArgs(input                 )                   {
   const exists = input.existsSync ?? ((p        ) => fs.existsSync(p));
   const realpath = input.realpathSync ?? ((p        ) => fs.realpathSync(p));
   const lstatKind = input.lstatKind ?? defaultLstatKind;
+  const statKind = input.statKind ?? ((p        )                                                         => {
+    if (input.lstatKind) {
+      const lk = input.lstatKind(p);
+      if (lk === 'symlink') {
+        try {
+          const rp = realpath(p);
+          if (rp !== p) return input.lstatKind(rp);
+        } catch {
+          return null;
+        }
+      }
+      return lk;
+    }
+    return defaultStatKind(p);
+  });
   const rootEntries = input.rootEntries ?? readLinuxRootEntries();
+  const emptyMask = input.emptyMaskFilePath ?? '/dev/null';
+  const effectiveHome = input.homeDir ?? input.env.HOME;
 
   const args           = [];
 
@@ -256,12 +304,36 @@ export function buildBwrapArgs(input                 )                   {
   args.push('--tmpfs', '/run');
   args.push('--tmpfs', '/mnt');
 
-  // 4. Mask any extra non-/run, non-/tmp, non-/mnt high-risk sockets (e.g. custom SSH_AUTH_SOCK)
+  // NixOS-WSL compatibility: keep /run/current-system accessible after masking /run
+  if (lstatKind('/run/current-system') !== null) {
+    args.push('--ro-bind', '/run/current-system', '/run/current-system');
+  }
+
+  // /etc/resolv.conf dangling symlink fix: keep /run & /mnt completely empty while binding
+  // resolved resolv.conf in allowlist-proxy mode, or masking empty in offline mode.
+  const resolvKind = lstatKind('/etc/resolv.conf');
+  if (input.networkMode === 'offline') {
+    if (resolvKind === 'file' || resolvKind === 'symlink') {
+      args.push('--ro-bind', emptyMask, '/etc/resolv.conf');
+    }
+  } else if (resolvKind === 'file' || resolvKind === 'symlink' || exists('/etc/resolv.conf')) {
+    try {
+      const resolvedResolv = realpath('/etc/resolv.conf');
+      if (resolvedResolv !== '/etc/resolv.conf' && exists(resolvedResolv)) {
+        args.push('--ro-bind', resolvedResolv, '/etc/resolv.conf');
+      }
+    } catch {
+      // Ignore broken/unresolvable host /etc/resolv.conf
+    }
+  }
+
+  // 4. Mask any extra non-/run, non-/tmp, non-/mnt high-risk sockets (e.g. custom SSH_AUTH_SOCK, agent.sock)
   const maskedSockets = discoverSocketsToMask(
-    process.env,
+    { ...process.env, ...input.env },
     input.extraSocketsToMask ?? [],
     realpath,
     exists,
+    effectiveHome,
   );
   for (const sock of maskedSockets) {
     if (
@@ -272,33 +344,78 @@ export function buildBwrapArgs(input                 )                   {
     ) {
       continue; // already hidden under fresh empty tmpfs
     }
-    args.push('--ro-bind', '/dev/null', sock);
+    args.push('--ro-bind', emptyMask, sock);
   }
 
-  // 4b. Mask private user config & credential directories under $HOME so sandboxed AI has ZERO read/write access
-  //     to plugin config/backups (~/.dsh, ~/.config/dsh-wsl-sandbox) or host credentials (~/.ssh, ~/.aws, etc.).
+  // 4b. Mask private user config & credential directories under $HOME (including symlinked dirs/files)
+  //     so sandboxed AI has ZERO read/write access to plugin config/backups or host credentials.
   const maskedConfigPaths           = [];
-  const effectiveHome = input.homeDir ?? input.env.HOME;
   if (effectiveHome && effectiveHome.startsWith('/') && effectiveHome !== '/') {
-    const emptyMask = input.emptyMaskFilePath ?? '/dev/null';
+    const isHiddenTmpfs = (p        )          =>
+      p.startsWith('/tmp/') ||
+      p.startsWith('/var/tmp/') ||
+      p.startsWith('/run/') ||
+      p.startsWith('/var/run/') ||
+      p.startsWith('/mnt/');
+    const overlapsWorkspaceOrCache = (p        )          =>
+      input.workspaceRoot === p ||
+      input.workspaceRoot.startsWith(p + '/') ||
+      (Boolean(input.cacheDir) && (input.cacheDir === p || input.cacheDir .startsWith(p + '/')));
+
     for (const relDir of SENSITIVE_HOME_CONFIG_DIRS) {
       const target = posix.join(effectiveHome, relDir);
-      if (
-        input.workspaceRoot === target ||
-        input.workspaceRoot.startsWith(target + '/') ||
-        (input.cacheDir && (input.cacheDir === target || input.cacheDir.startsWith(target + '/')))
-      ) {
-        continue;
+      if (overlapsWorkspaceOrCache(target)) continue;
+      if (!exists(target) || statKind(target) !== 'dir') continue;
+
+      let resolved = target;
+      try {
+        resolved = realpath(target);
+      } catch {
+        resolved = target;
       }
-      if (lstatKind(target) === 'dir') {
-        args.push('--tmpfs', target);
-        args.push('--remount-ro', target);
+
+      if (lstatKind(target) === 'symlink' && resolved !== target) {
+        if (
+          !overlapsWorkspaceOrCache(resolved) &&
+          resolved !== '/' &&
+          resolved !== effectiveHome &&
+          !isHiddenTmpfs(resolved)
+        ) {
+          args.push('--tmpfs', resolved, '--remount-ro', resolved);
+          maskedConfigPaths.push(resolved);
+        }
+        maskedConfigPaths.push(target);
+      } else {
+        args.push('--tmpfs', target, '--remount-ro', target);
         maskedConfigPaths.push(target);
       }
     }
+
     for (const relFile of SENSITIVE_HOME_CREDENTIAL_FILES) {
       const target = posix.join(effectiveHome, relFile);
-      if (lstatKind(target) === 'file') {
+      if (!exists(target) || statKind(target) !== 'file') continue;
+
+      let resolved = target;
+      try {
+        resolved = realpath(target);
+      } catch {
+        resolved = target;
+      }
+
+      if (lstatKind(target) === 'symlink' && resolved !== target) {
+        if (
+          !overlapsWorkspaceOrCache(resolved) &&
+          resolved !== '/' &&
+          resolved !== effectiveHome &&
+          resolved !== '/dev/null' &&
+          resolved !== emptyMask &&
+          !isHiddenTmpfs(resolved)
+        ) {
+          args.push('--ro-bind', emptyMask, resolved);
+          maskedConfigPaths.push(resolved);
+        }
+        maskedConfigPaths.push(target);
+      } else {
         args.push('--ro-bind', emptyMask, target);
         maskedConfigPaths.push(target);
       }
@@ -327,12 +444,12 @@ export function buildBwrapArgs(input                 )                   {
   // Lock `/` itself read-only after creating top-level mountpoints (`/shares`, `/run`, `/mnt`, etc.)
   args.push('--remount-ro', '/');
 
-  // 7. Workspace & isolated cache (workspace-write only for rw)
+  // 7. Workspace & isolated cache (workspace-write rw; read-only always binds workspaceRoot ro)
   if (input.mode === 'workspace-write') {
     args.push('--bind', input.workspaceRoot, input.workspaceRoot);
 
     for (const extraRoot of input.additionalWritableRoots ?? []) {
-      const kind = lstatKind(extraRoot);
+      const kind = statKind(extraRoot);
       if (kind !== 'dir') {
         failSandbox('SANDBOX_PREPARATION_FAILED', `additionalWritableRoot must be a physical directory: ${extraRoot}`);
       }
@@ -342,8 +459,7 @@ export function buildBwrapArgs(input                 )                   {
     if (input.cacheDir) {
       args.push('--bind', input.cacheDir, input.cacheDir);
     }
-  } else if (input.workspaceRoot.startsWith('/tmp/')) {
-    // Even in read-only mode, if workspace lives under /tmp (e.g. test dirs), expose it read-only
+  } else {
     args.push('--ro-bind', input.workspaceRoot, input.workspaceRoot);
   }
 
@@ -351,17 +467,54 @@ export function buildBwrapArgs(input                 )                   {
   const protectedPaths           = [];
   const createdPlaceholders           = [];
   if (input.mode === 'workspace-write') {
-    const emptyMask = input.emptyMaskFilePath ?? '/dev/null';
+    // Git worktree / submodule `.git` file + optional `gitdir:` target inside workspaceRoot
+    const dotGitPath = posix.join(input.workspaceRoot, '.git');
+    if (lstatKind(dotGitPath) === 'file') {
+      if (exists(dotGitPath)) {
+        args.push('--ro-bind', dotGitPath, dotGitPath);
+        protectedPaths.push(dotGitPath);
+        try {
+          const readText = input.readFileSync ?? ((p        ) => fs.readFileSync(p, 'utf8'));
+          const content = readText(dotGitPath);
+          const m = content.match(/^gitdir:\s*(.+)$/im);
+          if (m && m[1]) {
+            const rawGitDir = m[1].trim();
+            const resolvedGitDir = rawGitDir.startsWith('/')
+              ? posix.normalize(rawGitDir)
+              : posix.normalize(posix.join(input.workspaceRoot, rawGitDir));
+            const normRoot = posix.normalize(input.workspaceRoot);
+            if (
+              (resolvedGitDir === normRoot || resolvedGitDir.startsWith(normRoot + '/')) &&
+              resolvedGitDir !== normRoot &&
+              exists(resolvedGitDir)
+            ) {
+              args.push('--ro-bind', resolvedGitDir, resolvedGitDir);
+              protectedPaths.push(resolvedGitDir);
+            }
+          }
+        } catch {
+          // Ignore unreadable .git file in unit tests using virtual lstatKind
+        }
+      } else {
+        args.push('--ro-bind', emptyMask, dotGitPath);
+        protectedPaths.push(dotGitPath);
+      }
+    }
 
     for (const relFile of DANGEROUS_FILES) {
       const target = posix.join(input.workspaceRoot, relFile);
       const kind = lstatKind(target);
       if (kind !== null) {
-        args.push('--ro-bind', target, target);
+        if (exists(target)) {
+          args.push('--ro-bind', target, target);
+        } else {
+          // Broken symlink -> mask with emptyMask instead of crashing bwrap
+          args.push('--ro-bind', emptyMask, target);
+        }
         protectedPaths.push(target);
       } else {
-        // Non-existent dangerous file: bind /dev/null read-only to prevent in-sandbox creation!
-        args.push('--ro-bind', '/dev/null', target);
+        // Non-existent dangerous file: bind emptyMask read-only to prevent in-sandbox creation!
+        args.push('--ro-bind', emptyMask, target);
         protectedPaths.push(target);
         createdPlaceholders.push(target);
       }
@@ -372,7 +525,11 @@ export function buildBwrapArgs(input                 )                   {
       const parentDir = posix.dirname(target);
       const kind = lstatKind(target);
       if (kind !== null) {
-        args.push('--ro-bind', target, target);
+        if (exists(target)) {
+          args.push('--ro-bind', target, target);
+        } else {
+          args.push('--ro-bind', emptyMask, target);
+        }
         protectedPaths.push(target);
       } else if (lstatKind(parentDir) === 'dir') {
         // Parent exists (e.g. .git exists, .git/hooks missing): block creation with read-only placeholder
@@ -388,10 +545,9 @@ export function buildBwrapArgs(input                 )                   {
   if (input.maskEnvSecrets !== false) {
     const envFiles = input.preScannedEnvFiles
       ? [...input.preScannedEnvFiles]
-      : scanEnvSecretFiles(input.workspaceRoot, 3);
-    const maskSource = input.emptyMaskFilePath ?? '/dev/null';
+      : scanEnvSecretFiles(input.workspaceRoot);
     for (const envFile of envFiles) {
-      args.push('--ro-bind', maskSource, envFile);
+      args.push('--ro-bind', emptyMask, envFile);
       maskedEnvFiles.push(envFile);
     }
   }

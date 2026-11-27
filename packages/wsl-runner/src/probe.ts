@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { posix } from 'node:path';
 import {
   compileSeccompBpf,
   discoverSocketsToMask,
@@ -13,6 +14,39 @@ import {
   validateWorkspaceRoot,
   type WslProbeResult,
 } from '../../core/src/index.ts';
+
+function findExecutable(name: string): string | undefined {
+  if (!name) return undefined;
+  if (name.includes('/')) {
+    try {
+      const st = fs.statSync(name);
+      if (st.isFile()) {
+        fs.accessSync(name, fs.constants.X_OK);
+        return name;
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
+  }
+  const pathEnv =
+    process.env.PATH ||
+    '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin';
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, name);
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // continue searching
+    }
+  }
+  return undefined;
+}
 
 export function detectLinuxArch(): LinuxArch {
   if (process.arch === 'x64') return 'x86_64';
@@ -32,11 +66,29 @@ export function detectWslKernelVersion(): { isWsl: boolean; wslVersion: number; 
   if (lower.includes('wsl2') || lower.includes('microsoft-standard-wsl2')) {
     return { isWsl: true, wslVersion: 2, kernelRelease };
   }
+  // WSL 2 kernels always expose `/run/WSL` and/or `/dev/dxg` even on custom builds without standard marker
+  if (fs.existsSync('/run/WSL') || fs.existsSync('/dev/dxg')) {
+    return { isWsl: true, wslVersion: 2, kernelRelease };
+  }
   if (lower.includes('microsoft')) {
-    // WSL 1 kernels contain "Microsoft" without WSL2 standard marker
+    // WSL 1 kernels contain "Microsoft" without WSL2 markers
     return { isWsl: true, wslVersion: 1, kernelRelease };
   }
   return { isWsl: false, wslVersion: 0, kernelRelease };
+}
+
+function formatUsernsDiagnostics(stderr: string): string {
+  const lower = stderr.toLowerCase();
+  if (
+    lower.includes('apparmor') ||
+    lower.includes('operation not permitted') ||
+    lower.includes('setting up uid map') ||
+    lower.includes('permission denied') ||
+    lower.includes('userns')
+  ) {
+    return `${stderr.trim()} (hint: check sysctl kernel.apparmor_restrict_unprivileged_userns / Ubuntu 24.04 AppArmor bwrap profile)`;
+  }
+  return stderr.trim();
 }
 
 export function probeBwrapCapabilities(arch: LinuxArch): {
@@ -57,13 +109,13 @@ export function probeBwrapCapabilities(arch: LinuxArch): {
   }
   const bwrapVersion = (verRes.stdout || '').trim();
 
-  // Check --disable-userns support
+  // Check --disable-userns support using portable `sh -c :` instead of `/bin/true`
   const disableCheck = spawnSync(
     'bwrap',
     [
       '--unshare-user', '--disable-userns', '--unshare-pid', '--unshare-net',
       '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc', '--tmpfs', '/tmp',
-      '--', '/bin/true',
+      '--', 'sh', '-c', ':',
     ],
     { encoding: 'utf8', timeout: 5000 },
   );
@@ -78,7 +130,11 @@ export function probeBwrapCapabilities(arch: LinuxArch): {
   let bpfFd: number | undefined;
   try {
     fs.chmodSync(tmpDir, 0o700);
-    const bpf = compileSeccompBpf({ arch, blockNetworkSockets: true });
+    const bpf = compileSeccompBpf({
+      arch,
+      blockNetworkSockets: true,
+      blockUsernsClone: !supportsDisableUserns,
+    });
     fs.writeFileSync(bpfPath, bpf, { mode: 0o600 });
     bpfFd = fs.openSync(bpfPath, 'r');
 
@@ -99,6 +155,7 @@ export function probeBwrapCapabilities(arch: LinuxArch): {
       stdio: ['ignore', 'pipe', 'pipe', bpfFd],
     });
     const ok = selfTest.status === 0 && (selfTest.stdout || '').includes('SELF_TEST_OK');
+    const combinedErr = `${disableCheck.stderr || ''}\n${selfTest.stderr || ''}`;
     return {
       bwrapAvailable: true,
       bwrapVersion,
@@ -106,7 +163,7 @@ export function probeBwrapCapabilities(arch: LinuxArch): {
       functionalSelfTestPassed: ok,
       selfTestDetail: ok
         ? 'bwrap + seccomp functional probe passed'
-        : `exit=${selfTest.status} stderr=${(selfTest.stderr || '').trim()}`,
+        : `exit=${selfTest.status} stderr=${formatUsernsDiagnostics(combinedErr)}`,
     };
   } catch (err) {
     return {
@@ -131,6 +188,7 @@ export function runEnvironmentProbe(params: ProbeParams, runnerId: string = rand
   }
 
   const username = os.userInfo().username;
+  const homeDir = os.homedir() || `/home/${username}`;
   const arch = detectLinuxArch();
   const kernel = detectWslKernelVersion();
 
@@ -146,6 +204,28 @@ export function runEnvironmentProbe(params: ProbeParams, runnerId: string = rand
     }
   } else if (kernel.wslVersion !== 2) {
     failSandbox('BACKEND_UNAVAILABLE', `WSL ${kernel.wslVersion} is not supported; upgrade distro to WSL 2`);
+  }
+
+  // Validate requested workspaceRoot syntax first, then create missing workspace directory if ENOENT (never follow broken symlink)
+  const normalizedRequestedWs = posix.normalize(params.workspaceRoot);
+  validateWorkspaceRoot(normalizedRequestedWs, username);
+  let wsStat: fs.Stats | null = null;
+  try {
+    wsStat = fs.lstatSync(params.workspaceRoot);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      try {
+        fs.mkdirSync(params.workspaceRoot, { recursive: true, mode: 0o755 });
+      } catch (mkErr) {
+        failSandbox(
+          'POLICY_BLOCK',
+          `Failed to initialize workspaceRoot in Linux distro: ${mkErr instanceof Error ? mkErr.message : String(mkErr)}`,
+        );
+      }
+    }
+  }
+  if (wsStat?.isSymbolicLink() && !fs.existsSync(params.workspaceRoot)) {
+    failSandbox('POLICY_BLOCK', `workspaceRoot is a dangling symlink: ${params.workspaceRoot}`);
   }
 
   // Canonicalize and verify workspaceRoot & cwd inside target Linux filesystem
@@ -174,7 +254,8 @@ export function runEnvironmentProbe(params: ProbeParams, runnerId: string = rand
     failSandbox('SANDBOX_UNAVAILABLE', `bwrap/seccomp self-test failed: ${bwrap.selfTestDetail}`);
   }
 
-  const probedSockets = discoverSocketsToMask(process.env);
+  const hasPrlimit = Boolean(findExecutable('prlimit'));
+  const probedSockets = discoverSocketsToMask(process.env, [], undefined, undefined, homeDir);
 
   return {
     sessionId: params.sessionId,
@@ -193,6 +274,9 @@ export function runEnvironmentProbe(params: ProbeParams, runnerId: string = rand
     enforcement: bwrap.supportsDisableUserns ? 'full' : 'partial',
     bwrapVersion: bwrap.bwrapVersion,
     supportsDisableUserns: bwrap.supportsDisableUserns,
+    hasPrlimit,
+    requestedWorkspaceRoot: params.workspaceRoot,
+    homeDir,
     probedSockets,
     authorizedShares: params.authorizedShares ?? [],
     authorizedDevices: params.authorizedDevices ?? [],

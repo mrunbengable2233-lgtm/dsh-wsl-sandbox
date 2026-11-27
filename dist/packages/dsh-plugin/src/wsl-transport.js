@@ -121,6 +121,12 @@ export class WslTransport {
 
     if (this.options.mode === 'wsl') {
       command = this.options.wslExecutable ?? 'wsl.exe';
+      if (
+        process.env.DSH_WSL_NO_HOST_SPAWN === '1' &&
+        /^(?:wsl|wsl\.exe)$/i.test(command.replace(/^.*[\\/]/, ''))
+      ) {
+        failSandbox('BACKEND_UNAVAILABLE', 'Spawning host wsl.exe is disabled under DSH_WSL_NO_HOST_SPAWN=1');
+      }
       args = buildWslNodeSpawnArgs({
         distro: this.options.distro,
         username: this.options.username,

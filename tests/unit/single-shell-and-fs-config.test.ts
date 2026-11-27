@@ -484,6 +484,29 @@ describe('ConfigStore & ApprovalController — persistence, TTL timeout, and den
 
       await mgr.dispose();
     } finally {
+      if (IS_WINDOWS && fs.existsSync(tmpRoot)) {
+        const curUser = process.env.USERNAME || os.userInfo().username;
+        spawnSync('icacls.exe', [tmpRoot, '/inheritance:e', '/T', '/C', '/Q'], { windowsHide: true });
+        if (curUser) {
+          spawnSync('icacls.exe', [tmpRoot, '/grant:r', `${curUser}:F`, '/T', '/C', '/Q'], {
+            windowsHide: true,
+          });
+        }
+        const clearReadOnlyWin = (dir: string): void => {
+          try { fs.chmodSync(dir, 0o777); } catch { /* ignore */ }
+          let ents: fs.Dirent[] = [];
+          try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+          for (const e of ents) {
+            const p = path.join(dir, e.name);
+            if (e.isDirectory()) {
+              clearReadOnlyWin(p);
+            } else {
+              try { fs.chmodSync(p, 0o666); } catch { /* ignore */ }
+            }
+          }
+        };
+        clearReadOnlyWin(tmpRoot);
+      }
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
   });

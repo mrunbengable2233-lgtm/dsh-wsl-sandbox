@@ -4,11 +4,13 @@
  * Communicates with the Windows/Host DSH plugin via line-delimited JSON over stdio.
  * Zero 9P dependency, zero systemd requirement, clean PGID teardown on stdin EOF or heartbeat timeout.
  */
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
+import { fileURLToPath } from 'node:url';
 import {
   formatRunnerWireLog,
   isSandboxError,
@@ -117,11 +119,32 @@ const pendingCallbacks = new Map
          
                                                                 
  ();
+const inFlightProxyAuth = new Map                          ();
 
 let lastActivity = Date.now();
 
 function sendFrame(frame                                  )       {
-  process.stdout.write(JSON.stringify(frame) + '\n');
+  const encoded = JSON.stringify(frame) + '\n';
+  const bytes = Buffer.byteLength(encoded, 'utf8');
+  if (bytes > MAX_RPC_FRAME_BYTES) {
+    rlog.warn('rpc.frame_oversize', `Dropping oversized RPC frame (${bytes} bytes > ${MAX_RPC_FRAME_BYTES})`, {
+      id: frame.id,
+      bytes,
+    });
+    if ('ok' in frame) {
+      const errFrame              = {
+        id: frame.id,
+        ok: false,
+        error: {
+          code: 'OUTPUT_LIMIT',
+          message: `RPC response frame (${bytes} bytes) exceeds ${MAX_RPC_FRAME_BYTES} byte limit`,
+        },
+      };
+      process.stdout.write(JSON.stringify(errFrame) + '\n');
+    }
+    return;
+  }
+  process.stdout.write(encoded);
 }
 
 function send(resp             )       {
@@ -132,8 +155,14 @@ function requestHostProxyAuthorization(host        , port        )              
   if (!interactiveProxyApproval) {
     return Promise.resolve(false);
   }
+  const key = `${host.toLowerCase()}:${port}`;
+  const existing = inFlightProxyAuth.get(key);
+  if (existing) {
+    return existing;
+  }
+
   const id = `cb-${randomUUID()}`;
-  return new Promise         ((resolve) => {
+  const pending = new Promise         ((resolve) => {
     const timer = setTimeout(() => {
       pendingCallbacks.delete(id);
       resolve(false);
@@ -146,7 +175,12 @@ function requestHostProxyAuthorization(host        , port        )              
       method: 'proxy.authorizeHost',
       params: { host, port },
     });
+  }).finally(() => {
+    inFlightProxyAuth.delete(key);
   });
+
+  inFlightProxyAuth.set(key, pending);
+  return pending;
 }
 
 async function configureManagedProxy(params                      )                                                     {
@@ -217,6 +251,83 @@ function withManagedProxy(params                )                 {
     return { ...params, proxySocketHostPath: managedProxy.getSocketPath() };
   }
   return params;
+}
+
+async function runDoctorNonBlocking(options   
+                         
+                      
+                                              
+ )                   {
+  const selfDir = path.dirname(fileURLToPath(import.meta.url));
+  const doctorJs = path.resolve(selfDir, '../../bootstrap/src/doctor.js');
+  const doctorTs = path.resolve(selfDir, '../../bootstrap/src/doctor.ts');
+  const doctorScript = fs.existsSync(doctorJs) ? doctorJs : doctorTs;
+
+  if (fs.existsSync(doctorScript)) {
+    const cliArgs = [doctorScript, '--json'];
+    if (options.strictWsl2) cliArgs.push('--strict-wsl2');
+    if (options.upstreamProxy) cliArgs.push('--proxy', options.upstreamProxy);
+    if (options.profile) cliArgs.push('--profile', options.profile);
+
+    const subReport = await new Promise                ((resolve) => {
+      const child = spawn(process.execPath, cliArgs, {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        shell: false,
+        windowsHide: true,
+      });
+      const outChunks           = [];
+      let totalBytes = 0;
+      let settled = false;
+      const timer = setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
+        }
+        if (!settled) {
+          settled = true;
+          resolve(null);
+        }
+      }, 30_000);
+      timer.unref();
+
+      child.stdout?.on('data', (chunk        ) => {
+        if (totalBytes < 2 * 1024 * 1024) {
+          outChunks.push(chunk);
+          totalBytes += chunk.length;
+        }
+      });
+      child.once('error', () => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          resolve(null);
+        }
+      });
+      child.once('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (code !== 0 && code !== 1) {
+          resolve(null);
+          return;
+        }
+        try {
+          const parsed = JSON.parse(Buffer.concat(outChunks).toString('utf8'))                         ;
+          resolve(parsed && typeof parsed === 'object' && 'verdict' in parsed ? parsed : null);
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+
+    if (subReport !== null) {
+      return subReport;
+    }
+  }
+
+  const { runDoctor } = await import('../../bootstrap/src/doctor.js');
+  return runDoctor(options);
 }
 
 async function handleRequest(req            )                   {
@@ -446,8 +557,7 @@ async function handleRequest(req            )                   {
     }
 
     case 'env.doctor': {
-      const { runDoctor } = await import('../../bootstrap/src/doctor.js');
-      return runDoctor({
+      return runDoctorNonBlocking({
         upstreamProxy: typeof p.upstreamProxy === 'string' && p.upstreamProxy ? p.upstreamProxy : undefined,
         strictWsl2: Boolean(p.strictWsl2),
         profile: typeof p.profile === 'string' ? (p.profile                                     ) : undefined,
@@ -620,8 +730,25 @@ async function shutdown()                {
   }
   await procManager.disposeAll().catch(() => {});
   cleanupTempArtifactsSync();
-  clearTimeout(watchdog);
-  process.exit(0);
+  const finishExit = ()       => {
+    clearTimeout(watchdog);
+    process.exit(0);
+  };
+  if (process.stdout.writableFinished || process.stdout.destroyed) {
+    finishExit();
+    return;
+  }
+  const drainTimer = setTimeout(finishExit, 250);
+  drainTimer.unref();
+  try {
+    process.stdout.write('', () => {
+      clearTimeout(drainTimer);
+      finishExit();
+    });
+  } catch {
+    clearTimeout(drainTimer);
+    finishExit();
+  }
 }
 
 process.on('exit', () => {

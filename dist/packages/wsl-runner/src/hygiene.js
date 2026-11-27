@@ -46,6 +46,39 @@ export function summarizePathTree(targetPath        )                 {
   return { path: targetPath, exists: true, fileCount, totalBytes };
 }
 
+function chmodNoFollow(target        , isDir         , mode        )       {
+  if (process.platform === 'linux') {
+    const flags =
+      fs.constants.O_RDONLY |
+      (fs.constants.O_NOFOLLOW || 0) |
+      (isDir ? (fs.constants.O_DIRECTORY || 0) : 0);
+    let fd                    ;
+    try {
+      fd = fs.openSync(target, flags);
+      fs.fchmodSync(fd, mode);
+      return;
+    } catch {
+      // Fallback below if mode blocks O_RDONLY (e.g. 0000); still verify !isSymbolicLink immediately before chmod
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }
+  try {
+    const check = fs.lstatSync(target);
+    if (!check.isSymbolicLink()) {
+      fs.chmodSync(target, mode);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 /**
  * Safely unlocks `0400` / `0444` / read-only files and directories before recursive deletion.
  */
@@ -61,11 +94,7 @@ export function forceRemoveReadOnlyTree(targetPath        )          {
     }
     if (st.isSymbolicLink()) return;
     if (st.isDirectory()) {
-      try {
-        fs.chmodSync(curr, 0o700);
-      } catch {
-        // ignore
-      }
+      chmodNoFollow(curr, true, 0o700);
       let entries           = [];
       try {
         entries = fs.readdirSync(curr);
@@ -76,11 +105,7 @@ export function forceRemoveReadOnlyTree(targetPath        )          {
         unlock(path.join(curr, name));
       }
     } else {
-      try {
-        fs.chmodSync(curr, 0o600);
-      } catch {
-        // ignore
-      }
+      chmodNoFollow(curr, false, 0o600);
     }
   };
 
@@ -275,7 +300,17 @@ export function pruneWorkspaceCaches(options
     if (!ent.isDirectory()) continue;
     try {
       const st = fs.statSync(full);
-      if (now - st.mtimeMs >= maxAgeMs) {
+      let effectiveMtimeMs = st.mtimeMs;
+      const lastUsedPath = path.join(full, '.last-used');
+      try {
+        const lastUsedSt = fs.lstatSync(lastUsedPath);
+        if (!lastUsedSt.isSymbolicLink() && lastUsedSt.isFile()) {
+          effectiveMtimeMs = lastUsedSt.mtimeMs;
+        }
+      } catch {
+        // Fallback to directory mtimeMs when `.last-used` does not exist yet
+      }
+      if (now - effectiveMtimeMs >= maxAgeMs) {
         forceRemoveReadOnlyTree(full);
         removedDirs.push(full);
       } else {

@@ -1,4 +1,4 @@
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import { posix } from 'node:path';
@@ -12,11 +12,60 @@ import {
   type SessionBinding,
 } from '../../core/src/index.ts';
 
+const MAX_READ_FILE_BYTES = 16 * 1024 * 1024; // 16 MiB safety cap for wsl_read / wsl_edit
+const BINARY_NUL_SNIFF_BYTES = 8192;
+const MAX_RG_STDOUT_BYTES = 4 * 1024 * 1024;
+
 export interface FsPathResolution {
   readonly rootReal: string;
   readonly realPath: string;
   readonly insideShare: boolean;
   readonly shareWritable: boolean;
+}
+
+export function toPosixPath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+function isAbsolutePosixOrWin(p: string): boolean {
+  return p.startsWith('/') || /^[A-Za-z]:\//.test(p);
+}
+
+function lstatOrNull(targetPath: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(targetPath);
+  } catch {
+    return null;
+  }
+}
+
+function canonicalizeAncestorWithinRoot(rootReal: string, absTarget: string): string {
+  let probe = absTarget;
+  const missingTail: string[] = [];
+  for (;;) {
+    const st = lstatOrNull(probe);
+    if (st) {
+      if (st.isSymbolicLink() && !fs.existsSync(probe)) {
+        failSandbox('POLICY_BLOCK', `Ancestor symlink target does not exist: ${probe}`);
+      }
+      break;
+    }
+    const parent = posix.dirname(probe);
+    if (parent === probe) {
+      failSandbox('POLICY_BLOCK', `Cannot resolve ancestor for ${absTarget}`);
+    }
+    missingTail.unshift(posix.basename(probe));
+    probe = parent;
+  }
+  const ancestorReal = toPosixPath(fs.realpathSync(probe));
+  if (!isPathInside(rootReal, ancestorReal)) {
+    failSandbox('POLICY_BLOCK', `Ancestor symlink escape blocked: ${probe} -> ${ancestorReal}`);
+  }
+  const finalCandidate = missingTail.length > 0 ? posix.join(ancestorReal, ...missingTail) : ancestorReal;
+  if (!isPathInside(rootReal, finalCandidate)) {
+    failSandbox('POLICY_BLOCK', `Constructed path escapes root: ${finalCandidate}`);
+  }
+  return finalCandidate;
 }
 
 /**
@@ -27,24 +76,27 @@ export function resolveConfinedFsPath(
   binding: SessionBinding,
   requestedPath: string,
   mustExist: boolean,
+  options?: { readonly allowDanglingSymlink?: boolean },
 ): FsPathResolution {
   if (typeof requestedPath !== 'string' || requestedPath.length === 0 || requestedPath.includes('\0')) {
     failSandbox('POLICY_BLOCK', `Invalid filesystem path: ${String(requestedPath)}`);
   }
 
+  const reqPosix = toPosixPath(requestedPath);
+
   // Handle /shares/<alias>/... mapped paths
-  if (requestedPath === '/shares' || requestedPath.startsWith('/shares/')) {
-    const norm = posix.normalize(requestedPath);
+  if (reqPosix === '/shares' || reqPosix.startsWith('/shares/')) {
+    const norm = posix.normalize(reqPosix);
     const parts = norm.split('/').filter(Boolean); // ['shares', alias, ...rest]
     const alias = parts[1];
     const share = binding.authorizedShares.find((s) => s.alias === alias);
     if (!share) {
       failSandbox('POLICY_BLOCK', `Unauthorized share path: ${requestedPath}`);
     }
-    const shareRootReal = fs.realpathSync(share.sourceLinuxPath);
+    const shareRootReal = toPosixPath(fs.realpathSync(share.sourceLinuxPath));
     const subRel = parts.slice(2).join('/');
     const candidate = subRel ? posix.join(shareRootReal, subRel) : shareRootReal;
-    const resolved = canonicalizeWithinRoot(shareRootReal, candidate, mustExist);
+    const resolved = canonicalizeWithinRoot(shareRootReal, candidate, mustExist, options);
     return {
       rootReal: shareRootReal,
       realPath: resolved,
@@ -53,16 +105,23 @@ export function resolveConfinedFsPath(
     };
   }
 
-  const workspaceReal = fs.realpathSync(binding.workspaceRoot);
-  const rawAbs = requestedPath.startsWith('/')
-    ? posix.normalize(requestedPath)
-    : posix.normalize(posix.join(binding.cwd, requestedPath));
+  const workspaceReal = toPosixPath(fs.realpathSync(binding.workspaceRoot));
+  const rawWs = posix.normalize(toPosixPath(binding.workspaceRoot));
+  const cwdPosix = posix.normalize(toPosixPath(binding.cwd));
+  let rawAbs = isAbsolutePosixOrWin(reqPosix)
+    ? posix.normalize(reqPosix)
+    : posix.normalize(posix.join(cwdPosix, reqPosix));
 
   if (!isPathInside(workspaceReal, rawAbs)) {
-    failSandbox('POLICY_BLOCK', `Path escapes workspaceRoot (${workspaceReal}): ${requestedPath}`);
+    if (isPathInside(rawWs, rawAbs)) {
+      const rel = rawAbs === rawWs ? '' : rawAbs.slice(rawWs.length + 1);
+      rawAbs = rel ? posix.join(workspaceReal, rel) : workspaceReal;
+    } else {
+      failSandbox('POLICY_BLOCK', `Path escapes workspaceRoot (${workspaceReal}): ${requestedPath}`);
+    }
   }
 
-  const resolved = canonicalizeWithinRoot(workspaceReal, rawAbs, mustExist);
+  const resolved = canonicalizeWithinRoot(workspaceReal, rawAbs, mustExist, options);
   return {
     rootReal: workspaceReal,
     realPath: resolved,
@@ -71,9 +130,27 @@ export function resolveConfinedFsPath(
   };
 }
 
-function canonicalizeWithinRoot(rootReal: string, absTarget: string, mustExist: boolean): string {
-  if (fs.existsSync(absTarget)) {
-    const targetReal = fs.realpathSync(absTarget);
+function canonicalizeWithinRoot(
+  rootReal: string,
+  absTarget: string,
+  mustExist: boolean,
+  options?: { readonly allowDanglingSymlink?: boolean },
+): string {
+  const existing = lstatOrNull(absTarget);
+  if (existing) {
+    if (existing.isSymbolicLink() && !fs.existsSync(absTarget)) {
+      // Dangling symlink: verify parent resolves inside root before allowing stat/delete/move-src
+      const parentReal = canonicalizeAncestorWithinRoot(rootReal, posix.dirname(absTarget));
+      const linkPath = posix.join(parentReal, posix.basename(absTarget));
+      if (!isPathInside(rootReal, linkPath)) {
+        failSandbox('POLICY_BLOCK', `Symlink escapes root: ${absTarget}`);
+      }
+      if (options?.allowDanglingSymlink) {
+        return linkPath;
+      }
+      failSandbox('POLICY_BLOCK', `Dangling symlink target cannot be traversed: ${absTarget}`);
+    }
+    const targetReal = toPosixPath(fs.realpathSync(absTarget));
     if (!isPathInside(rootReal, targetReal)) {
       failSandbox('POLICY_BLOCK', `Symlink escape blocked: ${absTarget} -> ${targetReal}`);
     }
@@ -85,25 +162,7 @@ function canonicalizeWithinRoot(rootReal: string, absTarget: string, mustExist: 
   }
 
   // Walk up to nearest existing ancestor to prevent creating files through a symlinked parent pointing outside root
-  let probe = absTarget;
-  const missingTail: string[] = [];
-  while (!fs.existsSync(probe)) {
-    const parent = posix.dirname(probe);
-    if (parent === probe) {
-      failSandbox('POLICY_BLOCK', `Cannot resolve ancestor for ${absTarget}`);
-    }
-    missingTail.unshift(posix.basename(probe));
-    probe = parent;
-  }
-  const ancestorReal = fs.realpathSync(probe);
-  if (!isPathInside(rootReal, ancestorReal)) {
-    failSandbox('POLICY_BLOCK', `Ancestor symlink escape blocked: ${probe} -> ${ancestorReal}`);
-  }
-  const finalCandidate = posix.join(ancestorReal, ...missingTail);
-  if (!isPathInside(rootReal, finalCandidate)) {
-    failSandbox('POLICY_BLOCK', `Constructed path escapes root: ${finalCandidate}`);
-  }
-  return finalCandidate;
+  return canonicalizeAncestorWithinRoot(rootReal, absTarget);
 }
 
 function assertWriteAllowed(binding: SessionBinding, res: FsPathResolution, requestedPath: string): void {
@@ -119,7 +178,70 @@ function assertWriteAllowed(binding: SessionBinding, res: FsPathResolution, requ
   }
 }
 
-function atomicWriteNoFollow(targetPath: string, content: string): number {
+function readUtf8RegularFile(
+  filePath: string,
+  requestedPath: string,
+  maxBytes = MAX_READ_FILE_BYTES,
+): { content: string; mode: number } {
+  const lst = lstatOrNull(filePath);
+  if (!lst) {
+    failSandbox('POLICY_BLOCK', `Path does not exist: ${requestedPath}`);
+  }
+  if (lst.isDirectory()) {
+    failSandbox('INVALID_ACTION', `Path is a directory, expected regular file: ${requestedPath}`);
+  }
+
+  const openFlags =
+    fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(filePath, openFlags);
+    const fst = fs.fstatSync(fd);
+    if (!fst.isFile()) {
+      failSandbox('INVALID_ACTION', `Path is not a regular file (refusing FIFO/device/socket): ${requestedPath}`);
+    }
+    if (fst.size > maxBytes) {
+      failSandbox(
+        'OUTPUT_LIMIT',
+        `File exceeds ${Math.floor(maxBytes / (1024 * 1024))} MiB limit (${fst.size} bytes): ${requestedPath}`,
+      );
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const chunkBuf = Buffer.allocUnsafe(64 * 1024);
+    for (;;) {
+      const n = fs.readSync(fd, chunkBuf, 0, chunkBuf.length, null);
+      if (n === 0) break;
+      total += n;
+      if (total > maxBytes) {
+        failSandbox(
+          'OUTPUT_LIMIT',
+          `File exceeds ${Math.floor(maxBytes / (1024 * 1024))} MiB limit while reading: ${requestedPath}`,
+        );
+      }
+      chunks.push(Buffer.from(chunkBuf.subarray(0, n)));
+    }
+
+    const buf = chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks, total);
+    const probeLen = Math.min(buf.length, BINARY_NUL_SNIFF_BYTES);
+    if (probeLen > 0 && buf.subarray(0, probeLen).includes(0)) {
+      failSandbox('INVALID_ACTION', `Refusing binary file containing NUL bytes: ${requestedPath}`);
+    }
+
+    return { content: buf.toString('utf8'), mode: fst.mode & 0o777 };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function atomicWriteNoFollow(targetPath: string, content: string, mode = 0o644): number {
   const dir = posix.dirname(targetPath);
   fs.mkdirSync(dir, { recursive: true });
 
@@ -129,6 +251,9 @@ function atomicWriteNoFollow(targetPath: string, content: string): number {
     if (st.isSymbolicLink()) {
       failSandbox('POLICY_BLOCK', `Refusing to write through symlink: ${targetPath}`);
     }
+    if (st.isDirectory()) {
+      failSandbox('INVALID_ACTION', `Cannot overwrite directory with file write: ${targetPath}`);
+    }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
   }
@@ -136,11 +261,22 @@ function atomicWriteNoFollow(targetPath: string, content: string): number {
   const tmpName = `.dsh-tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
   const tmpPath = posix.join(dir, tmpName);
   const data = Buffer.from(content, 'utf8');
-  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW;
+  const flags =
+    fs.constants.O_WRONLY |
+    fs.constants.O_CREAT |
+    fs.constants.O_EXCL |
+    (fs.constants.O_NOFOLLOW || 0);
   let fd: number | undefined;
   try {
-    fd = fs.openSync(tmpPath, flags, 0o644);
+    fd = fs.openSync(tmpPath, flags, mode);
     fs.writeSync(fd, data, 0, data.length);
+    if (process.platform !== 'win32' && mode !== 0o644) {
+      try {
+        fs.fchmodSync(fd, mode);
+      } catch {
+        // ignore chmod failures on restricted filesystems
+      }
+    }
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = undefined;
@@ -148,21 +284,92 @@ function atomicWriteNoFollow(targetPath: string, content: string): number {
     return data.length;
   } catch (err) {
     if (fd !== undefined) {
-      try { fs.closeSync(fd); } catch { /* ignore */ }
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* ignore */
+      }
     }
     fs.rmSync(tmpPath, { force: true });
     throw err;
   }
 }
 
-function globToRegExp(pattern: string): RegExp {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*\*\//g, '(?:.+/)?')
-    .replace(/\*\*/g, '.*')
-    .replace(/\*/g, '[^/]*')
-    .replace(/\?/g, '[^/]');
-  return new RegExp(`^${escaped}$`);
+function globFragmentToRegExpSource(fragment: string): string {
+  let out = '';
+  let i = 0;
+  while (i < fragment.length) {
+    const ch = fragment[i]!;
+    if ((i === 0 || fragment[i - 1] === '/') && fragment.startsWith('**/', i)) {
+      out += '(?:.+/)?';
+      i += 3;
+      continue;
+    }
+    if (fragment.startsWith('/**', i) && i + 3 === fragment.length) {
+      out += '(?:/.*)?';
+      i += 3;
+      continue;
+    }
+    if (fragment.startsWith('**', i)) {
+      out += '.*';
+      i += 2;
+      continue;
+    }
+    if (ch === '*') {
+      out += '[^/]*';
+      i += 1;
+      continue;
+    }
+    if (ch === '?') {
+      out += '[^/]';
+      i += 1;
+      continue;
+    }
+    if (ch === '{') {
+      let depth = 1;
+      let j = i + 1;
+      const alts: string[] = [];
+      let altStart = j;
+      while (j < fragment.length && depth > 0) {
+        const cur = fragment[j]!;
+        if (cur === '{') {
+          depth += 1;
+        } else if (cur === '}') {
+          depth -= 1;
+          if (depth === 0) {
+            alts.push(fragment.slice(altStart, j));
+            break;
+          }
+        } else if (cur === ',' && depth === 1) {
+          alts.push(fragment.slice(altStart, j));
+          altStart = j + 1;
+        }
+        j += 1;
+      }
+      if (depth === 0) {
+        out += `(?:${alts.map((alt) => globFragmentToRegExpSource(alt)).join('|')})`;
+        i = j + 1;
+        continue;
+      }
+      out += '\\{';
+      i += 1;
+      continue;
+    }
+    out += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    i += 1;
+  }
+  return out;
+}
+
+export function globToRegExp(pattern: string): RegExp {
+  let normalized = toPosixPath(pattern);
+  while (normalized.startsWith('./')) {
+    normalized = normalized.slice(2);
+  }
+  if (normalized.startsWith('/')) {
+    normalized = normalized.slice(1);
+  }
+  return new RegExp(`^${globFragmentToRegExpSource(normalized)}$`);
 }
 
 export class ConfinedFsService {
@@ -173,13 +380,13 @@ export class ConfinedFsService {
     mtimeMs: number;
     maskedEnv: boolean;
   } {
-    const res = resolveConfinedFsPath(params.binding, params.path, false);
-    if (!fs.existsSync(res.realPath)) {
+    const res = resolveConfinedFsPath(params.binding, params.path, false, { allowDanglingSymlink: true });
+    const st = lstatOrNull(res.realPath);
+    if (!st) {
       return { exists: false, kind: 'missing', size: 0, mtimeMs: 0, maskedEnv: false };
     }
-    const st = fs.lstatSync(res.realPath);
     const maskedEnv = !res.insideShare && isMaskedEnvRead(
-      params.binding.workspaceRoot,
+      res.rootReal,
       res.realPath,
       params.maskEnvSecrets !== false,
     );
@@ -210,7 +417,7 @@ export class ConfinedFsService {
   } {
     const res = resolveConfinedFsPath(params.binding, params.path, true);
     const maskedEnv = !res.insideShare && isMaskedEnvRead(
-      params.binding.workspaceRoot,
+      res.rootReal,
       res.realPath,
       params.maskEnvSecrets !== false,
     );
@@ -226,7 +433,7 @@ export class ConfinedFsService {
       };
     }
 
-    const raw = fs.readFileSync(res.realPath, 'utf8');
+    const { content: raw } = readUtf8RegularFile(res.realPath, params.path, MAX_READ_FILE_BYTES);
     const totalBytes = Buffer.byteLength(raw, 'utf8');
     if (raw.length === 0) {
       return {
@@ -303,7 +510,9 @@ export class ConfinedFsService {
   } {
     const res = resolveConfinedFsPath(params.binding, params.path, false);
     assertWriteAllowed(params.binding, res, params.path);
-    const bytesWritten = atomicWriteNoFollow(res.realPath, params.content);
+    const existing = lstatOrNull(res.realPath);
+    const mode = existing && !existing.isSymbolicLink() && existing.isFile() ? (existing.mode & 0o777) : 0o644;
+    const bytesWritten = atomicWriteNoFollow(res.realPath, params.content, mode);
     return { bytesWritten, canonicalPath: res.realPath };
   }
 
@@ -319,7 +528,7 @@ export class ConfinedFsService {
     if (!params.oldText) {
       failSandbox('INVALID_ACTION', 'edit oldText must be non-empty');
     }
-    const content = fs.readFileSync(res.realPath, 'utf8');
+    const { content, mode } = readUtf8RegularFile(res.realPath, params.path, MAX_READ_FILE_BYTES);
     let replacements = 0;
     let updated: string;
     if (params.replaceAll) {
@@ -337,7 +546,7 @@ export class ConfinedFsService {
     if (replacements === 0) {
       failSandbox('INVALID_ACTION', `oldText not found in ${params.path}`);
     }
-    atomicWriteNoFollow(res.realPath, updated);
+    atomicWriteNoFollow(res.realPath, updated, mode);
     return { replacements, canonicalPath: res.realPath };
   }
 
@@ -412,74 +621,186 @@ export class ConfinedFsService {
     return { matches, truncated };
   }
 
-  grep(params: {
+  async grep(params: {
     binding: SessionBinding;
     query: string;
     cwd?: string;
     regex?: boolean;
     maxMatches?: number;
     maskEnvSecrets?: boolean;
-  }): { matches: GrepMatch[]; truncated: boolean } {
+  }): Promise<{ matches: GrepMatch[]; truncated: boolean }> {
     const base = resolveConfinedFsPath(params.binding, params.cwd ?? params.binding.cwd, true);
     const cap = Math.min(500, Math.max(1, params.maxMatches ?? 100));
     const maskEnv = params.maskEnvSecrets !== false;
 
-    // Prefer fast ripgrep (`rg`) inside distro if available
-    const rgArgs = ['--no-heading', '--line-number', '--color=never', '--max-count=50'];
+    let jsMatcher: RegExp | null = null;
+    if (params.regex) {
+      try {
+        jsMatcher = new RegExp(params.query);
+      } catch (err) {
+        failSandbox(
+          'INVALID_ACTION',
+          `Invalid regex pattern in grep: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    // Prefer non-blocking ripgrep (`rg --json`) inside distro if available
+    const rgArgs = ['--no-config', '--no-follow', '--json', '--max-count=50', '--max-columns=1000'];
     if (!params.regex) rgArgs.push('--fixed-strings');
     rgArgs.push('--', params.query, base.realPath);
 
-    const rgRes = spawnSync('rg', rgArgs, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: 15_000 });
-    if (!rgRes.error && (rgRes.status === 0 || rgRes.status === 1)) {
-      const matches: GrepMatch[] = [];
-      let truncated = false;
-      const lines = (rgRes.stdout || '').split('\n').filter(Boolean);
-      for (const line of lines) {
-        const firstColon = line.indexOf(':');
-        if (firstColon === -1) continue;
-        const secondColon = line.indexOf(':', firstColon + 1);
-        if (secondColon === -1) continue;
-        const filePath = line.slice(0, firstColon);
-        const lineNum = Number(line.slice(firstColon + 1, secondColon));
-        const text = line.slice(secondColon + 1);
-        if (isMaskedEnvRead(params.binding.workspaceRoot, filePath, maskEnv)) {
-          continue;
+    const rgOutcome = await new Promise<{
+      spawned: boolean;
+      status: number | null;
+      stdout: string;
+      stderr: string;
+      truncatedOutput: boolean;
+    }>((resolve) => {
+      const child = spawn('rg', rgArgs, { stdio: ['ignore', 'pipe', 'pipe'], shell: false });
+      const outChunks: Buffer[] = [];
+      const errChunks: Buffer[] = [];
+      let outBytes = 0;
+      let errBytes = 0;
+      let truncatedOutput = false;
+      let settled = false;
+
+      const timer = setTimeout(() => {
+        truncatedOutput = true;
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // ignore
         }
-        if (matches.length >= cap) {
-          truncated = true;
-          break;
+      }, 15_000);
+      timer.unref();
+
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (outBytes < MAX_RG_STDOUT_BYTES) {
+          const take = Math.min(chunk.length, MAX_RG_STDOUT_BYTES - outBytes);
+          outChunks.push(chunk.subarray(0, take));
+          outBytes += take;
+          if (take < chunk.length) {
+            truncatedOutput = true;
+            try {
+              child.kill('SIGKILL');
+            } catch {
+              // ignore
+            }
+          }
         }
-        matches.push({
-          file: posix.relative(base.realPath, filePath),
-          line: Number.isFinite(lineNum) ? lineNum : 0,
-          text,
+      });
+      child.stderr?.on('data', (chunk: Buffer) => {
+        if (errBytes < 16 * 1024) {
+          errChunks.push(chunk.subarray(0, 16 * 1024 - errBytes));
+          errBytes += chunk.length;
+        }
+      });
+
+      child.once('error', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ spawned: false, status: null, stdout: '', stderr: '', truncatedOutput: false });
+      });
+
+      child.once('close', (code) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          spawned: true,
+          status: code,
+          stdout: Buffer.concat(outChunks).toString('utf8'),
+          stderr: Buffer.concat(errChunks).toString('utf8'),
+          truncatedOutput,
         });
+      });
+    });
+
+    if (rgOutcome.spawned) {
+      if (rgOutcome.status === 2) {
+        failSandbox(
+          'INVALID_ACTION',
+          `Invalid grep query (${rgOutcome.stderr.trim() || 'exit 2'})`,
+        );
       }
-      return { matches, truncated };
+      if (rgOutcome.status === 0 || rgOutcome.status === 1 || rgOutcome.truncatedOutput) {
+        const matches: GrepMatch[] = [];
+        let truncated = rgOutcome.truncatedOutput;
+        const lines = rgOutcome.stdout.split('\n').filter(Boolean);
+        for (const line of lines) {
+          let parsed: {
+            type?: string;
+            data?: {
+              path?: { text?: string };
+              line_number?: number;
+              lines?: { text?: string };
+            };
+          };
+          try {
+            parsed = JSON.parse(line) as typeof parsed;
+          } catch {
+            continue;
+          }
+          if (parsed.type !== 'match' || !parsed.data) continue;
+          const rawFile = parsed.data.path?.text;
+          if (!rawFile) continue;
+          const rawPosix = toPosixPath(rawFile);
+          const candidatePath = isAbsolutePosixOrWin(rawPosix)
+            ? rawPosix
+            : posix.join(base.realPath, rawPosix);
+          let realFile: string;
+          try {
+            realFile = toPosixPath(fs.realpathSync(candidatePath));
+          } catch {
+            continue;
+          }
+          if (!isPathInside(base.rootReal, realFile)) {
+            continue;
+          }
+          if (!base.insideShare && isMaskedEnvRead(base.rootReal, realFile, maskEnv)) {
+            continue;
+          }
+          if (matches.length >= cap) {
+            truncated = true;
+            break;
+          }
+          const rawLineText = parsed.data.lines?.text ?? '';
+          const text = rawLineText.replace(/\r?\n$/, '');
+          matches.push({
+            file: posix.relative(base.realPath, realFile),
+            line: typeof parsed.data.line_number === 'number' ? parsed.data.line_number : 0,
+            text,
+          });
+        }
+        return { matches, truncated };
+      }
     }
 
-    // Pure JS fallback when `rg` is not installed yet
-    const matcher = params.regex ? new RegExp(params.query) : null;
+    // Pure JS fallback when `rg` is not installed
     const matches: GrepMatch[] = [];
     let truncated = false;
-    const { matches: files } = this.glob({ binding: params.binding, pattern: '**', cwd: base.realPath, maxResults: 1000 });
+    const { matches: files } = this.glob({
+      binding: params.binding,
+      pattern: '**',
+      cwd: params.cwd ?? params.binding.cwd,
+      maxResults: 1000,
+    });
     for (const rel of files) {
       if (truncated) break;
       const full = posix.join(base.realPath, rel);
-      if (isMaskedEnvRead(params.binding.workspaceRoot, full, maskEnv)) continue;
+      if (!base.insideShare && isMaskedEnvRead(base.rootReal, full, maskEnv)) continue;
       let content: string;
       try {
-        const st = fs.statSync(full);
-        if (st.size > 2 * 1024 * 1024) continue;
-        content = fs.readFileSync(full, 'utf8');
+        content = readUtf8RegularFile(full, rel, 2 * 1024 * 1024).content;
       } catch {
         continue;
       }
-      if (content.includes('\0')) continue;
-      const lines = content.split('\n');
+      const lines = content.split(/\r?\n/);
       for (let i = 0; i < lines.length; i++) {
         const text = lines[i]!;
-        const hit = matcher ? matcher.test(text) : text.includes(params.query);
+        const hit = jsMatcher ? jsMatcher.test(text) : text.includes(params.query);
         if (hit) {
           if (matches.length >= cap) {
             truncated = true;
@@ -493,20 +814,27 @@ export class ConfinedFsService {
   }
 
   delete(params: { binding: SessionBinding; path: string }): { deleted: true } {
-    const res = resolveConfinedFsPath(params.binding, params.path, true);
+    const res = resolveConfinedFsPath(params.binding, params.path, true, { allowDanglingSymlink: true });
     assertWriteAllowed(params.binding, res, params.path);
-    if (res.realPath === fs.realpathSync(params.binding.workspaceRoot)) {
+    if (res.realPath === res.rootReal) {
       failSandbox('POLICY_BLOCK', 'Cannot delete workspaceRoot itself');
     }
-    fs.rmSync(res.realPath, { recursive: false, force: false });
+    const st = fs.lstatSync(res.realPath);
+    if (st.isDirectory()) {
+      failSandbox('INVALID_ACTION', `Refusing non-recursive delete of directory: ${params.path}`);
+    }
+    fs.unlinkSync(res.realPath);
     return { deleted: true };
   }
 
   move(params: { binding: SessionBinding; from: string; to: string }): { moved: true } {
-    const src = resolveConfinedFsPath(params.binding, params.from, true);
-    const dst = resolveConfinedFsPath(params.binding, params.to, false);
+    const src = resolveConfinedFsPath(params.binding, params.from, true, { allowDanglingSymlink: true });
+    const dst = resolveConfinedFsPath(params.binding, params.to, false, { allowDanglingSymlink: false });
     assertWriteAllowed(params.binding, src, params.from);
     assertWriteAllowed(params.binding, dst, params.to);
+    if (src.realPath === src.rootReal) {
+      failSandbox('POLICY_BLOCK', 'Cannot move workspaceRoot itself');
+    }
     fs.mkdirSync(posix.dirname(dst.realPath), { recursive: true });
     fs.renameSync(src.realPath, dst.realPath);
     return { moved: true };

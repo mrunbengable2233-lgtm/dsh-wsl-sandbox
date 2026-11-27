@@ -13,11 +13,53 @@
  * 4. Avoids Windows PowerShell 5.1 binary pipeline corruption (`tar | wsl` breaks in PS 5.1).
  * 5. Requires only POSIX `sh` + `tar` inside WSL (works before Node.js is installed in WSL).
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const ROOT = path.resolve(import.meta.dirname, '..');
+function resolveDefaultRepoRoot() {
+  let cur = path.resolve(import.meta.dirname);
+  for (let i = 0; i < 6; i++) {
+    const pkgPath = path.join(cur, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+        if (pkg && pkg.name === 'dsh-wsl-sandbox') {
+          return cur;
+        }
+      } catch {
+        // continue walking up
+      }
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return path.resolve(import.meta.dirname, '..');
+}
+
+const ROOT = resolveDefaultRepoRoot();
+const VALID_LINUX_USERNAME_RE = /^[a-z_][a-z0-9_.-]{0,31}$/;
+
+function isValidDistro(value) {
+  if (typeof value !== 'string') return false;
+  if (value.length === 0 || value.length > 128) return false;
+  if (value.trim() !== value) return false;
+  if (value === '.' || value === '..') return false;
+  return !/[\x00-\x1f\x7f/\\:*?"<>|]/.test(value);
+}
+
+function validateTargetSubdir(rawSubdir) {
+  const subdir = (rawSubdir ?? '.local/share/dsh-wsl-sandbox/runner').replace(/\\/g, '/').replace(/\/+$/, '');
+  if (!subdir || subdir.startsWith('/') || subdir.includes('\0') || /[\r\n]/.test(subdir)) {
+    throw new Error(`Invalid targetSubdir: ${String(rawSubdir)}`);
+  }
+  const parts = subdir.split('/');
+  if (parts.some((p) => p === '' || p === '.' || p === '..')) {
+    throw new Error(`Unsafe targetSubdir path traversal: ${subdir}`);
+  }
+  return subdir;
+}
 
 function writeOctal(buf, offset, length, value) {
   const oct = value.toString(8).padStart(length - 1, '0');
@@ -25,16 +67,29 @@ function writeOctal(buf, offset, length, value) {
 }
 
 export function createTarHeader(relPath, size, mode, typeFlag = '0') {
-  const cleanPath = relPath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const cleanPath = relPath.replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+/g, '/');
   let name = cleanPath;
   let prefix = '';
+
   if (Buffer.byteLength(cleanPath, 'utf8') > 100) {
-    const idx = cleanPath.lastIndexOf('/');
-    if (idx === -1 || idx > 155 || cleanPath.length - idx - 1 > 100) {
+    let splitIdx = -1;
+    for (let i = cleanPath.indexOf('/'); i !== -1; i = cleanPath.indexOf('/', i + 1)) {
+      const candPrefix = cleanPath.slice(0, i);
+      const candName = cleanPath.slice(i + 1);
+      if (
+        candPrefix.length > 0 &&
+        candName.length > 0 &&
+        Buffer.byteLength(candPrefix, 'utf8') <= 155 &&
+        Buffer.byteLength(candName, 'utf8') <= 100
+      ) {
+        splitIdx = i;
+      }
+    }
+    if (splitIdx === -1) {
       throw new Error(`Path too long for POSIX ustar tar header: ${cleanPath}`);
     }
-    prefix = cleanPath.slice(0, idx);
-    name = cleanPath.slice(idx + 1);
+    prefix = cleanPath.slice(0, splitIdx);
+    name = cleanPath.slice(splitIdx + 1);
   }
 
   const header = Buffer.alloc(512, 0);
@@ -101,50 +156,129 @@ function collectFiles(repoRoot) {
   }
   walkDir(distDir);
 
-  for (const extraRel of ['package.json', 'packages/bootstrap/provision-wsl.sh']) {
-    const abs = path.join(repoRoot, extraRel);
-    if (fs.existsSync(abs)) {
-      let content = fs.readFileSync(abs);
-      if (extraRel.endsWith('.sh')) {
-        // Normalize CRLF -> LF in case repo was cloned on Windows with core.autocrlf=true
-        content = Buffer.from(content.toString('utf8').replace(/\r\n/g, '\n'), 'utf8');
+  let pkgVersion = '0.0.0';
+  const pkgAbs = path.join(repoRoot, 'package.json');
+  if (fs.existsSync(pkgAbs)) {
+    const rawPkg = fs.readFileSync(pkgAbs);
+    try {
+      const parsed = JSON.parse(rawPkg.toString('utf8'));
+      if (typeof parsed.version === 'string' && parsed.version.trim()) {
+        pkgVersion = parsed.version.trim();
       }
-      entries.push({
-        path: extraRel,
-        content,
-        mode: extraRel.endsWith('.sh') ? 0o755 : 0o644,
-      });
+    } catch {
+      // ignore invalid package.json
     }
+    entries.push({ path: 'package.json', content: rawPkg, mode: 0o644 });
   }
-  return entries;
+
+  const provRel = 'packages/bootstrap/provision-wsl.sh';
+  const provAbs = path.join(repoRoot, provRel);
+  if (fs.existsSync(provAbs)) {
+    const lfText = fs.readFileSync(provAbs, 'utf8').replace(/\r\n/g, '\n').replace(/\r/g, '');
+    entries.push({ path: provRel, content: Buffer.from(lfText, 'utf8'), mode: 0o755 });
+  }
+
+  entries.push({
+    path: '.staged-version',
+    content: Buffer.from(`${pkgVersion}\n`, 'utf8'),
+    mode: 0o644,
+  });
+
+  return { entries, version: pkgVersion };
 }
 
-export function stageRunnerIntoWsl(options) {
-  const distro = options.distro;
-  const repoRoot = options.repoRoot ?? ROOT;
-  const targetSubdir = options.targetSubdir ?? '.local/share/dsh-wsl-sandbox/runner';
-  if (!distro || !distro.trim()) {
-    throw new Error('Missing --distro <name>');
+function buildStageInvocation(options) {
+  const distro = options?.distro;
+  const username = options?.username;
+  const repoRoot = options?.repoRoot ?? ROOT;
+  const targetSubdir = validateTargetSubdir(options?.targetSubdir);
+  const wslExecutable = options?.wslExecutable ?? 'wsl.exe';
+  const dryRun = Boolean(options?.dryRun);
+
+  if (!isValidDistro(distro)) {
+    throw new Error(`Missing or invalid --distro: ${String(distro ?? '')}`);
+  }
+  if (username !== undefined && username !== '' && !VALID_LINUX_USERNAME_RE.test(username)) {
+    throw new Error(`Invalid WSL Linux username: ${username}`);
   }
 
-  const entries = collectFiles(repoRoot);
+  const { entries, version } = collectFiles(repoRoot);
   const tarBuf = buildTarBuffer(entries);
+
   const shCmd = [
     'set -eu',
     'umask 077',
-    `TARGET="$HOME/${targetSubdir}"`,
-    'mkdir -p "$HOME/.local/share/dsh-wsl-sandbox"',
-    'chmod 700 "$HOME/.local/share/dsh-wsl-sandbox"',
-    'rm -rf "$TARGET"',
-    'mkdir -p "$TARGET"',
-    'chmod 700 "$TARGET"',
-    'tar -xf - -C "$TARGET"',
-    'if [ -f "$TARGET/packages/bootstrap/provision-wsl.sh" ]; then chmod 700 "$TARGET/packages/bootstrap/provision-wsl.sh"; fi',
+    'SUBDIR="$1"',
+    'TARGET="$HOME/$SUBDIR"',
+    'PARENT="$(dirname "$TARGET")"',
+    'mkdir -p "$PARENT"',
+    'chmod 700 "$PARENT" 2>/dev/null || true',
+    'TMP_DIR="$TARGET.tmp.$$"',
+    'OLD_DIR="$TARGET.old.$$"',
+    'rm -rf "$TMP_DIR" "$OLD_DIR"',
+    'mkdir -p "$TMP_DIR"',
+    'chmod 700 "$TMP_DIR"',
+    'tar -xf - -C "$TMP_DIR"',
+    'PROV="$TMP_DIR/packages/bootstrap/provision-wsl.sh"',
+    'if [ -f "$PROV" ]; then tr -d "\\r" < "$PROV" > "$PROV.lf" && mv "$PROV.lf" "$PROV" && chmod 700 "$PROV"; fi',
+    'if [ -d "$TARGET" ]; then mv "$TARGET" "$OLD_DIR"; fi',
+    'if ! mv "$TMP_DIR" "$TARGET"; then if [ -d "$OLD_DIR" ] && [ ! -e "$TARGET" ]; then mv "$OLD_DIR" "$TARGET" || true; fi; rm -rf "$TMP_DIR" || true; exit 1; fi',
+    'if [ -d "$OLD_DIR" ]; then chmod -R u+w "$OLD_DIR" 2>/dev/null || true; rm -rf "$OLD_DIR"; fi',
     'printf "%s\\n" "$TARGET"',
   ].join(' && ');
 
-  const res = spawnSync('wsl.exe', ['-d', distro, '--cd', '~', '--', 'sh', '-c', shCmd], {
-    input: tarBuf,
+  const args = ['-d', distro, '--cd', '~'];
+  if (username) {
+    args.push('-u', username);
+  }
+  args.push('--', 'sh', '-c', shCmd, 'stage-wsl', targetSubdir);
+
+  return {
+    distro,
+    username,
+    version,
+    targetSubdir,
+    wslExecutable,
+    dryRun,
+    entries,
+    tarBuf,
+    args,
+  };
+}
+
+function formatResult(plan, stagedRoot) {
+  return {
+    distro: plan.distro,
+    ...(plan.username ? { username: plan.username } : {}),
+    version: plan.version,
+    fileCount: plan.entries.length,
+    tarBytes: plan.tarBuf.length,
+    stagedRoot,
+    runnerPath: `${stagedRoot}/dist/packages/wsl-runner/src/main.js`,
+    doctorPath: `${stagedRoot}/dist/packages/bootstrap/src/doctor.js`,
+    provisionScriptPath: `${stagedRoot}/packages/bootstrap/provision-wsl.sh`,
+    ...(plan.dryRun ? { dryRun: true, wslExecutable: plan.wslExecutable, args: plan.args } : {}),
+  };
+}
+
+function assertAllowedHostWslSpawn(wslExecutable) {
+  if (
+    process.env.DSH_WSL_NO_HOST_SPAWN === '1' &&
+    /^(?:wsl|wsl\.exe)$/i.test(path.basename(String(wslExecutable ?? 'wsl.exe')))
+  ) {
+    throw new Error('Spawning host wsl.exe is disabled under DSH_WSL_NO_HOST_SPAWN=1');
+  }
+}
+
+export function stageRunnerIntoWsl(options) {
+  const plan = buildStageInvocation(options);
+  if (plan.dryRun) {
+    return formatResult(plan, `$HOME/${plan.targetSubdir}`);
+  }
+  assertAllowedHostWslSpawn(plan.wslExecutable);
+
+  const res = spawnSync(plan.wslExecutable, plan.args, {
+    input: plan.tarBuf,
     maxBuffer: 16 * 1024 * 1024,
     timeout: 60_000,
     windowsHide: true,
@@ -155,27 +289,81 @@ export function stageRunnerIntoWsl(options) {
   }
   if (res.status !== 0) {
     const errOut = Buffer.isBuffer(res.stderr) ? res.stderr.toString('utf8') : String(res.stderr ?? '');
-    throw new Error(`Failed to stage runner into WSL distro '${distro}' (exit ${res.status}): ${errOut.trim()}`);
+    throw new Error(`Failed to stage runner into WSL distro '${plan.distro}' (exit ${res.status}): ${errOut.trim()}`);
   }
-  const stagedRoot = (Buffer.isBuffer(res.stdout) ? res.stdout.toString('utf8') : String(res.stdout ?? '')).trim().split(/\r?\n/).pop() || '';
-  return {
-    distro,
-    fileCount: entries.length,
-    tarBytes: tarBuf.length,
-    stagedRoot,
-    runnerPath: `${stagedRoot}/dist/packages/wsl-runner/src/main.js`,
-    doctorPath: `${stagedRoot}/dist/packages/bootstrap/src/doctor.js`,
-    provisionScriptPath: `${stagedRoot}/packages/bootstrap/provision-wsl.sh`,
-  };
+  const stagedRoot = (Buffer.isBuffer(res.stdout) ? res.stdout.toString('utf8') : String(res.stdout ?? ''))
+    .trim()
+    .split(/\r?\n/)
+    .pop() || '';
+  return formatResult(plan, stagedRoot);
+}
+
+export async function stageRunnerIntoWslAsync(options) {
+  const plan = buildStageInvocation(options);
+  if (plan.dryRun) {
+    return formatResult(plan, `$HOME/${plan.targetSubdir}`);
+  }
+  assertAllowedHostWslSpawn(plan.wslExecutable);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(plan.wslExecutable, plan.args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      windowsHide: true,
+    });
+
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let settled = false;
+
+    const finishErr = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    };
+
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      finishErr(new Error(`Timed out staging runner into WSL distro '${plan.distro}'`));
+    }, 60_000);
+    timer.unref();
+
+    child.stdin.on('error', () => {});
+    child.stdout.on('data', (c) => stdoutChunks.push(c));
+    child.stderr.on('data', (c) => stderrChunks.push(c));
+    child.once('error', finishErr);
+
+    child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        const errOut = Buffer.concat(stderrChunks).toString('utf8').trim();
+        reject(new Error(`Failed to stage runner into WSL distro '${plan.distro}' (exit ${code}): ${errOut}`));
+        return;
+      }
+      const stagedRoot = Buffer.concat(stdoutChunks).toString('utf8').trim().split(/\r?\n/).pop() || '';
+      resolve(formatResult(plan, stagedRoot));
+    });
+
+    child.stdin.end(plan.tarBuf);
+  });
 }
 
 const isDirectRun = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(import.meta.filename);
 if (isDirectRun) {
   const args = process.argv.slice(2);
-  const dIdx = args.indexOf('--distro');
-  const distro = dIdx !== -1 ? args[dIdx + 1] : '';
+  const readFlag = (name) => {
+    const idx = args.indexOf(name);
+    return idx !== -1 ? args[idx + 1] : undefined;
+  };
+  const distro = readFlag('--distro') ?? '';
+  const username = readFlag('--username');
+  const targetSubdir = readFlag('--target-subdir');
+  const dryRun = args.includes('--dry-run');
   const asJson = args.includes('--json');
-  const result = stageRunnerIntoWsl({ distro });
+  const result = stageRunnerIntoWsl({ distro, username, targetSubdir, dryRun });
   if (asJson) {
     process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   } else {

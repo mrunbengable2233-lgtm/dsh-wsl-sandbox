@@ -95,31 +95,37 @@ const MAX_ARRAY_ITEMS = 40;
 const TAIL_PRELOAD_MAX_BYTES = 64 * 1024;
 
 /**
- * Redacts inline tokens, URL basic-auth credentials, and secret key-value assignments inside strings.
+ * Redacts inline tokens, URL basic-auth credentials, JWT/Basic headers, PEM private keys,
+ * and secret key-value assignments inside strings BEFORE truncating to MAX_STRING_LEN.
  */
 export function redactSecretText(input        )         {
   let out = input;
-  if (out.length > MAX_STRING_LEN) {
-    out = `${out.slice(0, MAX_STRING_LEN)}...[truncated ${input.length - MAX_STRING_LEN} chars]`;
-  }
+  out = out.replace(/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, '[REDACTED PEM KEY]');
   out = out.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+:[^/\s@]+)@/gi, '$1[REDACTED]@');
   out = out.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1[REDACTED]');
+  out = out.replace(/\b(Basic\s+)[A-Za-z0-9+/=]{8,}/gi, '$1[REDACTED]');
+  out = out.replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, 'jwt_[REDACTED]');
   out = out.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, 'sk-[REDACTED]');
   out = out.replace(/\bgh[pousr]_[A-Za-z0-9]{16,}\b/g, 'gh_[REDACTED]');
   out = out.replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, 'github_pat_[REDACTED]');
+  out = out.replace(/\bglpat-[A-Za-z0-9_-]{16,}\b/g, 'glpat-[REDACTED]');
+  out = out.replace(/\bAIza[0-9A-Za-z_-]{20,}\b/g, 'AIza[REDACTED]');
   out = out.replace(/\bxox[baprs]-[A-Za-z0-9-]{12,}\b/g, 'xox-[REDACTED]');
   out = out.replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA[REDACTED]');
   out = out.replace(
     /\b([A-Za-z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY|ACCESS_KEY)[A-Za-z0-9_]*)\s*=\s*([^\s"'`;&|]+|"[^"]*"|'[^']*')/gi,
     '$1=[REDACTED]',
   );
+  if (out.length > MAX_STRING_LEN) {
+    out = `${out.slice(0, MAX_STRING_LEN)}...[truncated ${out.length - MAX_STRING_LEN} chars]`;
+  }
   return out;
 }
 
 /**
  * Recursively clones and redacts arbitrary structured metadata for safe logging.
  */
-export function redactLogData(value         , depth = 0)          {
+export function redactLogData(value         , depth = 0, seen = new WeakSet        ())          {
   if (value === null || value === undefined) return value;
   if (typeof value === 'string') return redactSecretText(value);
   if (typeof value === 'number' || typeof value === 'boolean') return value;
@@ -134,8 +140,12 @@ export function redactLogData(value         , depth = 0)          {
   if (depth >= MAX_OBJECT_DEPTH) {
     return '[MaxDepth]';
   }
+  if (typeof value === 'object') {
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+  }
   if (Array.isArray(value)) {
-    const sliced = value.slice(0, MAX_ARRAY_ITEMS).map((item) => redactLogData(item, depth + 1));
+    const sliced = value.slice(0, MAX_ARRAY_ITEMS).map((item) => redactLogData(item, depth + 1, seen));
     if (value.length > MAX_ARRAY_ITEMS) {
       sliced.push(`[+${value.length - MAX_ARRAY_ITEMS} more]`);
     }
@@ -143,13 +153,17 @@ export function redactLogData(value         , depth = 0)          {
   }
   if (typeof value === 'object') {
     const out                          = {};
-    for (const [k, v] of Object.entries(value                           )) {
-      if (v === undefined) continue;
-      if (SECRET_KEY_RE.test(k)) {
-        out[k] = '[REDACTED]';
-      } else {
-        out[k] = redactLogData(v, depth + 1);
+    try {
+      for (const [k, v] of Object.entries(value                           )) {
+        if (v === undefined) continue;
+        if (SECRET_KEY_RE.test(k)) {
+          out[k] = '[REDACTED]';
+        } else {
+          out[k] = redactLogData(v, depth + 1, seen);
+        }
       }
+    } catch {
+      return '[UnreadableObject]';
     }
     return out;
   }
@@ -302,7 +316,9 @@ export class RotatingNdjsonSink {
     }
     if (this.pendingLines.length === 0) return;
 
-    const batchText = this.pendingLines.join('');
+    const linesToFlush = this.pendingLines;
+    const bytesToFlush = this.pendingBytes;
+    const batchText = linesToFlush.join('');
     this.pendingLines = [];
     this.pendingBytes = 0;
 
@@ -342,8 +358,24 @@ export class RotatingNdjsonSink {
       if ((this.knownFileSize ?? 0) > this.maxBytes) {
         this.rotateFiles();
       }
-    } catch {
+    } catch (err) {
       this.knownFileSize = null;
+      const code = (err                         ).code;
+      if (code === 'EBUSY' || code === 'EPERM' || code === 'EAGAIN') {
+        this.pendingLines = [...linesToFlush, ...this.pendingLines];
+        this.pendingBytes += bytesToFlush;
+        while (this.pendingLines.length > 0 && this.pendingBytes > this.maxPendingBytes) {
+          const dropped = this.pendingLines.shift() ;
+          this.pendingBytes -= Buffer.byteLength(dropped, 'utf8');
+        }
+        if (!this.disposed && this.flushIntervalMs > 0 && !this.flushTimer && this.pendingLines.length > 0) {
+          this.flushTimer = setTimeout(() => {
+            this.flushTimer = undefined;
+            this.flushSync();
+          }, this.flushIntervalMs);
+          this.flushTimer.unref();
+        }
+      }
     }
   }
 
@@ -368,12 +400,14 @@ export class RotatingNdjsonSink {
         fs.closeSync(fd);
       }
 
-      const raw = buf.subarray(0, bytesRead).toString('utf8');
-      let lines = raw.split(/\r?\n/);
-      // If we started mid-file, discard the partial first line
-      if (offset > 0 && lines.length > 1) {
-        lines = lines.slice(1);
+      let slice = buf.subarray(0, bytesRead);
+      // If we started mid-file, discard up through the first LF byte so UTF-8 boundaries and JSON stay valid
+      if (offset > 0) {
+        const firstNl = slice.indexOf(0x0a);
+        if (firstNl === -1) return [];
+        slice = slice.subarray(firstNl + 1);
       }
+      const lines = slice.toString('utf8').split(/\r?\n/);
       const nonEmpty = lines.filter(Boolean).slice(-maxEntries);
       const parsed             = [];
       for (const line of nonEmpty) {
@@ -464,6 +498,7 @@ export class RotatingNdjsonSink {
               
                   
                     
+                     
                     
                 
                   
@@ -573,6 +608,7 @@ export class StructuredLogger {
       component: state.component,
       event: `${state.event}.coalesced`,
       message: `${state.message} (coalesced ${suppressedCount} identical repeats)`,
+      ...(state.sessionId ? { sessionId: state.sessionId } : {}),
       pid: process.pid,
       data: { suppressedDuplicates: suppressedCount },
     };
@@ -592,7 +628,7 @@ export class StructuredLogger {
 
     const nowMs = Date.now();
     const cleanMessage = redactSecretText(fields.message);
-    const dedupeKey = `${level}|${source}|${fields.component}|${fields.event}|${cleanMessage}`;
+    const dedupeKey = `${level}|${source}|${fields.sessionId ?? ''}|${fields.component}|${fields.event}|${cleanMessage}`;
 
     if (this.dedupeWindowMs > 0 && this.lastDedupe) {
       if (
@@ -611,6 +647,7 @@ export class StructuredLogger {
       key: dedupeKey,
       level,
       source,
+      ...(fields.sessionId ? { sessionId: fields.sessionId } : {}),
       component: fields.component,
       event: fields.event,
       message: cleanMessage,

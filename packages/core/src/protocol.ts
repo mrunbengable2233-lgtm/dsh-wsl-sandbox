@@ -127,6 +127,7 @@ export interface ProcExecResult {
 
 export interface TerminalExecParams extends ProcExecParams {
   readonly terminalId: string;
+  readonly explicitCwd?: boolean;
 }
 
 export interface TerminalExecResult extends ProcExecResult {

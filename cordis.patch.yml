@@ -9,20 +9,4 @@
 - insert:
     - id: dsh-wsl-sandbox
       name: 'dsh-wsl-sandbox'
-      config:
-        enabled: true
-        defaultDistro: 'Ubuntu-24.04'
-        sandboxMode: 'workspace-write'
-        approvalPolicyMode: 'balanced'
-        approvalTimeoutMs: 60000
-        networkMode: 'allowlist-proxy'
-        upstreamProxy: ''
-        cacheMode: 'workspace-persistent'
-        injectSystemPromptSection: true
-        enableHostPwshGuard: true
-        advanced:
-          shares: []
-          deviceNodes: []
-          localLabCidrs: []
-          localLabPorts: []
-          customAllowedDomains: []
+      config: {}

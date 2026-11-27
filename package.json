@@ -6,8 +6,8 @@
   "license": "GPL-3.0-only",
   "type": "module",
   "engines": {
-    "node": "^22.19.0 || >=24.0.0",
-    "dsh": ">=0.2.1-rc.1 <0.3.0"
+    "node": ">=20.11.0",
+    "dsh": ">=0.2.1-0 <1.0.0-0"
   },
   "main": "./dist/packages/dsh-plugin/src/index.js",
   "exports": {
@@ -25,14 +25,6 @@
     "dsh-wsl-doctor": "./dist/packages/bootstrap/src/doctor.js",
     "dsh-wsl-runner": "./dist/packages/wsl-runner/src/main.js"
   },
-  "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.1"
-  },
-  "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": {
-      "optional": true
-    }
-  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -46,7 +38,7 @@
       ]
     },
     "compatibility": {
-      "dsh": ">=0.2.1-rc.1 <0.3.0",
+      "dsh": ">=0.2.1-0 <1.0.0-0",
       "profiles": [
         "desktop",
         "web",
@@ -55,24 +47,23 @@
     }
   },
   "files": [
-    "dist",
+    "dist/packages",
     "client.js",
-    "test.js",
     "icon.svg",
     "locale",
     "cordis.patch.yml",
-    "tsconfig.json",
-    "scripts",
-    "packages",
+    "packages/bootstrap",
+    "scripts/stage-wsl-runner.mjs",
+    "scripts/build.mjs",
+    ".agents/skills/dsh-wsl-env-setup",
     "docs",
-    "tests",
-    ".agents/skills",
-    "AGENTS.md",
+    "LICENSE",
     "INSTALL.zh.md",
     "README.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",
+    "prepare": "node scripts/build.mjs",
     "prepack": "node scripts/build.mjs",
     "test": "node scripts/run-tests.mjs",
     "test:unit": "node scripts/run-tests.mjs --suite unit",

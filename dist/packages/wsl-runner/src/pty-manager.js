@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
+import fs from 'node:fs';
 import { posix } from 'node:path';
 import {
   isPathInside,
+                      
                           
                           
 } from '../../core/src/index.js';
@@ -13,10 +16,36 @@ import {
                                        
  
 
-const CWD_MARKER = '__DSH_WSL_TERM_CWD__=';
-
 function makeKey(sessionId        , terminalId        )         {
   return `${sessionId}::${terminalId}`;
+}
+
+function toPosixPath(p        )         {
+  return p.replace(/\\/g, '/');
+}
+
+function isAllowedTerminalCwd(binding                , candidate        )          {
+  const norm = posix.normalize(toPosixPath(candidate));
+  const wsRoot = posix.normalize(toPosixPath(binding.workspaceRoot));
+  if (isPathInside(wsRoot, norm)) {
+    return true;
+  }
+  try {
+    const wsReal = toPosixPath(fs.realpathSync(binding.workspaceRoot));
+    if (isPathInside(wsReal, norm)) {
+      return true;
+    }
+  } catch {
+    // ignore realpath lookup failure in mocked paths
+  }
+  if (norm === '/shares' || norm.startsWith('/shares/')) {
+    const parts = norm.split('/').filter(Boolean);
+    const alias = parts[1];
+    if (alias && binding.authorizedShares.some((s) => s.alias === alias)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -73,24 +102,37 @@ export class ConfinedTerminalManager {
 
   async exec(params                    )                              {
     const key = makeKey(params.binding.sessionId, params.terminalId);
+    const requestedCwd = params.cwd ? posix.normalize(toPosixPath(params.cwd)) : undefined;
+    const bindingCwdNorm = posix.normalize(toPosixPath(params.binding.cwd));
+    const shouldOverrideCwd =
+      params.explicitCwd === true ||
+      (params.explicitCwd !== false && Boolean(requestedCwd) && requestedCwd !== bindingCwdNorm);
+
     let state = this.sessions.get(key);
     if (!state) {
+      const initialCwd =
+        requestedCwd && isAllowedTerminalCwd(params.binding, requestedCwd)
+          ? requestedCwd
+          : params.binding.cwd;
       state = {
         sessionId: params.binding.sessionId,
         terminalId: params.terminalId,
-        cwd: params.cwd || params.binding.cwd,
+        cwd: initialCwd,
         env: {},
       };
       this.sessions.set(key, state);
+    } else if (shouldOverrideCwd && requestedCwd && isAllowedTerminalCwd(params.binding, requestedCwd)) {
+      state.cwd = requestedCwd;
     }
 
-    const effectiveCwd = isPathInside(params.binding.workspaceRoot, state.cwd)
+    const effectiveCwd = isAllowedTerminalCwd(params.binding, state.cwd)
       ? state.cwd
       : params.binding.workspaceRoot;
 
+    const cwdMarker = `__DSH_WSL_TERM_CWD_${randomUUID().replace(/-/g, '')}__=`;
     const rawCmd = params.command ?? '';
     const wrapped = [
-      `__dsh_emit_cwd() { local __rc=$?; printf '\\n${CWD_MARKER}%s\\n' "$(pwd -P)"; exit $__rc; }`,
+      `__dsh_emit_cwd() { local __rc=$?; printf '\\n${cwdMarker}%s\\n' "$(pwd -P)"; exit $__rc; }`,
       'trap __dsh_emit_cwd EXIT',
       rawCmd,
     ].join('\n');
@@ -104,14 +146,14 @@ export class ConfinedTerminalManager {
       env: { ...state.env, ...(params.env ?? {}) },
     });
 
-    // Extract updated cwd if it remained inside workspaceRoot
+    // Extract updated cwd if it remained inside workspaceRoot or an authorized share
     let cleanText = result.stdout.text;
-    const markerIdx = cleanText.lastIndexOf(CWD_MARKER);
+    const markerIdx = cleanText.lastIndexOf(cwdMarker);
     if (markerIdx !== -1) {
-      const after = cleanText.slice(markerIdx + CWD_MARKER.length).split('\n')[0]?.trim();
+      const after = cleanText.slice(markerIdx + cwdMarker.length).split('\n')[0]?.trim();
       if (after && after.startsWith('/')) {
         const norm = posix.normalize(after);
-        if (isPathInside(params.binding.workspaceRoot, norm)) {
+        if (isAllowedTerminalCwd(params.binding, norm)) {
           state.cwd = norm;
         }
       }

@@ -38,6 +38,9 @@ import { failSandbox } from './errors.js';
                                            
                                  
                                            
+                                
+                                           
+                            
                                              
                                                          
                                                                
@@ -60,6 +63,7 @@ import { failSandbox } from './errors.js';
                               
                                            
                                           
+                                
                                             
                                                         
                                                               
@@ -436,6 +440,7 @@ export function validateProbeAndCreateBinding(
     sandboxReady: true,
     enforcement: probe.enforcement === 'full' ? 'full' : 'partial',
     supportsDisableUserns: Boolean(probe.supportsDisableUserns),
+    ...(probe.hasPrlimit !== undefined ? { hasPrlimit: Boolean(probe.hasPrlimit) } : {}),
     probedSockets: Object.freeze([...(probe.probedSockets ?? [])]),
     authorizedShares: Object.freeze(shares),
     authorizedDevices: Object.freeze(devices),

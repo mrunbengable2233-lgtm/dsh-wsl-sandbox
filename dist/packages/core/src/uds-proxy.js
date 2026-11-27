@@ -1,8 +1,10 @@
 import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import path from 'node:path';
+import tls from 'node:tls';
 import { URL } from 'node:url';
 
 /**
@@ -13,7 +15,8 @@ import { URL } from 'node:url';
  * 2. Only allowed dev domains (or dynamically session-approved domains) pass through.
  * 3. Private / loopback / link-local / metadata IPv4 & IPv6 addresses are ALWAYS blocked
  *    to prevent SSRF, unless matched by human-configured Advanced `localLabCidrs` / `localLabPorts`.
- * 4. Supports chaining to an upstream local proxy (`http://` or `socks5://`, e.g. Clash/Mihomo/v2rayN).
+ * 4. Pins DNS resolution results from policy check into `net.connect` custom `lookup` to defeat DNS rebinding TOCTOU.
+ * 5. Supports chaining to an upstream local proxy (`http://`, `https://`, or `socks5://`).
  */
 
 export const DEFAULT_DEV_DOMAIN_ALLOWLIST                    = [
@@ -65,6 +68,8 @@ export const DEFAULT_DEV_DOMAIN_ALLOWLIST                    = [
                                                                                    
  
 
+const UPSTREAM_HANDSHAKE_TIMEOUT_MS = 15_000;
+
 function ipv4ToInt(ip        )                {
   const parts = ip.split('.');
   if (parts.length !== 4) return null;
@@ -89,7 +94,7 @@ export function parseIpv4Cidr(cidr        )                    {
   return { network: (ip & mask) >>> 0, mask };
 }
 
-const PRIVATE_IPV4_CIDRS                        = [
+const PRIVATE_IPV4_CIDR_STRS = [
   '0.0.0.0/8',
   '10.0.0.0/8',
   '100.64.0.0/10',
@@ -98,9 +103,28 @@ const PRIVATE_IPV4_CIDRS                        = [
   '172.16.0.0/12',
   '192.0.0.0/24',
   '192.168.0.0/16',
+  '198.18.0.0/15',
   '224.0.0.0/4',
   '240.0.0.0/4',
-].map((c) => parseIpv4Cidr(c) );
+]         ;
+
+const PRIVATE_IPV4_CIDRS                        = PRIVATE_IPV4_CIDR_STRS.map((c) => parseIpv4Cidr(c) );
+
+const PRIVATE_BLOCKLIST = (() => {
+  const bl = new net.BlockList();
+  for (const cidr of PRIVATE_IPV4_CIDR_STRS) {
+    const [addr, prefix] = cidr.split('/');
+    bl.addSubnet(addr , Number(prefix), 'ipv4');
+  }
+  bl.addAddress('::', 'ipv6');
+  bl.addAddress('::1', 'ipv6');
+  bl.addSubnet('64:ff9b::', 96, 'ipv6');
+  bl.addSubnet('100::', 64, 'ipv6');
+  bl.addSubnet('fc00::', 7, 'ipv6');
+  bl.addSubnet('fe80::', 10, 'ipv6');
+  bl.addSubnet('ff00::', 8, 'ipv6');
+  return bl;
+})();
 
 function ipMatchesCidrs(ip        , cidrs                       )          {
   const val = ipv4ToInt(ip);
@@ -108,28 +132,116 @@ function ipMatchesCidrs(ip        , cidrs                       )          {
   return cidrs.some((c) => ((val & c.mask) >>> 0) === c.network);
 }
 
-export function isPrivateOrLoopbackIp(rawIp        )          {
-  const ip = rawIp.trim().toLowerCase().replace(/^\[|\]$/g, '');
-  // IPv4-mapped IPv6 e.g. ::ffff:127.0.0.1
-  if (ip.startsWith('::ffff:')) {
-    const mapped = ip.slice(7);
-    if (net.isIPv4(mapped)) return ipMatchesCidrs(mapped, PRIVATE_IPV4_CIDRS);
+function stripIpBracketsAndZone(rawIp        )         {
+  let ip = rawIp.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const zoneIdx = ip.indexOf('%');
+  if (zoneIdx !== -1) {
+    ip = ip.slice(0, zoneIdx);
   }
+  return ip;
+}
+
+function expandIpv6Hextets(ip        )                  {
+  if (!net.isIPv6(ip)) return null;
+
+  let work = ip;
+  if (work.includes('.')) {
+    const lastColon = work.lastIndexOf(':');
+    if (lastColon === -1) return null;
+    const v4Int = ipv4ToInt(work.slice(lastColon + 1));
+    if (v4Int === null) return null;
+    const hi = ((v4Int >>> 16) & 0xffff).toString(16);
+    const lo = (v4Int & 0xffff).toString(16);
+    work = `${work.slice(0, lastColon + 1)}${hi}:${lo}`;
+  }
+
+  const dblParts = work.split('::');
+  if (dblParts.length > 2) return null;
+
+  const parseSegs = (part        )                  => {
+    if (!part) return [];
+    const segs = part.split(':');
+    const nums           = [];
+    for (const seg of segs) {
+      if (!/^[0-9a-f]{1,4}$/.test(seg)) return null;
+      nums.push(parseInt(seg, 16));
+    }
+    return nums;
+  };
+
+  if (dblParts.length === 1) {
+    const full = parseSegs(dblParts[0] );
+    return full && full.length === 8 ? full : null;
+  }
+
+  const left = parseSegs(dblParts[0] );
+  const right = parseSegs(dblParts[1] );
+  if (!left || !right) return null;
+  const missing = 8 - (left.length + right.length);
+  if (missing < 1) return null;
+  return [...left, ...new Array        (missing).fill(0), ...right];
+}
+
+function hextetsToIpv4(h6        , h7        )         {
+  return `${(h6 >>> 8) & 0xff}.${h6 & 0xff}.${(h7 >>> 8) & 0xff}.${h7 & 0xff}`;
+}
+
+function canonicalizeIp(rawIp        )         {
+  const ip = stripIpBracketsAndZone(rawIp);
+  if (net.isIPv4(ip)) return ip;
+  const hextets = expandIpv6Hextets(ip);
+  if (!hextets) return ip;
+  // Normalize IPv4-mapped ::ffff:0:0/96 or ::1 / ::
+  const isAllZeroPrefix =
+    hextets[0] === 0 && hextets[1] === 0 && hextets[2] === 0 && hextets[3] === 0 && hextets[4] === 0;
+  if (isAllZeroPrefix && hextets[5] === 0 && hextets[6] === 0 && hextets[7] === 1) {
+    return '::1';
+  }
+  if (isAllZeroPrefix && hextets[5] === 0xffff) {
+    return hextetsToIpv4(hextets[6] , hextets[7] );
+  }
+  return ip;
+}
+
+export function isPrivateOrLoopbackIp(rawIp        )          {
+  const ip = stripIpBracketsAndZone(rawIp);
   if (net.isIPv4(ip)) {
-    return ipMatchesCidrs(ip, PRIVATE_IPV4_CIDRS);
+    return PRIVATE_BLOCKLIST.check(ip, 'ipv4') || ipMatchesCidrs(ip, PRIVATE_IPV4_CIDRS);
   }
   if (net.isIPv6(ip)) {
-    if (ip === '::' || ip === '::1') return true;
-    if (ip.startsWith('fc') || ip.startsWith('fd')) return true; // fc00::/7 ULA
-    if (ip.startsWith('fe8') || ip.startsWith('fe9') || ip.startsWith('fea') || ip.startsWith('feb')) return true; // fe80::/10
-    if (ip.startsWith('ff')) return true; // multicast
+    if (PRIVATE_BLOCKLIST.check(ip, 'ipv6')) return true;
+    const hextets = expandIpv6Hextets(ip);
+    if (!hextets) return false;
+    const zeroFirstFive =
+      hextets[0] === 0 && hextets[1] === 0 && hextets[2] === 0 && hextets[3] === 0 && hextets[4] === 0;
+    // ::ffff:0:0/96 IPv4-mapped IPv6 (including hex forms like ::ffff:7f00:1)
+    if (zeroFirstFive && hextets[5] === 0xffff) {
+      const innerV4 = hextetsToIpv4(hextets[6] , hextets[7] );
+      return PRIVATE_BLOCKLIST.check(innerV4, 'ipv4');
+    }
+    // Deprecated IPv4-compatible ::/96
+    if (zeroFirstFive && hextets[5] === 0) {
+      const innerV4 = hextetsToIpv4(hextets[6] , hextets[7] );
+      return PRIVATE_BLOCKLIST.check(innerV4, 'ipv4');
+    }
+    // 64:ff9b::/96 NAT64 (block both prefix and embedded IPv4)
+    if (
+      hextets[0] === 0x0064 &&
+      hextets[1] === 0xff9b &&
+      hextets[2] === 0 &&
+      hextets[3] === 0 &&
+      hextets[4] === 0 &&
+      hextets[5] === 0
+    ) {
+      return true;
+    }
     return false;
   }
   return false;
 }
 
 export function domainMatchesPattern(host        , pattern        )          {
-  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const h = stripIpBracketsAndZone(host);
   const p = pattern.trim().toLowerCase();
   if (!p) return false;
   if (p.startsWith('*.')) {
@@ -144,6 +256,7 @@ export function domainMatchesPattern(host        , pattern        )          {
                           
                                 
                                    
+                             
  
 
 export async function evaluateProxyTarget(
@@ -158,7 +271,7 @@ export async function evaluateProxyTarget(
                                         
    ,
 )                               {
-  const host = rawHost.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const host = stripIpBracketsAndZone(rawHost);
   if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
     return { allowed: false, reason: `Invalid target host or port: ${rawHost}:${port}` };
   }
@@ -167,11 +280,8 @@ export async function evaluateProxyTarget(
   const literalIpType = net.isIP(host);
 
   const checkLocalLab = (ipList                   )          => {
-    if (options.localLabPorts.size > 0 && !options.localLabPorts.has(port)) {
-      // If ports are specified, check if port matches when hitting loopback
-    }
     for (const ip of ipList) {
-      const normalized = ip.toLowerCase();
+      const normalized = canonicalizeIp(ip);
       if (normalized === '127.0.0.1' || normalized === '::1') {
         if (options.localLabPorts.has(port)) return true;
       }
@@ -184,27 +294,46 @@ export async function evaluateProxyTarget(
     return false;
   };
 
-  // 1. Literal IP or localhost checks
+  // 1. Literal IP or localhost checks (ALWAYS enforced even when upstreamProxy is configured!)
   if (isLocalhostName) {
     if (checkLocalLab(['127.0.0.1', '::1'])) {
-      return { allowed: true, reason: `Matched Advanced local lab loopback port ${port}`, isLocalLab: true };
+      return {
+        allowed: true,
+        reason: `Matched Advanced local lab loopback port ${port}`,
+        isLocalLab: true,
+        pinnedIp: '127.0.0.1',
+      };
     }
-    return { allowed: false, reason: `SSRF blocked: localhost target ${host}:${port} is not in Advanced localLabPorts`, isSsrfBlocked: true };
+    return {
+      allowed: false,
+      reason: `SSRF blocked: localhost target ${host}:${port} is not in Advanced localLabPorts`,
+      isSsrfBlocked: true,
+    };
   }
 
   if (literalIpType !== 0) {
+    const canonIp = canonicalizeIp(host);
     if (isPrivateOrLoopbackIp(host)) {
       if (checkLocalLab([host])) {
-        return { allowed: true, reason: `Matched Advanced local lab CIDR/port (${host}:${port})`, isLocalLab: true };
+        return {
+          allowed: true,
+          reason: `Matched Advanced local lab CIDR/port (${host}:${port})`,
+          isLocalLab: true,
+          pinnedIp: canonIp,
+        };
       }
-      return { allowed: false, reason: `SSRF blocked: private/loopback IP ${host}:${port} denied`, isSsrfBlocked: true };
+      return {
+        allowed: false,
+        reason: `SSRF blocked: private/loopback IP ${host}:${port} denied`,
+        isSsrfBlocked: true,
+      };
     }
     // Public literal IP still requires allowlist
     const inList =
       options.sessionAllowed.has(host) ||
       options.allowlist.some((p) => domainMatchesPattern(host, p));
     return inList
-      ? { allowed: true, reason: 'Allowed public IP' }
+      ? { allowed: true, reason: 'Allowed public IP', pinnedIp: host }
       : { allowed: false, reason: `Target IP ${host} is not in proxy allowlist` };
   }
 
@@ -217,7 +346,8 @@ export async function evaluateProxyTarget(
     return { allowed: false, reason: `Domain ${host} is not in proxy allowlist` };
   }
 
-  // 3. DNS rebinding / SSRF protection (skip DNS only if caller explicitly mocks or delegates remote DNS to upstream proxy)
+  // 3. DNS rebinding / SSRF protection + IP pinning
+  let pinnedIp                    ;
   if (!options.hasUpstreamProxy || options.resolveHost) {
     const resolver = options.resolveHost ?? (async (h        ) => {
       const results = await dns.lookup(h, { all: true });
@@ -225,10 +355,18 @@ export async function evaluateProxyTarget(
     });
     try {
       const ips = await resolver(host);
+      if (ips.length === 0 && !options.hasUpstreamProxy) {
+        return { allowed: false, reason: `DNS resolution returned no addresses for ${host}` };
+      }
       for (const ip of ips) {
         if (isPrivateOrLoopbackIp(ip)) {
           if (checkLocalLab([ip])) {
-            return { allowed: true, reason: `Resolved ${host} -> ${ip} matched Advanced local lab`, isLocalLab: true };
+            return {
+              allowed: true,
+              reason: `Resolved ${host} -> ${ip} matched Advanced local lab`,
+              isLocalLab: true,
+              pinnedIp: canonicalizeIp(ip),
+            };
           }
           return {
             allowed: false,
@@ -237,6 +375,9 @@ export async function evaluateProxyTarget(
           };
         }
       }
+      if (ips.length > 0) {
+        pinnedIp = ips[0];
+      }
     } catch {
       if (!options.hasUpstreamProxy) {
         return { allowed: false, reason: `DNS resolution failed for ${host}` };
@@ -244,7 +385,7 @@ export async function evaluateProxyTarget(
     }
   }
 
-  return { allowed: true, reason: `Domain ${host} allowed` };
+  return { allowed: true, reason: `Domain ${host} allowed`, ...(pinnedIp ? { pinnedIp } : {}) };
 }
 
 function connectViaHttpUpstream(
@@ -254,20 +395,41 @@ function connectViaHttpUpstream(
 )                      {
   return new Promise((resolve, reject) => {
     const proxyHost = upstreamUrl.hostname;
-    const proxyPort = Number(upstreamUrl.port || (upstreamUrl.protocol === 'https:' ? 443 : 80));
-    const sock = net.connect(proxyPort, proxyHost);
+    const isHttpsUpstream = upstreamUrl.protocol === 'https:';
+    const proxyPort = Number(upstreamUrl.port || (isHttpsUpstream ? 443 : 80));
+    const sock             = isHttpsUpstream
+      ? tls.connect({ host: proxyHost, port: proxyPort, servername: proxyHost })
+      : net.connect(proxyPort, proxyHost);
     let settled = false;
     let buf = '';
+
+    const timer = setTimeout(() => {
+      fail(new Error('Upstream HTTP proxy handshake timed out'));
+    }, UPSTREAM_HANDSHAKE_TIMEOUT_MS);
+    timer.unref();
+
+    const cleanupListeners = ()       => {
+      clearTimeout(timer);
+      sock.off('error', fail);
+      sock.off('close', onClose);
+      sock.off('data', onData);
+    };
 
     const fail = (err       )       => {
       if (settled) return;
       settled = true;
+      cleanupListeners();
       sock.destroy();
       reject(err);
     };
 
-    sock.once('error', fail);
-    sock.once('connect', () => {
+    const onClose = ()       => {
+      fail(new Error('Upstream HTTP proxy closed before CONNECT completed'));
+    };
+
+    sock.on('error', fail);
+    sock.once('close', onClose);
+    sock.once(isHttpsUpstream ? 'secureConnect' : 'connect', () => {
       const headers = [`CONNECT ${targetHost}:${targetPort} HTTP/1.1`, `Host: ${targetHost}:${targetPort}`];
       if (upstreamUrl.username || upstreamUrl.password) {
         const token = Buffer.from(
@@ -286,7 +448,6 @@ function connectViaHttpUpstream(
         if (buf.length > 16384) fail(new Error('Upstream HTTP proxy response header too large'));
         return;
       }
-      sock.off('data', onData);
       const statusLine = buf.slice(0, buf.indexOf('\r\n'));
       const match = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})/);
       if (!match || Number(match[1]) !== 200) {
@@ -294,6 +455,7 @@ function connectViaHttpUpstream(
         return;
       }
       settled = true;
+      cleanupListeners();
       const leftover = buf.slice(endIdx + 4);
       if (leftover.length > 0) {
         sock.unshift(Buffer.from(leftover, 'latin1'));
@@ -320,11 +482,28 @@ function connectViaSocks5Upstream(
 
     const hasAuth = Boolean(upstreamUrl.username || upstreamUrl.password);
 
+    const timer = setTimeout(() => {
+      fail(new Error('Upstream SOCKS5 proxy handshake timed out'));
+    }, UPSTREAM_HANDSHAKE_TIMEOUT_MS);
+    timer.unref();
+
+    const cleanupListeners = ()       => {
+      clearTimeout(timer);
+      sock.off('error', fail);
+      sock.off('close', onClose);
+      sock.off('data', onData);
+    };
+
     const fail = (err       )       => {
       if (settled) return;
       settled = true;
+      cleanupListeners();
       sock.destroy();
       reject(err);
+    };
+
+    const onClose = ()       => {
+      fail(new Error('Upstream SOCKS5 proxy closed before CONNECT completed'));
     };
 
     const sendConnectRequest = ()       => {
@@ -345,7 +524,8 @@ function connectViaSocks5Upstream(
       sock.write(req);
     };
 
-    sock.once('error', fail);
+    sock.on('error', fail);
+    sock.once('close', onClose);
     sock.once('connect', () => {
       if (hasAuth) {
         sock.write(Buffer.from([0x05, 0x02, 0x00, 0x02]));
@@ -409,8 +589,8 @@ function connectViaSocks5Upstream(
         }
         if (acc.length < headerLen) return;
         const leftover = acc.subarray(headerLen);
-        sock.off('data', onData);
         settled = true;
+        cleanupListeners();
         if (leftover.length > 0) sock.unshift(leftover);
         resolve(sock);
       }
@@ -422,6 +602,7 @@ function connectViaSocks5Upstream(
 
 export class UdsAllowlistProxy {
                    socketPath        ;
+                   baseAllowedDomains                   ;
           allowlist          ;
                    sessionAllowed = new Set        ();
           localLabCidrs              ;
@@ -434,8 +615,9 @@ export class UdsAllowlistProxy {
 
   constructor(config                ) {
     this.socketPath = config.socketPath;
+    this.baseAllowedDomains = [...(config.allowedDomains ?? DEFAULT_DEV_DOMAIN_ALLOWLIST)];
     this.allowlist = [
-      ...(config.allowedDomains ?? DEFAULT_DEV_DOMAIN_ALLOWLIST),
+      ...this.baseAllowedDomains,
       ...(config.customAllowedDomains ?? []),
     ];
     this.localLabCidrs = (config.localLabCidrs ?? [])
@@ -454,8 +636,12 @@ export class UdsAllowlistProxy {
     return this.socketPath;
   }
 
+  getAllowlistSnapshot()                    {
+    return [...this.allowlist];
+  }
+
   addSessionAllowedDomain(host        )       {
-    this.sessionAllowed.add(host.trim().toLowerCase());
+    this.sessionAllowed.add(stripIpBracketsAndZone(host));
   }
 
   clearSessionAllowedDomains()       {
@@ -469,7 +655,7 @@ export class UdsAllowlistProxy {
                                       
    )       {
     if (patch.customAllowedDomains) {
-      this.allowlist = [...DEFAULT_DEV_DOMAIN_ALLOWLIST, ...patch.customAllowedDomains];
+      this.allowlist = [...this.baseAllowedDomains, ...patch.customAllowedDomains];
     }
     if (patch.upstreamProxy !== undefined) {
       this.upstreamUrl = patch.upstreamProxy.trim() ? new URL(patch.upstreamProxy.trim()) : undefined;
@@ -485,13 +671,14 @@ export class UdsAllowlistProxy {
   }
 
           async checkAndAuthorize(host        , port        )                               {
-    const verdict = await evaluateProxyTarget(host, port, {
+    const evalOpts = {
       allowlist: this.allowlist,
       sessionAllowed: this.sessionAllowed,
       localLabCidrs: this.localLabCidrs,
       localLabPorts: this.localLabPorts,
       hasUpstreamProxy: Boolean(this.upstreamUrl),
-    });
+    };
+    const verdict = await evaluateProxyTarget(host, port, evalOpts);
 
     if (verdict.allowed || verdict.isSsrfBlocked) {
       return verdict;
@@ -501,7 +688,7 @@ export class UdsAllowlistProxy {
       const approved = await this.authorizeUnknownHost(host, port);
       if (approved) {
         this.addSessionAllowedDomain(host);
-        return { allowed: true, reason: `User approved domain ${host}` };
+        return evaluateProxyTarget(host, port, evalOpts);
       }
     }
     return verdict;
@@ -511,6 +698,7 @@ export class UdsAllowlistProxy {
     host        ,
     port        ,
     isLocalLab         ,
+    pinnedIp         ,
   )                                                                                       {
     // Local lab targets always connect directly (never sent to external upstream proxy)
     if (!isLocalLab && this.upstreamUrl) {
@@ -521,8 +709,27 @@ export class UdsAllowlistProxy {
       const socket = await connectViaHttpUpstream(this.upstreamUrl, host, port);
       return { socket, via: 'upstream-http' };
     }
+
+    const connectHost = stripIpBracketsAndZone(host);
     const socket = await new Promise            ((resolve, reject) => {
-      const s = net.connect(port, host);
+      let s            ;
+      if (pinnedIp && net.isIP(pinnedIp) !== 0 && net.isIP(connectHost) === 0) {
+        const family = net.isIPv6(pinnedIp) ? 6 : 4;
+        const pinnedLookup = ((
+          _hostname        ,
+          opts                   ,
+          cb                                                                                                                      ,
+        ) => {
+          if (opts && opts.all) {
+            cb(null, [{ address: pinnedIp, family }]);
+          } else {
+            cb(null, pinnedIp, family);
+          }
+        })                                 ;
+        s = net.connect({ host: connectHost, port, lookup: pinnedLookup });
+      } else {
+        s = net.connect(port, pinnedIp && net.isIP(pinnedIp) !== 0 ? pinnedIp : connectHost);
+      }
       s.once('error', reject);
       s.once('connect', () => {
         s.off('error', reject);
@@ -577,10 +784,12 @@ export class UdsAllowlistProxy {
             ).toString('base64');
             upstreamHeaders['proxy-authorization'] = `Basic ${token}`;
           }
-          const proxyReq = http.request(
+          const isHttpsUpstream = this.upstreamUrl.protocol === 'https:';
+          const reqFn = isHttpsUpstream ? https.request : http.request;
+          const proxyReq = reqFn(
             {
               host: this.upstreamUrl.hostname,
-              port: Number(this.upstreamUrl.port || 80),
+              port: Number(this.upstreamUrl.port || (isHttpsUpstream ? 443 : 80)),
               method: req.method,
               path: targetUrl.toString(),
               headers: upstreamHeaders,
@@ -598,7 +807,12 @@ export class UdsAllowlistProxy {
           return;
         }
 
-        const { socket, via } = await this.openTargetSocket(host, port, Boolean(verdict.isLocalLab));
+        const { socket, via } = await this.openTargetSocket(
+          host,
+          port,
+          Boolean(verdict.isLocalLab),
+          verdict.pinnedIp,
+        );
         this.trackSocket(socket);
         this.onAllowed?.({ host, port, via });
 
@@ -631,11 +845,21 @@ export class UdsAllowlistProxy {
       }
     });
 
+    server.on('clientError', (_err, socket) => {
+      try {
+        socket.destroy();
+      } catch {
+        // ignore
+      }
+    });
+
     server.on('connection', (sock) => {
+      sock.on('error', () => {});
       this.trackSocket(sock);
     });
 
     server.on('connect', async (req, clientSocket, head) => {
+      clientSocket.on('error', () => {});
       this.trackSocket(clientSocket);
       try {
         const authority = req.url ?? '';
@@ -646,32 +870,42 @@ export class UdsAllowlistProxy {
         const verdict = await this.checkAndAuthorize(host, port);
         if (!verdict.allowed) {
           this.onDenied?.({ host, port, reason: verdict.reason });
-          clientSocket.write(
-            `HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDSH WSL Sandbox Proxy Blocked: ${verdict.reason}\r\n`,
-          );
+          if (!clientSocket.destroyed && clientSocket.writable) {
+            clientSocket.write(
+              `HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nDSH WSL Sandbox Proxy Blocked: ${verdict.reason}\r\n`,
+            );
+          }
           clientSocket.destroy();
           return;
         }
 
-        const { socket: upstream, via } = await this.openTargetSocket(host, port, Boolean(verdict.isLocalLab));
+        const { socket: upstream, via } = await this.openTargetSocket(
+          host,
+          port,
+          Boolean(verdict.isLocalLab),
+          verdict.pinnedIp,
+        );
+        upstream.on('error', () => clientSocket.destroy());
         this.trackSocket(upstream);
         this.onAllowed?.({ host, port, via });
 
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head && head.length > 0) {
+        if (!clientSocket.destroyed && clientSocket.writable) {
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        }
+        if (head && head.length > 0 && !upstream.destroyed && upstream.writable) {
           upstream.write(head);
         }
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
 
-        upstream.on('error', () => clientSocket.destroy());
-        clientSocket.on('error', () => upstream.destroy());
         upstream.on('close', () => clientSocket.destroy());
         clientSocket.on('close', () => upstream.destroy());
       } catch (err) {
-        clientSocket.write(
-          `HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n${err instanceof Error ? err.message : String(err)}\r\n`,
-        );
+        if (!clientSocket.destroyed && clientSocket.writable) {
+          clientSocket.write(
+            `HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n${err instanceof Error ? err.message : String(err)}\r\n`,
+          );
+        }
         clientSocket.destroy();
       }
     });

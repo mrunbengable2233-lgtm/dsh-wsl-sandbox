@@ -3,21 +3,120 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { posix } from 'node:path';
 import {
   buildBwrapArgs,
   type CollectedStream,
   compileSeccompBpf,
   failSandbox,
+  isPathInside,
   type ProcExecParams,
   type ProcExecResult,
   sanitizeSandboxEnv,
+  type SessionBinding,
 } from '../../core/src/index.ts';
 import { resolveEphemeralRamTmpRoot } from './hygiene.ts';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_GRACE_MS = 2_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024;
-const MAX_SPILL_BYTES = 10 * 1024 * 1024;
+const MAX_COLLECTOR_OUTPUT_BYTES = 4 * 1024 * 1024;
+
+function findExecutableInHost(candidates: readonly string[], commandName: string): string | undefined {
+  for (const candidate of candidates) {
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // continue
+    }
+  }
+  const pathEnv =
+    process.env.PATH ||
+    '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/run/current-system/sw/bin';
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, commandName);
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile()) {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      }
+    } catch {
+      // continue
+    }
+  }
+  return undefined;
+}
+
+function resolveBashExecutable(): string {
+  return (
+    findExecutableInHost(
+      ['/bin/bash', '/usr/bin/bash', '/usr/local/bin/bash', '/run/current-system/sw/bin/bash'],
+      'bash',
+    ) ?? '/bin/bash'
+  );
+}
+
+function hasPrlimitBinary(): boolean {
+  return Boolean(
+    findExecutableInHost(['/usr/bin/prlimit', '/bin/prlimit', '/run/current-system/sw/bin/prlimit'], 'prlimit'),
+  );
+}
+
+function resolveExecutionCwd(binding: SessionBinding, requestedCwd: string): {
+  readonly bwrapCwd: string;
+  readonly hostSpawnCwd: string;
+} {
+  if (!requestedCwd || requestedCwd.includes('\0')) {
+    failSandbox('POLICY_BLOCK', `Invalid working directory: ${String(requestedCwd)}`);
+  }
+  const normReq = posix.normalize(requestedCwd.replace(/\\/g, '/'));
+  if (normReq === '/shares' || normReq.startsWith('/shares/')) {
+    const parts = normReq.split('/').filter(Boolean);
+    const alias = parts[1];
+    const share = binding.authorizedShares.find((s) => s.alias === alias);
+    if (!share) {
+      failSandbox('POLICY_BLOCK', `Unauthorized share cwd: ${requestedCwd}`);
+    }
+    const shareRootReal = fs.realpathSync(share.sourceLinuxPath).replace(/\\/g, '/');
+    const subRel = parts.slice(2).join('/');
+    const candidate = subRel ? posix.join(shareRootReal, subRel) : shareRootReal;
+    let hostDirReal: string;
+    try {
+      hostDirReal = fs.realpathSync(candidate).replace(/\\/g, '/');
+    } catch (err) {
+      failSandbox(
+        'POLICY_BLOCK',
+        `Failed to resolve share cwd (${requestedCwd}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (!isPathInside(shareRootReal, hostDirReal)) {
+      failSandbox('POLICY_BLOCK', `Share cwd escapes share root: ${requestedCwd} -> ${hostDirReal}`);
+    }
+    return { bwrapCwd: normReq, hostSpawnCwd: hostDirReal };
+  }
+
+  let wsReal: string;
+  let cwdReal: string;
+  try {
+    wsReal = fs.realpathSync(binding.workspaceRoot).replace(/\\/g, '/');
+    cwdReal = fs.realpathSync(normReq).replace(/\\/g, '/');
+  } catch (err) {
+    failSandbox(
+      'POLICY_BLOCK',
+      `Failed to resolve cwd (${requestedCwd}): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  if (!isPathInside(wsReal, cwdReal)) {
+    failSandbox('POLICY_BLOCK', `cwd escapes workspaceRoot (${wsReal}): ${requestedCwd} -> ${cwdReal}`);
+  }
+  return { bwrapCwd: cwdReal, hostSpawnCwd: cwdReal };
+}
 
 const DENIAL_SIGNATURES = [
   'read-only file system',
@@ -48,92 +147,73 @@ interface ActiveProc {
 
 class BoundedStreamCollector {
   private readonly maxBytes: number;
-  private readonly spillDir: string;
-  private readonly name: string;
   private chunks: Buffer[] = [];
+  private headIdx = 0;
   private keptBytes = 0;
   private totalBytes = 0;
   private truncated = false;
-  private spillPath: string | undefined;
-  private spillFd: number | undefined;
-  private spillBytes = 0;
-  private spillAborted = false;
   private finishedResult: CollectedStream | undefined;
 
-  constructor(maxBytes: number, spillDir: string, name: string) {
-    this.maxBytes = Math.max(1024, maxBytes);
-    this.spillDir = spillDir;
-    this.name = name;
+  constructor(maxBytes: number) {
+    this.maxBytes = Math.min(MAX_COLLECTOR_OUTPUT_BYTES, Math.max(1024, maxBytes));
   }
 
   push(chunk: Buffer): void {
     this.totalBytes += chunk.length;
+    if (chunk.length === 0) return;
 
-    if (!this.truncated && this.keptBytes + chunk.length <= this.maxBytes) {
-      this.chunks.push(chunk);
-      this.keptBytes += chunk.length;
-      return;
-    }
-
-    // Overflow -> begin spill file with previously buffered bytes + new bytes
-    if (!this.truncated) {
-      this.truncated = true;
-      try {
-        fs.mkdirSync(this.spillDir, { recursive: true, mode: 0o700 });
-        this.spillPath = path.join(this.spillDir, `${this.name}-${randomUUID()}.log`);
-        this.spillFd = fs.openSync(this.spillPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
-        for (const prev of this.chunks) {
-          this.writeSpill(prev);
-        }
-      } catch {
-        this.spillAborted = true;
-        this.spillPath = undefined;
+    if (chunk.length >= this.maxBytes) {
+      if (this.keptBytes > 0 || chunk.length > this.maxBytes) {
+        this.truncated = true;
       }
-    }
-
-    this.writeSpill(chunk);
-
-    // Keep tail up to maxBytes in memory
-    const combined = Buffer.concat([...this.chunks, chunk]);
-    if (combined.length > this.maxBytes) {
-      const tail = combined.subarray(combined.length - this.maxBytes);
-      this.chunks = [tail];
-      this.keptBytes = tail.length;
-    } else {
-      this.chunks = [combined];
-      this.keptBytes = combined.length;
-    }
-  }
-
-  private writeSpill(buf: Buffer): void {
-    if (this.spillAborted || this.spillFd === undefined) return;
-    if (this.spillBytes + buf.length > MAX_SPILL_BYTES) {
-      try { fs.closeSync(this.spillFd); } catch { /* ignore */ }
-      this.spillFd = undefined;
-      if (this.spillPath) fs.rmSync(this.spillPath, { force: true });
-      this.spillPath = undefined;
-      this.spillAborted = true;
+      this.chunks = [Buffer.from(chunk.subarray(chunk.length - this.maxBytes))];
+      this.headIdx = 0;
+      this.keptBytes = this.chunks[0]!.length;
       return;
     }
-    try {
-      fs.writeSync(this.spillFd, buf);
-      this.spillBytes += buf.length;
-    } catch {
-      this.spillAborted = true;
+
+    this.chunks.push(chunk);
+    this.keptBytes += chunk.length;
+    if (this.keptBytes > this.maxBytes) {
+      this.truncated = true;
+      while (this.headIdx < this.chunks.length && this.keptBytes > this.maxBytes) {
+        const head = this.chunks[this.headIdx]!;
+        const excess = this.keptBytes - this.maxBytes;
+        if (head.length <= excess) {
+          this.keptBytes -= head.length;
+          this.headIdx += 1;
+        } else {
+          this.chunks[this.headIdx] = head.subarray(excess);
+          this.keptBytes -= excess;
+          break;
+        }
+      }
+      if (this.headIdx > 64) {
+        this.chunks = this.chunks.slice(this.headIdx);
+        this.headIdx = 0;
+      }
     }
   }
 
   finish(): CollectedStream {
-    if (this.spillFd !== undefined) {
-      try { fs.closeSync(this.spillFd); } catch { /* ignore */ }
-      this.spillFd = undefined;
-    }
     if (!this.finishedResult) {
+      const activeChunks = this.headIdx > 0 ? this.chunks.slice(this.headIdx) : this.chunks;
+      let buf = activeChunks.length === 1 ? activeChunks[0]! : Buffer.concat(activeChunks, this.keptBytes);
+      if (this.truncated && buf.length > 0) {
+        // Advance past orphan UTF-8 continuation bytes (`10xxxxxx`) at the truncated boundary
+        let start = 0;
+        while (start < buf.length && start < 3 && (buf[start]! & 0xc0) === 0x80) {
+          start += 1;
+        }
+        if (start > 0) {
+          buf = buf.subarray(start);
+        }
+      }
       this.finishedResult = {
-        text: Buffer.concat(this.chunks).toString('utf8'),
+        text: buf.toString('utf8'),
         truncated: this.truncated,
         totalBytes: this.totalBytes,
-        spillPath: this.truncated && !this.spillAborted ? this.spillPath : undefined,
+        spillPath: undefined,
       };
     }
     return this.finishedResult;
@@ -152,7 +232,8 @@ class BoundedStreamCollector {
  */
 function wrapCommandWithUdsLoopbackBridge(innerCommand: string): string {
   return [
-    '__dsh_proxy_port=$((38000 + ($$ % 10000)))',
+    '__dsh_proxy_port=$((38000 + ((${RANDOM:-0} + $$) % 20000)))',
+    '__dsh_port_hex=$(printf "%04X" "$__dsh_proxy_port")',
     '__dsh_bridge_pid=""',
     '__dsh_stop_bridge() { if [ -n "$__dsh_bridge_pid" ]; then kill "$__dsh_bridge_pid" 2>/dev/null || true; wait "$__dsh_bridge_pid" 2>/dev/null || true; __dsh_bridge_pid=""; fi; }',
     'if command -v socat >/dev/null 2>&1; then',
@@ -167,7 +248,12 @@ function wrapCommandWithUdsLoopbackBridge(innerCommand: string): string {
     'export HTTPS_PROXY="http://127.0.0.1:${__dsh_proxy_port}"',
     'export http_proxy="http://127.0.0.1:${__dsh_proxy_port}"',
     'export https_proxy="http://127.0.0.1:${__dsh_proxy_port}"',
-    'sleep 0.05',
+    '__dsh_tries=0',
+    'while [ "$__dsh_tries" -lt 20 ]; do',
+    '  if grep -qi ":${__dsh_port_hex} " /proc/net/tcp 2>/dev/null; then break; fi',
+    '  __dsh_tries=$((__dsh_tries + 1))',
+    '  sleep 0.02',
+    'done',
     '(',
     innerCommand,
     ')',
@@ -223,7 +309,6 @@ export class ConfinedProcManager {
   private readonly placeholderRefs = new Map<string, number>();
   private readonly runtimeDir: string;
   private readonly emptyMaskFile: string;
-  private readonly spillDir: string;
 
   constructor(baseTempDir?: string) {
     this.runtimeDir =
@@ -232,7 +317,6 @@ export class ConfinedProcManager {
     fs.writeFileSync(path.join(this.runtimeDir, 'owner.pid'), `${process.pid}\n`, { mode: 0o600 });
     this.emptyMaskFile = path.join(this.runtimeDir, 'empty-mask');
     fs.writeFileSync(this.emptyMaskFile, '', { mode: 0o444 });
-    this.spillDir = path.join(this.runtimeDir, 'spills');
   }
 
   getRuntimeDir(): string {
@@ -361,19 +445,22 @@ export class ConfinedProcManager {
     const maxOutputBytes = params.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 
     const useBridge = params.networkMode === 'allowlist-proxy' && Boolean(params.proxySocketHostPath);
+    const bashExe = resolveBashExecutable();
 
     let targetArgv: string[];
     if (params.argv && params.argv.length > 0 && !useBridge) {
       targetArgv = [...params.argv];
     } else if (params.command !== undefined) {
       const script = useBridge ? wrapCommandWithUdsLoopbackBridge(params.command) : params.command;
-      targetArgv = ['/bin/bash', '-c', script];
+      targetArgv = [bashExe, '-c', script];
     } else if (params.argv && params.argv.length > 0 && useBridge) {
       const quoted = params.argv.map((a) => `'${a.replace(/'/g, "'\\''")}'`).join(' ');
-      targetArgv = ['/bin/bash', '-c', wrapCommandWithUdsLoopbackBridge(quoted)];
+      targetArgv = [bashExe, '-c', wrapCommandWithUdsLoopbackBridge(quoted)];
     } else {
       failSandbox('INVALID_ACTION', 'proc.exec requires either command or argv');
     }
+
+    const resolvedCwd = resolveExecutionCwd(params.binding, params.cwd);
 
     const homeDir = os.homedir() || `/home/${params.binding.username}`;
     const ownerEnv: Record<string, string> = {
@@ -399,6 +486,15 @@ export class ConfinedProcManager {
 
     if (params.cacheDir && params.mode === 'workspace-write') {
       fs.mkdirSync(params.cacheDir, { recursive: true, mode: 0o700 });
+      try {
+        const lastUsedPath = path.join(params.cacheDir, '.last-used');
+        const fd = fs.openSync(lastUsedPath, 'a', 0o600);
+        fs.closeSync(fd);
+        const now = new Date();
+        fs.utimesSync(lastUsedPath, now, now);
+      } catch {
+        // Non-fatal cache timestamp update failure
+      }
     }
 
     // Compile architecture-specific seccomp-bpf and open fd for `bwrap --seccomp 3`
@@ -408,15 +504,18 @@ export class ConfinedProcManager {
       // Offline mode blocks AF_INET/AF_INET6 at seccomp layer too; allowlist-proxy relies on
       // --unshare-net isolation + AF_VSOCK/AF_PACKET block so sandbox-local 127.0.0.1 bridge works.
       blockNetworkSockets: params.networkMode === 'offline',
+      blockUsernsClone: !params.binding.supportsDisableUserns,
     });
     fs.writeFileSync(bpfPath, bpfBuf, { mode: 0o600 });
     const bpfFd = fs.openSync(bpfPath, 'r');
+
+    const usePrlimit = params.binding.hasPrlimit !== false && hasPrlimitBinary();
 
     let bwrapBuild;
     try {
       bwrapBuild = buildBwrapArgs({
         argv: targetArgv,
-        cwd: params.cwd,
+        cwd: resolvedCwd.bwrapCwd,
         workspaceRoot: params.binding.workspaceRoot,
         mode: params.mode,
         networkMode: params.networkMode,
@@ -425,7 +524,7 @@ export class ConfinedProcManager {
         env: sanitizedEnv,
         homeDir,
         rlimits: params.rlimits,
-        usePrlimit: true,
+        usePrlimit,
         shares: params.binding.authorizedShares,
         devices: params.binding.authorizedDevices,
         cacheDir: params.cacheDir,
@@ -442,10 +541,14 @@ export class ConfinedProcManager {
     const acquiredPlaceholders = this.acquirePlaceholders(bwrapBuild.createdPlaceholders);
 
     const child = spawn('bwrap', bwrapBuild.bwrapArgs, {
+      cwd: resolvedCwd.hostSpawnCwd,
       detached: true,
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe', bpfFd],
     });
+
+    // Attach stdin error listener immediately so EPIPE on fast-exiting child NEVER emits unhandled 'error'
+    child.stdin?.on('error', () => {});
 
     // Parent no longer needs bpfFd or temp file once child inherited fd 3
     try { fs.closeSync(bpfFd); } catch { /* ignore */ }
@@ -458,15 +561,15 @@ export class ConfinedProcManager {
       child.stdin.end();
     }
 
-    const stdoutCollector = new BoundedStreamCollector(maxOutputBytes, this.spillDir, `out-${execId}`);
-    const stderrCollector = new BoundedStreamCollector(maxOutputBytes, this.spillDir, `err-${execId}`);
+    const stdoutCollector = new BoundedStreamCollector(maxOutputBytes);
+    const stderrCollector = new BoundedStreamCollector(maxOutputBytes);
     child.stdout?.on('data', (chunk: Buffer) => stdoutCollector.push(chunk));
     child.stderr?.on('data', (chunk: Buffer) => stderrCollector.push(chunk));
 
     let timedOut = false;
     let aborted = false;
     let exited = false;
-    let killing = false;
+    let killPromise: Promise<void> | undefined;
 
     const waitClose = new Promise<{ exitCode: number | null; signal: string | null }>((resolve, reject) => {
       child.once('error', (err) => {
@@ -487,22 +590,25 @@ export class ConfinedProcManager {
       }
     };
 
-    const killGroup = async (fromTimeout = false): Promise<void> => {
-      if (exited || killing) return;
-      killing = true;
+    const killGroup = (fromTimeout = false): Promise<void> => {
       if (!fromTimeout && !timedOut) aborted = true;
-      const pid = child.pid;
-      if (pid && isOwnedProcessGroupAlive(pid)) {
-        try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
-        const forceTimer = setTimeout(() => {
-          if (!exited && child.exitCode === null && isOwnedProcessGroupAlive(pid)) {
-            try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
-          }
-        }, graceMs);
-        forceTimer.unref();
-        await waitClose.catch(() => undefined);
-        clearTimeout(forceTimer);
-      }
+      if (exited) return Promise.resolve();
+      if (killPromise) return killPromise;
+      killPromise = (async () => {
+        const pid = child.pid;
+        if (pid && isOwnedProcessGroupAlive(pid)) {
+          try { process.kill(-pid, 'SIGTERM'); } catch { /* already gone */ }
+          const forceTimer = setTimeout(() => {
+            if (!exited && child.exitCode === null && isOwnedProcessGroupAlive(pid)) {
+              try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
+            }
+          }, graceMs);
+          forceTimer.unref();
+          await waitClose.catch(() => undefined);
+          clearTimeout(forceTimer);
+        }
+      })();
+      return killPromise;
     };
 
     this.active.set(execId, {
