@@ -1,10 +1,15 @@
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { posix } from 'node:path';
+import fs from 'node:fs';
+import path, { posix } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import {
   assertVerifiedProbe,
   evaluateBashCommand,
   failSandbox,
   isPathInside,
+  isValidDistroName,
+  isValidLinuxUsername,
                      
                       
   resolveSharedHostNodeRuntime,
@@ -14,14 +19,26 @@ import {
                           
 } from '../../core/src/index.js';
                                                            
-                                                                       
+                                                                                         
              
                   
                    
                   
                     
                            
+import {
+  discoverWslDistrosAsync,
+  isHostSpawnDisabled,
+                        
+  probeWslDistroUserAsync,
+                          
+} from './wsl-discovery.js';
 import { WslTransport } from './wsl-transport.js';
+
+                                 
+               
+                                                                                             
+  
 
                                         
                                     
@@ -30,6 +47,19 @@ import { WslTransport } from './wsl-transport.js';
                                        
                                      
                                              
+                                                                       
+                                                               
+                                                                                                     
+                                 
+                   
+                                 
+                       
+                       
+                              
+                                 
+                   
+                      
+                                                         
  
 
                                      
@@ -95,11 +125,158 @@ function renderGenericJson(value         )                    {
   return [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }];
 }
 
+function findRepoRoot()                     {
+  let cur = path.resolve(import.meta.dirname);
+  for (let i = 0; i < 6; i++) {
+    const pkgPath = path.join(cur, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))                     ;
+        if (pkg.name === 'dsh-wsl-sandbox') {
+          return cur;
+        }
+      } catch {
+        // continue walking up
+      }
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return undefined;
+}
+
+/** 导出插件根目录解析辅助函数，供 Web 预览接口与受控 AI 初始化引导通道使用。 */
+export function findPluginPackageRoot()                     {
+  return findRepoRoot();
+}
+
+                                                                                 
+
+/** 受控 AI 初始化引导通道状态：必须严格按 1 探测 -> 2 -DryRun 预览 -> 3 单次审批安装 -> 4 闭环顺序推进。 */
+                                        
+                           
+                                 
+                                    
+                                
+                                
+                               
+                                 
+                               
+                                      
+                                    
+                                        
+ 
+
+const DEFAULT_BOOTSTRAP_TTL_MS = 20 * 60 * 1000; // 20 分钟限时通道，超时或绑定就绪自动关闸
+
+function readLocalPackageVersion()                     {
+  const root = findRepoRoot();
+  if (!root) return undefined;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))     
+                        
+     ;
+    return typeof parsed.version === 'string' && parsed.version.trim() ? parsed.version.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function defaultCheckStagedVersion(
+  distro        ,
+  username                    ,
+  runnerRoot        ,
+  runnerMain        ,
+)                         {
+  if (process.platform !== 'win32' || isHostSpawnDisabled() || !isValidDistroName(distro)) {
+    return null;
+  }
+  const args = ['-d', distro, '--cd', '~'];
+  if (username && isValidLinuxUsername(username)) {
+    args.push('-u', username);
+  }
+  args.push(
+    '--',
+    'sh',
+    '-c',
+    'if [ -f "$1" ] && [ -f "$2/.staged-version" ]; then cat "$2/.staged-version"; fi',
+    'dsh-check-stage',
+    runnerMain,
+    runnerRoot,
+  );
+  return new Promise               ((resolve) => {
+    let child;
+    try {
+      child = spawn('wsl.exe', args, {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        shell: false,
+        windowsHide: true,
+      });
+    } catch {
+      resolve(null);
+      return;
+    }
+    const chunks           = [];
+    let settled = false;
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      if (!settled) {
+        settled = true;
+        resolve(null);
+      }
+    }, 6000);
+    timer.unref();
+
+    child.stdout?.on('data', (c        ) => chunks.push(c));
+    child.once('error', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(null);
+    });
+    child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve(null);
+        return;
+      }
+      const ver = Buffer.concat(chunks).toString('utf8').replace(/\r/g, '').trim();
+      resolve(ver || null);
+    });
+  });
+}
+
+async function defaultStageRunner(opts   
+                 
+                    
+ )                                                   {
+  const root = findRepoRoot();
+  if (!root) {
+    failSandbox('INVALID_SETUP', 'Could not locate dsh-wsl-sandbox repository root for runner staging');
+  }
+  const modPath = path.join(root, 'scripts', 'stage-wsl-runner.mjs');
+  const mod = (await import(pathToFileURL(modPath).href))     
+                                                                                    
+                         
+                      
+       
+   ;
+  return mod.stageRunnerIntoWslAsync(opts);
+}
+
 /**
  * Coordinates the single active verified `SessionBinding`, persistent `WslTransport`,
  * managed in-WSL `UdsAllowlistProxy`, and `ApprovalBridge` across all 7 `wsl_*` tools.
  */
 export class WslSandboxSessionManager {
+                   options                       ;
                    configStore             ;
                    approvalBridge                ;
                    sessionId        ;
@@ -107,13 +284,26 @@ export class WslSandboxSessionManager {
                    logger                   ;
                    onStderr                         ;
 
-          transport                          ;
+          transport                           ;
           binding                            ;
+          boundEffectiveRevision                    ;
+          bindingPromise                                     ;
+          probedHomeDir                    ;
+          bindingConfigUpdateInProgress = false;
+                   terminalCwds = new Map                ();
           generation = 0;
           proxyConfiguredRevision                    ;
           unsubscribeConfig                          ;
 
+          bootstrapActive = false;
+          bootstrapPhase                 = 'idle';
+          bootstrapPreviewedDryRun = false;
+          bootstrapStartedAtMs                    ;
+          bootstrapExpiresAtMs                    ;
+          bootstrapTargetDistro                    ;
+
   constructor(options                       ) {
+    this.options = options;
     this.configStore = options.configStore;
     this.approvalBridge = options.approvalBridge;
     this.sessionId = options.sessionId ?? `dsh-wsl-${randomUUID().slice(0, 8)}`;
@@ -134,12 +324,147 @@ export class WslSandboxSessionManager {
     return this.binding;
   }
 
+  getTerminalCwd(terminalId        )                     {
+    return this.terminalCwds.get(terminalId);
+  }
+
+  setTerminalCwd(terminalId        , cwd        )       {
+    if (cwd) {
+      this.terminalCwds.set(terminalId, cwd);
+    }
+  }
+
+  clearTerminalCwd(terminalId         )       {
+    if (terminalId) {
+      this.terminalCwds.delete(terminalId);
+    } else {
+      this.terminalCwds.clear();
+    }
+  }
+
   getGeneration()         {
     return this.generation;
   }
 
   isRunnerActive()          {
     return Boolean(this.transport?.isRunning());
+  }
+
+  /** 读取当前受控 AI 初始化引导通道状态；超时后自动恢复为关闭态。 */
+  getBootstrapChannelState()                        {
+    const now = Date.now();
+    if (this.bootstrapActive && this.bootstrapExpiresAtMs !== undefined && now >= this.bootstrapExpiresAtMs) {
+      this.bootstrapActive = false;
+      this.bootstrapPhase = 'idle';
+      this.bootstrapPreviewedDryRun = false;
+      this.bootstrapStartedAtMs = undefined;
+      this.bootstrapExpiresAtMs = undefined;
+      this.bootstrapTargetDistro = undefined;
+    }
+    const pluginRoot = findRepoRoot();
+    return {
+      active: this.bootstrapActive,
+      phase: this.bootstrapActive ? this.bootstrapPhase : 'idle',
+      previewedDryRun: this.bootstrapActive && this.bootstrapPreviewedDryRun,
+      startedAtMs: this.bootstrapStartedAtMs,
+      expiresAtMs: this.bootstrapExpiresAtMs,
+      remainingMs:
+        this.bootstrapActive && this.bootstrapExpiresAtMs !== undefined
+          ? Math.max(0, this.bootstrapExpiresAtMs - now)
+          : 0,
+      targetDistro: this.bootstrapTargetDistro,
+      pluginRoot,
+      installScriptPath: pluginRoot
+        ? path.join(pluginRoot, 'packages', 'bootstrap', 'install-dsh-plugin.ps1')
+        : undefined,
+      stageScriptPath: pluginRoot ? path.join(pluginRoot, 'scripts', 'stage-wsl-runner.mjs') : undefined,
+      provisionScriptPath: pluginRoot
+        ? path.join(pluginRoot, 'packages', 'bootstrap', 'provision-wsl.sh')
+        : undefined,
+    };
+  }
+
+  /** 开启或关闭受控 AI 初始化引导通道（仅限人工控制台 UI 或宿主机本地接口调用）。 */
+  setBootstrapChannel(opts   
+                    
+                   
+                          
+   )                        {
+    if (!opts.active) {
+      this.bootstrapActive = false;
+      this.bootstrapPhase = 'idle';
+      this.bootstrapPreviewedDryRun = false;
+      this.bootstrapStartedAtMs = undefined;
+      this.bootstrapExpiresAtMs = undefined;
+      this.bootstrapTargetDistro = undefined;
+      this.logger?.log('info', {
+        component: 'bootstrap',
+        event: 'bootstrap.channelClosed',
+        message: '受控 AI 初始化引导通道已关闭',
+        sessionId: this.sessionId,
+      });
+      return this.getBootstrapChannelState();
+    }
+
+    const now = Date.now();
+    const rawTtl = opts.ttlMs ?? DEFAULT_BOOTSTRAP_TTL_MS;
+    const ttlMs = Math.max(60_000, Math.min(60 * 60 * 1000, Number.isFinite(rawTtl) ? Math.floor(rawTtl) : DEFAULT_BOOTSTRAP_TTL_MS));
+    const trimmedDistro = opts.targetDistro?.trim();
+    if (trimmedDistro && !isValidDistroName(trimmedDistro)) {
+      failSandbox('INVALID_SETUP', `Invalid targetDistro for bootstrap channel: ${trimmedDistro}`);
+    }
+
+    this.bootstrapActive = true;
+    this.bootstrapPhase = '1-probe';
+    this.bootstrapPreviewedDryRun = false;
+    this.bootstrapStartedAtMs = now;
+    this.bootstrapExpiresAtMs = now + ttlMs;
+    this.bootstrapTargetDistro = trimmedDistro || undefined;
+
+    this.logger?.log('info', {
+      component: 'bootstrap',
+      event: 'bootstrap.channelOpened',
+      message: `已开启受控 AI 初始化引导通道（targetDistro=${this.bootstrapTargetDistro ?? '待探测确认'}, ttl=${Math.round(ttlMs / 60000)}m）`,
+      sessionId: this.sessionId,
+      data: { targetDistro: this.bootstrapTargetDistro ?? null, ttlMs },
+    });
+    return this.getBootstrapChannelState();
+  }
+
+  /** 记录 `-DryRun` / `--dry-run` 安装预览已由人工审批执行，解锁下一步真实安装审批门禁。 */
+  markBootstrapPreviewCompleted(distro         )                        {
+    const cur = this.getBootstrapChannelState();
+    if (!cur.active) return cur;
+    this.bootstrapPreviewedDryRun = true;
+    if (this.bootstrapPhase === '1-probe' || this.bootstrapPhase === 'idle') {
+      this.bootstrapPhase = '2-previewed';
+    }
+    const cleanDistro = distro?.trim();
+    if (cleanDistro && !this.bootstrapTargetDistro && isValidDistroName(cleanDistro)) {
+      this.bootstrapTargetDistro = cleanDistro;
+    }
+    this.logger?.log('info', {
+      component: 'bootstrap',
+      event: 'bootstrap.previewCompleted',
+      message: `已完成 -DryRun 安装脚本预览（targetDistro=${this.bootstrapTargetDistro ?? 'auto'}），已解锁单次审批安装阶段`,
+      sessionId: this.sessionId,
+    });
+    return this.getBootstrapChannelState();
+  }
+
+  /** 记录受控安装步骤已获得人工单次审批并执行，并尝试从磁盘同步最新 config.json。 */
+  markBootstrapInstallStarted()                        {
+    const cur = this.getBootstrapChannelState();
+    if (!cur.active) return cur;
+    this.bootstrapPhase = '3-installing';
+    this.configStore.reloadFromDisk();
+    this.logger?.log('info', {
+      component: 'bootstrap',
+      event: 'bootstrap.installExecuted',
+      message: '已完成受控单次审批安装步骤并同步磁盘配置',
+      sessionId: this.sessionId,
+    });
+    return this.getBootstrapChannelState();
   }
 
   getNodeRuntimeSummary()                     {
@@ -158,6 +483,10 @@ export class WslSandboxSessionManager {
   }
 
           async handleConfigChanged(next                  , prev                  )                {
+    if (this.bindingConfigUpdateInProgress) {
+      return;
+    }
+
     if (next.logLevel !== prev.logLevel) {
       this.logger?.setLevel(next.logLevel);
       if (this.transport?.isRunning()) {
@@ -165,8 +494,9 @@ export class WslSandboxSessionManager {
       }
     }
 
-    // If ONLY logLevel changed, avoid killing active sandbox terminals/processes unnecessarily!
-    const onlyLogLevelChanged =
+    // Avoid bumping generation, invalidating ApprovalBridge, or killing active terminals/processes
+    // when ONLY logLevel, backupDir, approvalTimeoutMs, or enablePromptInjection changed!
+    const onlyNonDisruptiveChanged =
       next.enabled === prev.enabled &&
       next.transportMode === prev.transportMode &&
       next.distro === prev.distro &&
@@ -185,19 +515,30 @@ export class WslSandboxSessionManager {
       JSON.stringify(next.unmaskedEnvWorkspaces) === JSON.stringify(prev.unmaskedEnvWorkspaces) &&
       JSON.stringify(next.advanced) === JSON.stringify(prev.advanced);
 
-    if (onlyLogLevelChanged) {
+    if (onlyNonDisruptiveChanged) {
+      if (this.binding && this.boundEffectiveRevision === prev.revision) {
+        this.boundEffectiveRevision = next.revision;
+      }
+      if (this.proxyConfiguredRevision === prev.revision) {
+        this.proxyConfiguredRevision = next.revision;
+      }
       this.logger?.log('info', {
         component: 'config',
-        event: 'config.logLevelChanged',
-        message: `Updated log level to '${next.logLevel}'`,
-        data: { logLevel: next.logLevel },
+        event: next.logLevel !== prev.logLevel ? 'config.logLevelChanged' : 'config.nonDisruptiveUpdated',
+        message:
+          next.logLevel !== prev.logLevel
+            ? `Updated log level to '${next.logLevel}'`
+            : `Updated non-disruptive setting (${next.revision})`,
+        data: { revision: next.revision, logLevel: next.logLevel },
       });
       return;
     }
 
     this.generation += 1;
     this.binding = undefined;
+    this.boundEffectiveRevision = undefined;
     this.proxyConfiguredRevision = undefined;
+    this.clearTerminalCwd();
     this.approvalBridge.invalidate(`Configuration changed to ${next.revision}`);
 
     this.logger?.log('info', {
@@ -222,6 +563,10 @@ export class WslSandboxSessionManager {
       next.runnerPath !== prev.runnerPath ||
       next.wslNodePath !== prev.wslNodePath;
 
+    if (transportChanged) {
+      this.probedHomeDir = undefined;
+    }
+
     if (this.transport) {
       if (transportChanged || !next.enabled) {
         const old = this.transport;
@@ -233,29 +578,31 @@ export class WslSandboxSessionManager {
     }
   }
 
-          ensureTransport(cfg                  )               {
+          ensureTransport(cfg                  )                {
     if (!cfg.enabled) {
       failSandbox('SANDBOX_UNAVAILABLE', 'dsh-wsl-sandbox is currently disabled in configuration');
     }
     if (!this.transport) {
-      this.transport = new WslTransport({
-        mode: cfg.transportMode,
-        distro: cfg.distro,
-        username: cfg.username,
-        runnerPath: cfg.runnerPath,
-        nodeExecutable: cfg.wslNodePath,
-        logLevel: cfg.logLevel,
-        logger: this.logger,
-        onStderr: this.onStderr,
-        onAuthorizeProxyHost: (host, port) => this.authorizeUnknownProxyHost(host, port),
-      });
+      this.transport = this.options.transportFactory
+        ? this.options.transportFactory(cfg)
+        : new WslTransport({
+            mode: cfg.transportMode,
+            distro: cfg.distro,
+            username: cfg.username,
+            runnerPath: cfg.runnerPath,
+            nodeExecutable: cfg.wslNodePath,
+            logLevel: cfg.logLevel,
+            logger: this.logger,
+            onStderr: this.onStderr,
+            onAuthorizeProxyHost: (host, port) => this.authorizeUnknownProxyHost(host, port),
+          });
     }
     return this.transport;
   }
 
           async authorizeUnknownProxyHost(host        , port        )                   {
     try {
-      const binding = await this.ensureBound();
+      const binding = this.binding ?? (await this.ensureBound());
       const ticket = await this.approvalBridge.requestApproval(
         binding,
         {
@@ -283,9 +630,122 @@ export class WslSandboxSessionManager {
 
   async ensureBound()                          {
     const cfg = this.configStore.get();
-    if (this.binding && this.binding.revision === cfg.revision && this.transport?.isRunning()) {
+    if (
+      this.binding &&
+      (this.binding.revision === cfg.revision || this.boundEffectiveRevision === cfg.revision) &&
+      this.transport?.isRunning()
+    ) {
       await this.syncProxyPolicy(cfg);
       return this.binding;
+    }
+    if (this.bindingPromise) {
+      return this.bindingPromise;
+    }
+    this.bindingPromise = this.performBind().finally(() => {
+      this.bindingPromise = undefined;
+    });
+    return this.bindingPromise;
+  }
+
+          async performBind()                          {
+    this.configStore.reloadFromDisk();
+    let cfg = this.configStore.get();
+    if (!cfg.enabled) {
+      failSandbox('SANDBOX_UNAVAILABLE', 'dsh-wsl-sandbox is currently disabled in configuration');
+    }
+
+    const shouldAutoPrepareWsl =
+      cfg.transportMode === 'wsl' &&
+      ((process.platform === 'win32' && !isHostSpawnDisabled()) ||
+        Boolean(this.options.stageRunner || this.options.discoverDistros));
+
+    if (shouldAutoPrepareWsl) {
+      const needsDiscovery =
+        !cfg.username ||
+        cfg.distro === 'Ubuntu-26.04' ||
+        cfg.workspaceRoot === '/home/dev/workspace' ||
+        cfg.runnerPath.includes('/home/dev/.local/share/dsh-wsl-sandbox/runner/');
+
+      if (needsDiscovery) {
+        const discover = this.options.discoverDistros ?? discoverWslDistrosAsync;
+        const probeUser = this.options.probeDistroUser ?? probeWslDistroUserAsync;
+        const report = await discover();
+
+        const exactMatch = report.distros.find(
+          (d) => !d.isInternalContainer && d.name.toLowerCase() === cfg.distro.toLowerCase(),
+        );
+        let targetDistro = exactMatch ? exactMatch.name : cfg.distro;
+        if (
+          cfg.distro === 'Ubuntu-26.04' &&
+          !exactMatch &&
+          report.distros.some((d) => d.supported)
+        ) {
+          targetDistro = report.recommendedDistro;
+        }
+        const switchedDistro = targetDistro !== cfg.distro;
+        const probed = await probeUser(targetDistro, cfg.username);
+
+        const patch                   = {};
+        if (switchedDistro) {
+          patch.distro = targetDistro;
+        }
+        if (probed && probed.uid > 0) {
+          this.probedHomeDir = probed.homeDir;
+          if (!cfg.username || cfg.username !== probed.username) {
+            patch.username = probed.username;
+          }
+          if (cfg.workspaceRoot === '/home/dev/workspace' || switchedDistro) {
+            const nextWs = posix.join(probed.homeDir, 'workspace');
+            if (nextWs !== cfg.workspaceRoot) {
+              patch.workspaceRoot = nextWs;
+            }
+          }
+          if (cfg.runnerPath.includes('/.local/share/dsh-wsl-sandbox/runner/')) {
+            const nextRunner = posix.join(
+              probed.homeDir,
+              '.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js',
+            );
+            if (nextRunner !== cfg.runnerPath) {
+              patch.runnerPath = nextRunner;
+            }
+          }
+        }
+
+        if (Object.keys(patch).length > 0) {
+          this.bindingConfigUpdateInProgress = true;
+          try {
+            this.configStore.updateBasic(patch);
+            cfg = this.configStore.get();
+          } finally {
+            this.bindingConfigUpdateInProgress = false;
+          }
+        }
+      }
+
+      const managedMarker = '/.local/share/dsh-wsl-sandbox/runner/';
+      const markerIdx = cfg.runnerPath.indexOf(managedMarker);
+      if (markerIdx !== -1) {
+        const runnerRoot = cfg.runnerPath.slice(
+          0,
+          markerIdx + '/.local/share/dsh-wsl-sandbox/runner'.length,
+        );
+        const checkVersion = this.options.checkStagedVersion ?? defaultCheckStagedVersion;
+        const stagedVer = await checkVersion(cfg.distro, cfg.username, runnerRoot, cfg.runnerPath);
+        const localVer = readLocalPackageVersion();
+        if (!stagedVer || (localVer && stagedVer !== localVer)) {
+          const stageFn = this.options.stageRunner ?? defaultStageRunner;
+          const staged = await stageFn({ distro: cfg.distro, username: cfg.username });
+          if (staged.runnerPath && staged.runnerPath !== cfg.runnerPath) {
+            this.bindingConfigUpdateInProgress = true;
+            try {
+              this.configStore.updateBasic({ runnerPath: staged.runnerPath });
+              cfg = this.configStore.get();
+            } finally {
+              this.bindingConfigUpdateInProgress = false;
+            }
+          }
+        }
+      }
     }
 
     const transport = this.ensureTransport(cfg);
@@ -307,6 +767,10 @@ export class WslSandboxSessionManager {
       20_000,
     );
 
+    if (typeof probeResult?.homeDir === 'string' && probeResult.homeDir.startsWith('/')) {
+      this.probedHomeDir = probeResult.homeDir;
+    }
+
     const verified = assertVerifiedProbe(probeResult, {
       expectedSessionId: this.sessionId,
       expectedDistribution: cfg.distro,
@@ -315,13 +779,18 @@ export class WslSandboxSessionManager {
       expectedProfile: cfg.sandboxMode,
       expectedRevision: cfg.revision,
       generation: this.generation,
+      homeDir: this.probedHomeDir,
       authorizedShares: cfg.advanced.shares,
       authorizedDevices: cfg.advanced.deviceNodes,
     });
 
     this.binding = verified;
+    this.boundEffectiveRevision = cfg.revision;
     this.approvalBridge.setBinding(verified);
     await this.syncProxyPolicy(cfg);
+    if (verified.sandboxReady && this.getBootstrapChannelState().active) {
+      this.setBootstrapChannel({ active: false });
+    }
     return verified;
   }
 
@@ -344,9 +813,13 @@ export class WslSandboxSessionManager {
 
   async invalidateNow(reason = 'Manual invalidation', terminalId         )                  {
     this.generation += 1;
-    if (!terminalId) {
+    if (terminalId) {
+      this.clearTerminalCwd(terminalId);
+    } else {
       this.binding = undefined;
+      this.boundEffectiveRevision = undefined;
       this.proxyConfiguredRevision = undefined;
+      this.clearTerminalCwd();
       this.approvalBridge.invalidate(reason);
     }
     if (this.transport) {
@@ -374,12 +847,17 @@ export class WslSandboxSessionManager {
   computeCacheDir(binding                , cfg                  )                     {
     if (cfg.cacheMode !== 'workspace-persistent') return undefined;
     const hash = createHash('sha256').update(binding.workspaceRoot).digest('hex').slice(0, 12);
-    return `/home/${binding.username}/.cache/dsh-wsl-sandbox/${hash}`;
+    const home = this.probedHomeDir ?? `/home/${binding.username}`;
+    return `${home}/.cache/dsh-wsl-sandbox/${hash}`;
   }
 
   async dispose()                {
     this.unsubscribeConfig?.();
     this.unsubscribeConfig = undefined;
+    this.binding = undefined;
+    this.boundEffectiveRevision = undefined;
+    this.proxyConfiguredRevision = undefined;
+    this.clearTerminalCwd();
     this.approvalBridge.invalidate('Plugin disposed');
     if (this.transport) {
       const t = this.transport;
@@ -426,7 +904,13 @@ export function createWslSandboxTools(
     }
     const cfg = configStore.get();
     const binding = await sessionManager.ensureBound();
-    const cwd = resolveToolCwd(binding, params.cwd);
+    const requestedOrSavedCwd =
+      params.cwd !== undefined
+        ? params.cwd
+        : params.terminalId
+          ? (sessionManager.getTerminalCwd(params.terminalId) ?? binding.workspaceRoot)
+          : undefined;
+    const cwd = resolveToolCwd(binding, requestedOrSavedCwd);
 
     const guard = evaluateBashCommand(params.command, {
       workspaceRoot: binding.workspaceRoot,
@@ -541,11 +1025,19 @@ export function createWslSandboxTools(
     meta?.signal?.addEventListener('abort', onAbort, { once: true });
     try {
       if (params.terminalId) {
-        return await sessionManager.callRpc                    (
+        const termRes = await sessionManager.callRpc                    (
           'term.exec',
-          { ...execPayload, terminalId: params.terminalId },
+          {
+            ...execPayload,
+            terminalId: params.terminalId,
+            explicitCwd: params.cwd !== undefined,
+          },
           (params.timeoutMs ?? 120_000) + 15_000,
         );
+        if (typeof termRes?.cwd === 'string' && termRes.cwd.startsWith('/')) {
+          sessionManager.setTerminalCwd(params.terminalId, termRes.cwd);
+        }
+        return termRes;
       }
 
       return await sessionManager.callRpc                (
@@ -585,7 +1077,11 @@ export function createWslSandboxTools(
         },
       },
       output: {
-        schema: { description: 'WSL 2 sandboxed Bash execution result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 sandboxed Bash execution result',
+        },
         render: (_args, value) => renderExecOutcome(value),
       },
       execute: async (input, meta) =>
@@ -621,7 +1117,11 @@ export function createWslSandboxTools(
       },
       isConcurrencySafe: () => true,
       output: {
-        schema: { description: 'WSL 2 file read result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 file read result',
+        },
         render: (_args, value) => renderGenericJson(value),
       },
       execute: async (input) => {
@@ -649,7 +1149,11 @@ export function createWslSandboxTools(
         },
       },
       output: {
-        schema: { description: 'WSL 2 file write result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 file write result',
+        },
         render: (_args, value) => renderGenericJson(value),
       },
       execute: async (input) => {
@@ -677,7 +1181,11 @@ export function createWslSandboxTools(
         },
       },
       output: {
-        schema: { description: 'WSL 2 file edit result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 file edit result',
+        },
         render: (_args, value) => renderGenericJson(value),
       },
       execute: async (input) => {
@@ -706,7 +1214,11 @@ export function createWslSandboxTools(
       },
       isConcurrencySafe: () => true,
       output: {
-        schema: { description: 'WSL 2 glob search result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 glob search result',
+        },
         render: (_args, value) => renderGenericJson(value),
       },
       execute: async (input) => {
@@ -736,7 +1248,11 @@ export function createWslSandboxTools(
       },
       isConcurrencySafe: () => true,
       output: {
-        schema: { description: 'WSL 2 grep search result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 grep search result',
+        },
         render: (_args, value) => renderGenericJson(value),
       },
       execute: async (input) => {
@@ -768,7 +1284,11 @@ export function createWslSandboxTools(
         },
       },
       output: {
-        schema: { description: 'WSL 2 stateful terminal execution result' },
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'WSL 2 stateful terminal execution result',
+        },
         render: (_args, value) => renderExecOutcome(value),
       },
       execute: async (input, meta) => {
@@ -777,8 +1297,9 @@ export function createWslSandboxTools(
             ? input.terminalId.trim()
             : 'default';
         if (input.reset) {
-          await sessionManager.ensureBound();
-          await sessionManager.callRpc('term.reset', { terminalId });
+          const binding = await sessionManager.ensureBound();
+          sessionManager.clearTerminalCwd(terminalId);
+          await sessionManager.callRpc('term.reset', { terminalId, sessionId: binding.sessionId });
         }
         return executeGuardedCommand(
           {
@@ -805,10 +1326,29 @@ export function registerWslSandboxTools(
   if (!ctx.tools) return disposers;
 
   const tools = createWslSandboxTools(sessionManager, configStore, approvalBridge);
+  const logger = sessionManager.getLogger();
   for (const tool of tools) {
-    const dispose = ctx.tools.register(tool);
-    if (typeof dispose === 'function') {
-      disposers.push(dispose);
+    if (typeof ctx.tools.has === 'function' && ctx.tools.has(tool.name)) {
+      logger?.log('warn', {
+        component: 'tools',
+        event: 'tools.duplicateSkipped',
+        message: `Tool '${tool.name}' already registered; skipping duplicate registration`,
+        data: { toolName: tool.name },
+      });
+      continue;
+    }
+    try {
+      const dispose = ctx.tools.register(tool);
+      if (typeof dispose === 'function') {
+        disposers.push(dispose);
+      }
+    } catch (err) {
+      logger?.log('warn', {
+        component: 'tools',
+        event: 'tools.registerFailed',
+        message: `Failed registering tool '${tool.name}': ${err instanceof Error ? err.message : String(err)}`,
+        data: { toolName: tool.name },
+      });
     }
   }
   return disposers;

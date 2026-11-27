@@ -30,6 +30,8 @@ OPEN_BACKUP_EXPLORER="false"
 UPGRADE_NODE="false"
 PURGE_TOOLCHAINS="false"
 SKIP_RESTORE_ON_UNINSTALL="false"
+UNINSTALL_WORKSPACE_ROOT=""
+CREATED_DEFAULT_WORKSPACE="false"
 
 usage() {
   cat <<'EOF'
@@ -72,10 +74,12 @@ while [[ $# -gt 0 ]]; do
     --open-backup-dir)   OPEN_BACKUP_EXPLORER="true"; shift ;;
     --disable-automount) ACTION="disable-automount"; shift ;;
     --restore-configs)   ACTION="restore"; shift ;;
-    --uninstall)         ACTION="uninstall"; shift ;;
-    --purge-toolchains)  PURGE_TOOLCHAINS="true"; shift ;;
-    --skip-restore)      SKIP_RESTORE_ON_UNINSTALL="true"; shift ;;
-    --dry-run) DRY_RUN="true"; shift ;;
+    --uninstall)                 ACTION="uninstall"; shift ;;
+    --purge-toolchains)          PURGE_TOOLCHAINS="true"; shift ;;
+    --skip-restore)              SKIP_RESTORE_ON_UNINSTALL="true"; shift ;;
+    --workspace-root)            UNINSTALL_WORKSPACE_ROOT="${2:?Missing value for --workspace-root}"; shift 2 ;;
+    --created-default-workspace) CREATED_DEFAULT_WORKSPACE="true"; shift ;;
+    --dry-run)                   DRY_RUN="true"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "[ERROR] Unknown argument: $1" >&2; usage; exit 2 ;;
   esac
@@ -101,7 +105,7 @@ if [[ "$(id -u)" -eq 0 ]]; then
   exit 1
 fi
 
-# Detect Linux distribution & package manager dynamically (supports Ubuntu 26.04/24.04/22.04, Debian, Fedora, Arch, openSUSE, Alpine)
+# Detect Linux distribution, libc, init system & NixOS immutability
 DISTRO_ID="linux"
 DISTRO_LIKE=""
 DISTRO_PRETTY="Linux"
@@ -111,6 +115,25 @@ if [[ -r /etc/os-release ]]; then
   DISTRO_ID="${ID:-linux}"
   DISTRO_LIKE="${ID_LIKE:-}"
   DISTRO_PRETTY="${PRETTY_NAME:-$DISTRO_ID}"
+fi
+
+IS_NIXOS="false"
+if [[ "$DISTRO_ID" == "nixos" || -d /etc/nixos || -d /run/current-system ]]; then
+  IS_NIXOS="true"
+fi
+
+IS_MUSL="false"
+if ldd --version 2>&1 | grep -qi musl || ls /lib/ld-musl-* >/dev/null 2>&1; then
+  IS_MUSL="true"
+fi
+
+INIT_SYSTEM="wsl-init"
+if [[ -d /run/systemd/system ]]; then
+  INIT_SYSTEM="systemd"
+elif [[ -d /run/openrc ]]; then
+  INIT_SYSTEM="openrc"
+elif [[ -d /run/runit ]]; then
+  INIT_SYSTEM="runit"
 fi
 
 PKG_MGR="unknown"
@@ -124,6 +147,42 @@ elif command -v zypper >/dev/null 2>&1; then
   PKG_MGR="zypper"
 elif command -v apk >/dev/null 2>&1; then
   PKG_MGR="apk"
+elif [[ "$IS_NIXOS" == "true" ]]; then
+  PKG_MGR="nix"
+fi
+
+has_glibc_dynamic_loader() {
+  [[ -n "${NIX_LD:-}" && -e "${NIX_LD}" ]] && return 0
+  local ld
+  for ld in /lib64/ld-linux*.so* /lib/ld-linux*.so* /lib/*-linux-gnu*/ld-linux*.so*; do
+    if [[ -e "$ld" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+print_nixos_guidance() {
+  cat >&2 <<'EOF'
+[NixOS / Immutable Linux] Detected declarative/immutable NixOS environment without classic FHS package manager:
+  1. Add required sandbox & CLI packages to /etc/nixos/configuration.nix (then run `sudo nixos-rebuild switch`):
+       environment.systemPackages = with pkgs; [
+         bubblewrap util-linux socat bash curl gnutar unzip xz
+         nodejs_24 git ripgrep fd jq python3 gcc cmake gnumake pkg-config
+         # For profile=standard add: go rustc cargo uv mise
+       ];
+       # Optional (only needed if running generic prebuilt Linux tarballs such as bun/golangci-lint):
+       programs.nix-ld.enable = true;
+  2. Or install quickly into user profile (with Nix flakes enabled):
+       nix profile install nixpkgs#bubblewrap nixpkgs#util-linux nixpkgs#socat nixpkgs#nodejs_24 nixpkgs#git nixpkgs#ripgrep nixpkgs#fd nixpkgs#jq nixpkgs#python3
+EOF
+}
+
+SUDO_CMD=""
+if command -v sudo >/dev/null 2>&1; then
+  SUDO_CMD="sudo"
+elif command -v doas >/dev/null 2>&1; then
+  SUDO_CMD="doas"
 fi
 
 CURRENT_WSL_DISTRO="${WSL_DISTRO_NAME:-<YourDistro>}"
@@ -190,13 +249,14 @@ file_sha256() {
 
 # Writes `.orig` once (0400), skips creating duplicate `.bak` if SHA-256 matches latest snapshot,
 # and rotates rolling `.bak` snapshots to at most 5 (unlocking 0400 before deleting old `.bak`).
-save_deduped_backup_series() {
-  local src_file="$1"
-  local orig_name="$2"
-  local prefix="$3"
-  local ext="$4"
-  local ts="$5"
-  local orig_path="$BACKUP_DIR/$orig_name"
+save_deduped_backup_series_to() {
+  local dest_dir="$1"
+  local src_file="$2"
+  local orig_name="$3"
+  local prefix="$4"
+  local ext="$5"
+  local ts="$6"
+  local orig_path="$dest_dir/$orig_name"
 
   if [[ ! -f "$orig_path" ]]; then
     save_readonly_file "$src_file" "$orig_path"
@@ -204,7 +264,7 @@ save_deduped_backup_series() {
   fi
 
   local latest_rolling=""
-  latest_rolling="$(ls -1 "$BACKUP_DIR/${prefix}."*".""$ext" 2>/dev/null | grep -v -F "/$orig_name" | sort | tail -n 1 || true)"
+  latest_rolling="$(ls -1 "$dest_dir/${prefix}."*".""$ext" 2>/dev/null | grep -v -F "/$orig_name" | sort | tail -n 1 || true)"
   local compare_file="${latest_rolling:-$orig_path}"
 
   if [[ -f "$compare_file" ]]; then
@@ -216,7 +276,7 @@ save_deduped_backup_series() {
     fi
   fi
 
-  save_readonly_file "$src_file" "$BACKUP_DIR/${prefix}.${ts}.${ext}"
+  save_readonly_file "$src_file" "$dest_dir/${prefix}.${ts}.${ext}"
 
   # Keep at most 5 rolling snapshots (never touch .orig)
   local old_file
@@ -224,12 +284,17 @@ save_deduped_backup_series() {
     [[ -z "$old_file" ]] && continue
     chmod u+w "$old_file" 2>/dev/null || true
     rm -f "$old_file" 2>/dev/null || true
-  done < <(ls -1 "$BACKUP_DIR/${prefix}."*".""$ext" 2>/dev/null | grep -v -F "/$orig_name" | sort -r | tail -n +6 || true)
+  done < <(ls -1 "$dest_dir/${prefix}."*".""$ext" 2>/dev/null | grep -v -F "/$orig_name" | sort -r | tail -n +6 || true)
+}
+
+save_deduped_backup_series() {
+  save_deduped_backup_series_to "$BACKUP_DIR" "$1" "$2" "$3" "$4" "$5"
 }
 
 backup_original_wsl_configs() {
   local ts
   ts="$(date +%Y%m%d-%H%M%S)"
+  local internal_bk="$CONFIG_ROOT/backups"
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "[dry-run] mkdir -p -m 700 $BACKUP_DIR && snapshot /etc/wsl.conf, /etc/fstab, /proc/mounts (read-only 0400, SHA-256 deduplicated)"
     return 0
@@ -238,27 +303,37 @@ backup_original_wsl_configs() {
   chmod 700 "$CONFIG_ROOT"
   mkdir -p "$BACKUP_DIR"
   chmod 700 "$BACKUP_DIR"
+  if [[ "$BACKUP_DIR" != "$internal_bk" ]]; then
+    mkdir -p "$internal_bk"
+    chmod 700 "$internal_bk"
+  fi
 
-  if [[ -f /etc/wsl.conf ]]; then
-    save_deduped_backup_series /etc/wsl.conf "wsl.conf.orig" "wsl.conf" "bak" "$ts"
-  else
-    if [[ ! -f "$BACKUP_DIR/wsl.conf.orig" && ! -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
-      write_readonly_text "$BACKUP_DIR/wsl.conf.orig.absent" "# /etc/wsl.conf did not exist prior to dsh-wsl-sandbox setup (${ts})"
-      echo "[backup] Recorded pristine state (no /etc/wsl.conf) -> $BACKUP_DIR/wsl.conf.orig.absent"
+  local bk_targets=("$BACKUP_DIR")
+  [[ "$BACKUP_DIR" != "$internal_bk" ]] && bk_targets+=("$internal_bk")
+
+  local dest_dir
+  for dest_dir in "${bk_targets[@]}"; do
+    if [[ -f /etc/wsl.conf ]]; then
+      save_deduped_backup_series_to "$dest_dir" /etc/wsl.conf "wsl.conf.orig" "wsl.conf" "bak" "$ts"
+    else
+      if [[ ! -f "$dest_dir/wsl.conf.orig" && ! -f "$dest_dir/wsl.conf.orig.absent" ]]; then
+        write_readonly_text "$dest_dir/wsl.conf.orig.absent" "# /etc/wsl.conf did not exist prior to dsh-wsl-sandbox setup (${ts})"
+        echo "[backup] Recorded pristine state (no /etc/wsl.conf) -> $dest_dir/wsl.conf.orig.absent"
+      fi
     fi
-  fi
 
-  if [[ -f /etc/fstab ]]; then
-    save_deduped_backup_series /etc/fstab "fstab.orig" "fstab" "bak" "$ts"
-  fi
+    if [[ -f /etc/fstab ]]; then
+      save_deduped_backup_series_to "$dest_dir" /etc/fstab "fstab.orig" "fstab" "bak" "$ts"
+    fi
 
-  if [[ -r /proc/mounts ]]; then
-    local mount_tmp
-    mount_tmp="$(mktemp)"
-    grep -E 'drvfs|9p|/mnt/' /proc/mounts > "$mount_tmp" 2>/dev/null || true
-    save_deduped_backup_series "$mount_tmp" "drvfs-mounts.orig.txt" "drvfs-mounts" "txt" "$ts"
-    rm -f "$mount_tmp"
-  fi
+    if [[ -r /proc/mounts ]]; then
+      local mount_tmp
+      mount_tmp="$(mktemp)"
+      grep -E 'drvfs|9p|/mnt/' /proc/mounts > "$mount_tmp" 2>/dev/null || true
+      save_deduped_backup_series_to "$dest_dir" "$mount_tmp" "drvfs-mounts.orig.txt" "drvfs-mounts" "txt" "$ts"
+      rm -f "$mount_tmp"
+    fi
+  done
 }
 
 disable_wsl_automount() {
@@ -295,16 +370,13 @@ disable_wsl_automount() {
     ' /etc/wsl.conf > "$tmp_conf"
   else
     cat > "$tmp_conf" <<'EOF'
-[boot]
-systemd = true
-
 [automount]
 enabled = false
 mountFsTab = false
 EOF
   fi
-  sudo cp "$tmp_conf" /etc/wsl.conf
-  sudo chmod 644 /etc/wsl.conf
+  run_priv cp "$tmp_conf" /etc/wsl.conf
+  run_priv chmod 644 /etc/wsl.conf
   rm -f "$tmp_conf"
   echo "[ok] Updated /etc/wsl.conf ([automount] enabled = false). Original backed up under $BACKUP_DIR."
   echo "[next] Run ONLY 'wsl.exe --terminate ${CURRENT_WSL_DISTRO}' in Windows PowerShell to apply to this distro without killing other WSL distros."
@@ -312,35 +384,41 @@ EOF
 
 restore_original_wsl_configs() {
   local remove_apt_bak="${1:-false}"
-  echo "=== [restore] Restoring original WSL configuration from $BACKUP_DIR ==="
+  local restore_dir="$BACKUP_DIR"
+  if [[ ! -f "$restore_dir/wsl.conf.orig" && ! -f "$restore_dir/wsl.conf.orig.absent" ]]; then
+    if [[ -f "$CONFIG_ROOT/backups/wsl.conf.orig" || -f "$CONFIG_ROOT/backups/wsl.conf.orig.absent" ]]; then
+      restore_dir="$CONFIG_ROOT/backups"
+    fi
+  fi
+  echo "=== [restore] Restoring original WSL configuration from $restore_dir ==="
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] Restore /etc/wsl.conf and package mirror sources from $BACKUP_DIR"
+    echo "[dry-run] Restore /etc/wsl.conf and package mirror sources from $restore_dir"
     return 0
   fi
-  if [[ -f "$BACKUP_DIR/wsl.conf.orig" ]]; then
-    if ! cmp -s "$BACKUP_DIR/wsl.conf.orig" /etc/wsl.conf 2>/dev/null; then
-      sudo cp "$BACKUP_DIR/wsl.conf.orig" /etc/wsl.conf
-      sudo chmod 644 /etc/wsl.conf
-      echo "[ok] Restored /etc/wsl.conf from $BACKUP_DIR/wsl.conf.orig"
+  if [[ -f "$restore_dir/wsl.conf.orig" ]]; then
+    if ! cmp -s "$restore_dir/wsl.conf.orig" /etc/wsl.conf 2>/dev/null; then
+      run_priv cp "$restore_dir/wsl.conf.orig" /etc/wsl.conf
+      run_priv chmod 644 /etc/wsl.conf
+      echo "[ok] Restored /etc/wsl.conf from $restore_dir/wsl.conf.orig"
     else
-      echo "[ok] /etc/wsl.conf already matches pristine $BACKUP_DIR/wsl.conf.orig"
+      echo "[ok] /etc/wsl.conf already matches pristine $restore_dir/wsl.conf.orig"
     fi
-  elif [[ -f "$BACKUP_DIR/wsl.conf.orig.absent" ]]; then
+  elif [[ -f "$restore_dir/wsl.conf.orig.absent" ]]; then
     if [[ -f /etc/wsl.conf ]]; then
-      sudo rm -f /etc/wsl.conf
+      run_priv rm -f /etc/wsl.conf
       echo "[ok] Removed /etc/wsl.conf (system originally had no /etc/wsl.conf)"
     fi
   else
-    echo "[info] No /etc/wsl.conf backup marker found in $BACKUP_DIR; left untouched."
+    echo "[info] No /etc/wsl.conf backup marker found in $restore_dir; left untouched."
   fi
 
   local src
   for src in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do
     if [[ -f "${src}.bak" ]]; then
-      sudo cp "${src}.bak" "$src"
+      run_priv cp "${src}.bak" "$src"
       echo "[ok] Restored $src from ${src}.bak"
       if [[ "$remove_apt_bak" == "true" ]]; then
-        sudo rm -f "${src}.bak"
+        run_priv rm -f "${src}.bak"
       fi
     fi
   done
@@ -357,7 +435,7 @@ uninstall_wsl_sandbox() {
   # 1. Strip shell RC hooks & remove ~/.dsh-wsl-env.sh
   local rc
   for rc in "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile" "$HOME/.zshrc"; do
-    if [[ -f "$rc" ]] && grep -Fq '.dsh-wsl-env.sh' "$rc"; then
+    if [[ -f "$rc" && ! -L "$rc" && -w "$rc" ]] && grep -Fq '.dsh-wsl-env.sh' "$rc"; then
       if [[ "$DRY_RUN" == "true" ]]; then
         echo "[dry-run] Strip .dsh-wsl-env.sh source line from $rc"
       else
@@ -407,7 +485,7 @@ uninstall_wsl_sandbox() {
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "[dry-run] Remove newly installed toolchain path: $p"
           elif [[ "$p" == /usr/local/* || "$p" == /etc/* ]]; then
-            sudo rm -rf "$p"
+            run_priv rm -rf "$p"
             echo "[ok] Removed $p"
           else
             chmod -R u+w "$p" 2>/dev/null || true
@@ -421,11 +499,11 @@ uninstall_wsl_sandbox() {
           echo "[dry-run] Uninstall ${#installed_pkgs[@]} delta OS packages (${PKG_MGR}): ${installed_pkgs[*]}"
         else
           case "$PKG_MGR" in
-            apt)    sudo env DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove "${installed_pkgs[@]}" || true ;;
-            dnf)    sudo dnf remove -y "${installed_pkgs[@]}" || true ;;
-            pacman) sudo pacman -Rns --noconfirm "${installed_pkgs[@]}" || true ;;
-            zypper) sudo zypper --non-interactive remove "${installed_pkgs[@]}" || true ;;
-            apk)    sudo apk del "${installed_pkgs[@]}" || true ;;
+            apt)    run_priv env DEBIAN_FRONTEND=noninteractive apt-get purge -y --auto-remove "${installed_pkgs[@]}" || true ;;
+            dnf)    run_priv dnf remove -y "${installed_pkgs[@]}" || true ;;
+            pacman) run_priv pacman -Rns --noconfirm "${installed_pkgs[@]}" || true ;;
+            zypper) run_priv zypper --non-interactive remove "${installed_pkgs[@]}" || true ;;
+            apk)    run_priv apk del "${installed_pkgs[@]}" || true ;;
           esac
         fi
       fi
@@ -439,7 +517,7 @@ uninstall_wsl_sandbox() {
         if [[ "$DRY_RUN" == "true" ]]; then
           echo "[dry-run] Remove legacy NodeSource file: $legacy_ns"
         else
-          sudo rm -f "$legacy_ns"
+          run_priv rm -f "$legacy_ns"
           echo "[ok] Removed legacy NodeSource file: $legacy_ns"
         fi
       fi
@@ -486,17 +564,20 @@ uninstall_wsl_sandbox() {
     [[ "$DRY_RUN" != "true" ]] && rmdir "$HOME/.dsh/runtime/bin" "$HOME/.dsh/runtime" 2>/dev/null || true
   fi
 
-  # 5. Remove default ~/workspace ONLY if completely empty (never delete user files!)
-  if [[ -d "$HOME/workspace" ]]; then
-    if [[ -z "$(ls -A "$HOME/workspace" 2>/dev/null)" ]]; then
-      if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[dry-run] Remove empty default workspace directory: $HOME/workspace"
+  # 5. Remove plugin-created workspace ONLY if completely empty (never delete user files!)
+  local target_ws="${UNINSTALL_WORKSPACE_ROOT:-$HOME/workspace}"
+  if [[ "$CREATED_DEFAULT_WORKSPACE" == "true" || "$target_ws" == "$HOME/workspace" ]]; then
+    if [[ -d "$target_ws" ]]; then
+      if [[ -z "$(ls -A "$target_ws" 2>/dev/null)" ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+          echo "[dry-run] Remove empty default workspace directory: $target_ws"
+        else
+          rmdir "$target_ws" 2>/dev/null || true
+          echo "[ok] Removed empty $target_ws"
+        fi
       else
-        rmdir "$HOME/workspace" 2>/dev/null || true
-        echo "[ok] Removed empty $HOME/workspace"
+        echo "[keep] Preserved non-empty $target_ws (contains user files)."
       fi
-    else
-      echo "[keep] Preserved non-empty $HOME/workspace (contains user files)."
     fi
   fi
 
@@ -549,33 +630,51 @@ run_cmd() {
   fi
 }
 
+run_priv() {
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] ${SUDO_CMD:-sudo} $*"
+    return 0
+  fi
+  if [[ -z "$SUDO_CMD" ]]; then
+    echo "[ERROR] Neither sudo nor doas is installed to execute privileged command: $*" >&2
+    exit 1
+  fi
+  "$SUDO_CMD" "$@"
+}
+
+has_all_bins() {
+  local b
+  for b in "$@"; do
+    command -v "$b" >/dev/null 2>&1 || return 1
+  done
+  return 0
+}
+
 pkg_update() {
   case "$PKG_MGR" in
     apt)
-      run_cmd sudo env DEBIAN_FRONTEND=noninteractive \
+      run_priv env DEBIAN_FRONTEND=noninteractive \
         ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} \
         ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         apt-get update -y
       ;;
     dnf)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         dnf makecache -y
       ;;
     pacman)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
-        pacman -Sy --noconfirm
+      echo "[info] Arch pacman: skipping standalone 'pacman -Sy' (partial-upgrade hazard); using 'pacman -Syu --needed' during install."
       ;;
     zypper)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         zypper --non-interactive refresh
       ;;
     apk)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         apk update
       ;;
     *)
-      echo "[ERROR] Unsupported Linux package manager on '${DISTRO_PRETTY}'. Install tools manually or switch to Ubuntu/Debian/Fedora/Arch/openSUSE/Alpine." >&2
-      exit 1
+      echo "[warn] Unsupported Linux package manager on '${DISTRO_PRETTY}'. Will verify whether required binaries are already present."
       ;;
   esac
 }
@@ -651,25 +750,25 @@ pkg_install() {
 
   case "$PKG_MGR" in
     apt)
-      run_cmd sudo env DEBIAN_FRONTEND=noninteractive \
+      run_priv env DEBIAN_FRONTEND=noninteractive \
         ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} \
         ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         apt-get install -y --no-install-recommends "$@"
       ;;
     dnf)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         dnf install -y --skip-unavailable "$@"
       ;;
     pacman)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
-        pacman -S --needed --noconfirm "$@"
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+        pacman -Syu --needed --noconfirm "$@"
       ;;
     zypper)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         zypper --non-interactive install --no-recommends "$@"
       ;;
     apk)
-      run_cmd sudo env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
+      run_priv env ${HTTP_PROXY:+http_proxy="$HTTP_PROXY"} ${HTTPS_PROXY:+https_proxy="$HTTPS_PROXY"} \
         apk add --no-cache "$@"
       ;;
     *)
@@ -712,7 +811,7 @@ EOF
 # Managed by dsh-wsl-sandbox provision-wsl.sh (profile=${PROFILE}, mirror=${MIRROR})
 export DSH_WSL_PROFILE="${PROFILE}"
 export DSH_WSL_MIRROR="${MIRROR}"
-export PATH="\$HOME/.dsh/runtime/bin:\$HOME/.local/share/dsh/node/bin:\$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.nvm/current/bin:\$HOME/.volta/bin:\$HOME/.cargo/bin:\$HOME/.bun/bin:/usr/local/go/bin:\$PATH"
+export PATH="\$HOME/.dsh/runtime/bin:\$HOME/.local/share/dsh/node/bin:\$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:\$HOME/.local/share/dsh-wsl-sandbox/toolchains/go/bin:\$HOME/.local/share/mise/shims:\$HOME/.local/bin:\$HOME/.nvm/current/bin:\$HOME/.volta/bin:\$HOME/.cargo/bin:\$HOME/.bun/bin:\$HOME/.nix-profile/bin:/etc/profiles/per-user/\${USER:-}/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/local/go/bin:\$PATH"
 EOF
 
   if [[ "$MIRROR" == "cn" ]]; then
@@ -730,13 +829,17 @@ EOF
 
   local rc
   for rc in "$HOME/.bashrc" "$HOME/.profile"; do
-    touch "$rc"
-    if ! grep -Fq '.dsh-wsl-env.sh' "$rc"; then
-      printf '\n[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh"\n' >> "$rc"
+    if [[ ! -L "$rc" && ( ! -e "$rc" || -w "$rc" ) ]]; then
+      touch "$rc"
+      if ! grep -Fq '.dsh-wsl-env.sh' "$rc"; then
+        printf '\n[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh"\n' >> "$rc"
+      fi
+    else
+      echo "[warn] Skipping read-only or symlinked shell RC file: $rc"
     fi
   done
   # If ~/.bash_profile already exists, bash -lc reads it instead of ~/.profile — hook it WITHOUT creating it if absent!
-  if [[ -f "$HOME/.bash_profile" ]] && ! grep -Fq '.dsh-wsl-env.sh' "$HOME/.bash_profile"; then
+  if [[ -f "$HOME/.bash_profile" && ! -L "$HOME/.bash_profile" && -w "$HOME/.bash_profile" ]] && ! grep -Fq '.dsh-wsl-env.sh' "$HOME/.bash_profile"; then
     printf '\n[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh"\n' >> "$HOME/.bash_profile"
   fi
 
@@ -755,21 +858,21 @@ configure_pkg_cn_mirror() {
   echo "[step:base] Configuring Tsinghua TUNA APT mirror for ${DISTRO_ID} (with .bak backup)..."
   if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
     if [[ ! -f /etc/apt/sources.list.d/ubuntu.sources.bak ]]; then
-      run_cmd sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak
+      run_priv cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/ubuntu.sources.bak
     fi
-    run_cmd sudo sed -i -E 's|https?://(archive|security|ports)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
+    run_priv sed -i -E 's|https?://(archive|security|ports)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
       /etc/apt/sources.list.d/ubuntu.sources
   elif [[ -f /etc/apt/sources.list.d/debian.sources ]]; then
     if [[ ! -f /etc/apt/sources.list.d/debian.sources.bak ]]; then
-      run_cmd sudo cp /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak
+      run_priv cp /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list.d/debian.sources.bak
     fi
-    run_cmd sudo sed -i -E 's|https?://deb\.debian\.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' \
+    run_priv sed -i -E 's|https?://deb\.debian\.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' \
       /etc/apt/sources.list.d/debian.sources
   elif [[ -f /etc/apt/sources.list ]]; then
     if [[ ! -f /etc/apt/sources.list.bak ]]; then
-      run_cmd sudo cp /etc/apt/sources.list /etc/apt/sources.list.bak
+      run_priv cp /etc/apt/sources.list /etc/apt/sources.list.bak
     fi
-    run_cmd sudo sed -i -E \
+    run_priv sed -i -E \
       -e 's|https?://(archive|security|ports)\.ubuntu\.com/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ubuntu|g' \
       -e 's|https?://deb\.debian\.org/debian|https://mirrors.tuna.tsinghua.edu.cn/debian|g' \
       -e 's|https?://http\.kali\.org/kali|https://mirrors.tuna.tsinghua.edu.cn/kali|g' \
@@ -802,6 +905,7 @@ ensure_step_prereqs() {
 # Discovers any Linux Node.js (>=22) already installed by DSH remote/headless, peer plugins, mise, nvm, fnm, volta, or OS
 find_shared_wsl_node() {
   local cand
+  local nix_user="${USER:-${HOME##*/}}"
   local search_dirs=(
     "$HOME/.dsh/runtime/bin"
     "$HOME/.local/share/dsh/node/bin"
@@ -811,6 +915,10 @@ find_shared_wsl_node() {
     "$HOME/.nvm/current/bin"
     "$HOME/.local/share/fnm/aliases/default/bin"
     "$HOME/.volta/bin"
+    "$HOME/.nix-profile/bin"
+    "/etc/profiles/per-user/${nix_user}/bin"
+    "/run/current-system/sw/bin"
+    "/nix/var/nix/profiles/default/bin"
     "/opt/dsh-toolchain/shims"
     "/opt/dsh-toolchain/bin"
     "/usr/local/bin"
@@ -827,7 +935,7 @@ find_shared_wsl_node() {
       local ver major
       ver="$("$cand" -v 2>/dev/null || true)"
       major="$(echo "$ver" | sed -E 's/^v([0-9]+).*/\1/')"
-      if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 22 ]]; then
+      if [[ "$major" =~ ^[0-9]+$ ]] && [[ "$major" -ge 20 ]]; then
         printf '%s\t%s\t%s\n' "$cand" "$ver" "$major"
         return 0
       fi
@@ -886,32 +994,92 @@ install_verified_prebuilt_node24() {
 }
 
 step_base() {
-  echo "=== [step:base][profile=${PROFILE}] Installing mandatory sandbox primitives (bwrap, prlimit, socat) on ${DISTRO_PRETTY} (${PKG_MGR}) ==="
+  echo "=== [step:base][profile=${PROFILE}] Installing mandatory sandbox primitives (bwrap, prlimit, socat) on ${DISTRO_PRETTY} (${PKG_MGR}, init=${INIT_SYSTEM}) ==="
   persist_profile_and_env
   configure_pkg_cn_mirror
-  pkg_update
-  case "$PKG_MGR" in
-    apt)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar unzip xz-utils
-      ;;
-    dnf)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg2 tar unzip xz
-      ;;
-    pacman)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg tar unzip xz
-      ;;
-    zypper)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gpg2 tar unzip xz
-      ;;
-    apk)
-      pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar unzip xz
-      ;;
-  esac
+  if [[ "$PKG_MGR" == "unknown" || "$PKG_MGR" == "nix" ]]; then
+    if has_all_bins bwrap prlimit socat bash curl tar unzip xz; then
+      echo "[step:base] Declarative/custom package manager (${PKG_MGR}), but all mandatory sandbox primitives are already installed; continuing."
+    elif [[ "$DRY_RUN" == "true" ]]; then
+      echo "[dry-run] Verify NixOS / declarative packages for mandatory bubblewrap, util-linux, socat, bash, curl, tar, unzip, xz"
+    else
+      [[ "$IS_NIXOS" == "true" ]] && print_nixos_guidance
+      echo "[ERROR] Unsupported or declarative package manager (${PKG_MGR}) on '${DISTRO_PRETTY}' and mandatory sandbox binaries (bwrap/prlimit/socat/curl/tar/unzip/xz) are missing." >&2
+      exit 1
+    fi
+  else
+    pkg_update
+    case "$PKG_MGR" in
+      apt)
+        pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar unzip xz-utils
+        ;;
+      dnf)
+        pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg2 tar unzip xz
+        ;;
+      pacman)
+        pkg_install bubblewrap util-linux bash ca-certificates socat procps-ng curl wget gnupg tar unzip xz
+        ;;
+      zypper)
+        pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gpg2 tar unzip xz
+        ;;
+      apk)
+        pkg_install bubblewrap util-linux bash ca-certificates socat procps curl wget gnupg tar unzip xz
+        ;;
+    esac
+  fi
+
+  if [[ "$INIT_SYSTEM" != "systemd" ]]; then
+    echo "[info] Non-systemd init detected (init=${INIT_SYSTEM}, musl=${IS_MUSL}): dsh-wsl-sandbox has ZERO systemd dependency and runs natively without systemd=true in /etc/wsl.conf."
+  fi
+
+  # Ubuntu 24.04+ / 26.04 AppArmor unprivileged userns profile for bwrap
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[dry-run] Configure /etc/apparmor.d/bwrap if AppArmor restricts unprivileged userns"
+  elif [[ -d /etc/apparmor.d ]] && command -v apparmor_parser >/dev/null 2>&1; then
+    local aa_restrict="0"
+    if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+      aa_restrict="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)"
+    fi
+    if [[ "$aa_restrict" == "1" && ! -f /etc/apparmor.d/bwrap ]]; then
+      local bwrap_bin tmp_aa
+      bwrap_bin="$(command -v bwrap || echo /usr/bin/bwrap)"
+      tmp_aa="$(mktemp)"
+      cat > "$tmp_aa" <<EOF
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap ${bwrap_bin} flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+      run_priv cp "$tmp_aa" /etc/apparmor.d/bwrap
+      run_priv chmod 644 /etc/apparmor.d/bwrap
+      rm -f "$tmp_aa"
+      run_priv apparmor_parser -r /etc/apparmor.d/bwrap || true
+      record_manifest_entries "path:/etc/apparmor.d/bwrap"
+      echo "[step:base] Installed AppArmor unprivileged userns profile -> /etc/apparmor.d/bwrap"
+    fi
+  fi
 }
 
 step_cli() {
   echo "=== [step:cli][profile=${PROFILE}] Installing Codex high-frequency CLI & C/C++ build headers ==="
   persist_profile_and_env
+  if [[ "$PKG_MGR" == "unknown" || "$PKG_MGR" == "nix" ]]; then
+    if has_all_bins git rg jq python3; then
+      echo "[step:cli] Declarative/custom package manager (${PKG_MGR}), core CLI tools are already present; continuing."
+      return 0
+    elif [[ "$DRY_RUN" == "true" ]]; then
+      echo "[dry-run] Verify NixOS / declarative packages for git, rg, fd, jq, python3, gcc, cmake"
+      return 0
+    else
+      [[ "$IS_NIXOS" == "true" ]] && print_nixos_guidance
+      echo "[ERROR] Unsupported or declarative package manager (${PKG_MGR}) on '${DISTRO_PRETTY}' and required CLI tools (git/rg/jq/python3) are missing." >&2
+      exit 1
+    fi
+  fi
   pkg_update
 
   # 1. Core layer (all profiles)
@@ -1030,9 +1198,13 @@ step_node() {
   if [[ "$need_node" == "true" ]]; then
     if [[ "$DRY_RUN" == "true" ]]; then
       echo "[dry-run] Install SHA-256 verified prebuilt Node.js 24 Active LTS into \$HOME/.local/share/dsh-wsl-sandbox/toolchains/node (zero root repo pollution)"
-    elif [[ "$PKG_MGR" == "apk" ]]; then
-      # Alpine uses musl libc rather than glibc tarballs
+    elif [[ "$PKG_MGR" == "apk" || "$IS_MUSL" == "true" ]]; then
+      # Alpine/musl uses musl libc rather than glibc tarballs
       pkg_install nodejs npm
+    elif [[ "$IS_NIXOS" == "true" ]] && ! has_glibc_dynamic_loader; then
+      echo "[ERROR] NixOS detected without Node.js (>=20) and without programs.nix-ld dynamic loader for generic glibc tarballs." >&2
+      print_nixos_guidance
+      exit 1
     else
       install_verified_prebuilt_node24
     fi
@@ -1052,11 +1224,15 @@ step_node() {
   else
     export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.bun/bin:$PATH"
     if ! command -v mise >/dev/null 2>&1; then
-      local had_mise_dir="false"
-      [[ -d "$HOME/.local/share/mise" ]] && had_mise_dir="true"
-      curl -fsSL https://mise.run | sh
-      record_manifest_entries "path:$HOME/.local/bin/mise"
-      [[ "$had_mise_dir" == "false" ]] && record_manifest_entries "path:$HOME/.local/share/mise"
+      if [[ "$IS_NIXOS" == "true" ]] && ! has_glibc_dynamic_loader; then
+        echo "[warn] Skipping prebuilt mise binary on NixOS without nix-ld; add pkgs.mise to configuration.nix if desired."
+      else
+        local had_mise_dir="false"
+        [[ -d "$HOME/.local/share/mise" ]] && had_mise_dir="true"
+        curl -fsSL https://mise.run | sh
+        record_manifest_entries "path:$HOME/.local/bin/mise"
+        [[ "$had_mise_dir" == "false" ]] && record_manifest_entries "path:$HOME/.local/share/mise"
+      fi
     fi
 
     if command -v corepack >/dev/null 2>&1; then
@@ -1081,10 +1257,19 @@ step_node() {
     fi
 
     if ! command -v bun >/dev/null 2>&1; then
-      local had_bun="false"
-      [[ -d "$HOME/.bun" ]] && had_bun="true"
-      curl -fsSL https://bun.sh/install | bash
-      [[ "$had_bun" == "false" ]] && record_manifest_entries "path:$HOME/.bun"
+      if [[ "$IS_NIXOS" == "true" ]] && ! has_glibc_dynamic_loader; then
+        echo "[warn] Skipping prebuilt bun binary on NixOS without nix-ld; add pkgs.bun to configuration.nix if desired."
+      else
+        local had_bun="false"
+        [[ -d "$HOME/.bun" ]] && had_bun="true"
+        if [[ "$MIRROR" == "cn" ]]; then
+          NPM_CONFIG_REGISTRY="https://registry.npmmirror.com" npm install -g --prefix "$npm_prefix" bun
+          record_manifest_entries "npm:bun"
+        else
+          curl -fsSL https://bun.sh/install | bash
+          [[ "$had_bun" == "false" ]] && record_manifest_entries "path:$HOME/.bun"
+        fi
+      fi
     fi
   fi
 
@@ -1105,13 +1290,25 @@ step_python() {
   echo "=== [step:python][profile=${PROFILE}] Installing Python 3 (binary-only, ZERO pyenv source compilation) ==="
   persist_profile_and_env
   ensure_step_prereqs
-  case "$PKG_MGR" in
-    apt)    pkg_install python3 python3-venv python3-pip ;;
-    dnf)    pkg_install python3 python3-pip ;;
-    pacman) pkg_install python python-pip ;;
-    zypper) pkg_install python3 python3-pip ;;
-    apk)    pkg_install python3 py3-pip ;;
-  esac
+  if [[ "$PKG_MGR" == "unknown" || "$PKG_MGR" == "nix" ]]; then
+    if ! command -v python3 >/dev/null 2>&1; then
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[dry-run] Verify NixOS / declarative python3 package"
+      else
+        [[ "$IS_NIXOS" == "true" ]] && print_nixos_guidance
+        echo "[ERROR] Unsupported or declarative package manager (${PKG_MGR}) on '${DISTRO_PRETTY}' and python3 is missing." >&2
+        exit 1
+      fi
+    fi
+  else
+    case "$PKG_MGR" in
+      apt)    pkg_install python3 python3-venv python3-pip ;;
+      dnf)    pkg_install python3 python3-pip ;;
+      pacman) pkg_install python python-pip ;;
+      zypper) pkg_install python3 python3-pip ;;
+      apk)    pkg_install python3 py3-pip ;;
+    esac
+  fi
 
   if [[ "$PROFILE" == "core" ]]; then
     echo "[step:python][profile=core] Core profile stops at system python3 + venv (skipping uv/pytest/ruff/mypy/pyright/black)."
@@ -1120,10 +1317,22 @@ step_python() {
 
   # Standard & Universal: Astral uv + CLI tools
   if [[ "$DRY_RUN" == "true" ]]; then
-    echo "[dry-run] Ensure prebuilt Astral uv binary (https://astral.sh/uv/install.sh)"
+    if [[ "$MIRROR" == "cn" ]]; then
+      echo "[dry-run] Install Astral uv via Tsinghua PyPI mirror (python3 -m pip install --user -i https://pypi.tuna.tsinghua.edu.cn/simple uv)"
+    else
+      echo "[dry-run] Ensure prebuilt Astral uv binary (https://astral.sh/uv/install.sh)"
+    fi
   elif ! command -v uv >/dev/null 2>&1; then
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    record_manifest_entries "path:$HOME/.local/bin/uv" "path:$HOME/.local/bin/uvx"
+    if [[ "$IS_NIXOS" == "true" ]] && ! has_glibc_dynamic_loader; then
+      echo "[warn] NixOS without nix-ld: cannot execute generic prebuilt uv binary; install pkgs.uv via configuration.nix."
+    elif [[ "$MIRROR" == "cn" ]]; then
+      python3 -m pip install --user --break-system-packages -i https://pypi.tuna.tsinghua.edu.cn/simple uv 2>/dev/null || \
+        python3 -m pip install --user -i https://pypi.tuna.tsinghua.edu.cn/simple uv
+      record_manifest_entries "path:$HOME/.local/bin/uv" "path:$HOME/.local/bin/uvx"
+    else
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      record_manifest_entries "path:$HOME/.local/bin/uv" "path:$HOME/.local/bin/uvx"
+    fi
   fi
   export PATH="$HOME/.local/bin:$PATH"
 
@@ -1136,8 +1345,12 @@ step_python() {
     if [[ "$DRY_RUN" == "true" ]]; then
       echo "[dry-run] uv tool install ${t}"
     elif ! command -v "$t" >/dev/null 2>&1; then
-      run_cmd uv tool install "$t"
-      record_manifest_entries "uv:$t"
+      if ! command -v uv >/dev/null 2>&1; then
+        echo "[warn] Skipping python CLI '${t}' because uv is unavailable on this distro."
+      else
+        run_cmd uv tool install "$t"
+        record_manifest_entries "uv:$t"
+      fi
     else
       echo "[step:python] ${t} already installed."
     fi
@@ -1166,21 +1379,50 @@ step_go() {
     return 0
   fi
 
+  local go_bin_dir="/usr/local/go/bin"
   if ! command -v go >/dev/null 2>&1; then
-    local had_usr_go="false"
-    [[ -d /usr/local/go ]] && had_usr_go="true"
-    curl -fsSL "${go_base}/${tarball}" -o "/tmp/${tarball}"
-    sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf "/tmp/${tarball}"
-    rm -f "/tmp/${tarball}"
-    [[ "$had_usr_go" == "false" ]] && record_manifest_entries "path:/usr/local/go"
+    if [[ "$PKG_MGR" == "apk" || "$IS_MUSL" == "true" ]]; then
+      pkg_install go
+      go_bin_dir="$(dirname "$(command -v go)")"
+    elif [[ "$IS_NIXOS" == "true" ]] && ! has_glibc_dynamic_loader; then
+      echo "[ERROR] NixOS detected without Go and without nix-ld dynamic loader; add pkgs.go to /etc/nixos/configuration.nix." >&2
+      print_nixos_guidance
+      exit 1
+    elif [[ -w /usr/local ]] || { [[ "$IS_NIXOS" != "true" ]] && [[ -n "$SUDO_CMD" ]]; }; then
+      local had_usr_go="false"
+      [[ -d /usr/local/go ]] && had_usr_go="true"
+      curl -fsSL "${go_base}/${tarball}" -o "/tmp/${tarball}"
+      run_priv rm -rf /usr/local/go
+      run_priv tar -C /usr/local -xzf "/tmp/${tarball}"
+      rm -f "/tmp/${tarball}"
+      [[ "$had_usr_go" == "false" ]] && record_manifest_entries "path:/usr/local/go"
+    else
+      # User-local fallback when /usr/local is immutable or sudo/doas is unavailable
+      local user_go_parent="$HOME/.local/share/dsh-wsl-sandbox/toolchains"
+      local user_go_root="${user_go_parent}/go"
+      mkdir -p "$user_go_parent"
+      curl -fsSL "${go_base}/${tarball}" -o "/tmp/${tarball}"
+      rm -rf "$user_go_root"
+      tar -C "$user_go_parent" -xzf "/tmp/${tarball}"
+      rm -f "/tmp/${tarball}"
+      go_bin_dir="${user_go_root}/bin"
+      export PATH="${go_bin_dir}:$PATH"
+      record_manifest_entries "path:${user_go_root}"
+      echo "[step:go] Extracted Go into user-local immutable-safe directory: ${user_go_root}"
+    fi
   else
+    go_bin_dir="$(dirname "$(command -v go)")"
     echo "[step:go] Go already installed: $(go version)"
   fi
 
   if ! command -v golangci-lint >/dev/null 2>&1; then
     mkdir -p "$HOME/.local/bin"
-    curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$HOME/.local/bin"
+    if [[ "$MIRROR" == "cn" ]]; then
+      GOPROXY="https://goproxy.cn,direct" GOBIN="$HOME/.local/bin" "${go_bin_dir}/go" install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest 2>/dev/null || \
+        GOPROXY="https://goproxy.cn,direct" GOBIN="$HOME/.local/bin" go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+    else
+      curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$HOME/.local/bin"
+    fi
     record_manifest_entries "path:$HOME/.local/bin/golangci-lint"
   else
     echo "[step:go] golangci-lint already installed: $(golangci-lint --version | head -n 1)"
@@ -1202,12 +1444,26 @@ step_rust() {
   fi
 
   if ! command -v rustc >/dev/null 2>&1; then
-    local had_rustup="false" had_cargo="false"
-    [[ -d "$HOME/.rustup" ]] && had_rustup="true"
-    [[ -d "$HOME/.cargo" ]] && had_cargo="true"
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component rustfmt,clippy
-    [[ "$had_rustup" == "false" ]] && record_manifest_entries "path:$HOME/.rustup"
-    [[ "$had_cargo" == "false" ]] && record_manifest_entries "path:$HOME/.cargo"
+    if [[ "$PKG_MGR" == "apk" ]]; then
+      pkg_install rust cargo
+      echo "[step:rust] Installed Alpine musl Rust toolchain via apk: $(rustc --version)"
+    elif [[ "$IS_NIXOS" == "true" ]] && ! has_glibc_dynamic_loader; then
+      echo "[ERROR] NixOS detected without rustc and without nix-ld dynamic loader; add pkgs.rustc & pkgs.cargo to /etc/nixos/configuration.nix." >&2
+      print_nixos_guidance
+      exit 1
+    else
+      local had_rustup="false" had_cargo="false"
+      [[ -d "$HOME/.rustup" ]] && had_rustup="true"
+      [[ -d "$HOME/.cargo" ]] && had_cargo="true"
+      if [[ "$MIRROR" == "cn" ]]; then
+        RUSTUP_DIST_SERVER="https://rsproxy.cn" RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup" \
+          curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y --profile minimal --component rustfmt,clippy
+      else
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --component rustfmt,clippy
+      fi
+      [[ "$had_rustup" == "false" ]] && record_manifest_entries "path:$HOME/.rustup"
+      [[ "$had_cargo" == "false" ]] && record_manifest_entries "path:$HOME/.cargo"
+    fi
   else
     echo "[step:rust] Rust already installed: $(rustc --version)"
   fi
@@ -1220,6 +1476,18 @@ step_extra() {
   fi
   echo "=== [step:extra][profile=universal] Installing prebuilt OpenJDK 21, Maven, Gradle, Ruby, PHP CLI + Composer ==="
   persist_profile_and_env
+  if [[ "$PKG_MGR" == "unknown" || "$PKG_MGR" == "nix" ]]; then
+    if has_all_bins java mvn gradle ruby php; then
+      echo "[step:extra] Declarative/custom package manager (${PKG_MGR}), universal tools are already present; continuing."
+      return 0
+    elif [[ "$DRY_RUN" == "true" ]]; then
+      echo "[dry-run] Verify NixOS / declarative packages for openjdk-21-jdk-headless maven gradle ruby php-cli composer"
+      return 0
+    fi
+    [[ "$IS_NIXOS" == "true" ]] && print_nixos_guidance
+    echo "[ERROR] Unsupported or declarative package manager (${PKG_MGR}) on '${DISTRO_PRETTY}'." >&2
+    exit 1
+  fi
   pkg_update
   case "$PKG_MGR" in
     apt)    pkg_install openjdk-21-jdk-headless maven gradle ruby php-cli composer ;;

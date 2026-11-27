@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   End-to-end real Windows + WSL 2 verification script for dsh-wsl-sandbox.
   Zero hardcoded distro/path assumptions: auto-discovers installed WSL 2 distros
@@ -72,6 +72,9 @@ function Invoke-SharedHostNode {
     $env:NODE_OPTIONS = $null
     if ($Runtime.ElectronRunAsNode) { $env:ELECTRON_RUN_AS_NODE = "1" }
     & $Runtime.Exe @Arguments
+    if ($LASTEXITCODE -ne 0) {
+      throw "Host Node command failed with exit code $LASTEXITCODE ($($Runtime.Exe) $($Arguments -join ' '))"
+    }
   } finally {
     $env:ELECTRON_RUN_AS_NODE = $prevElectron
     $env:NODE_OPTIONS = $prevNodeOpts
@@ -81,7 +84,7 @@ function Invoke-SharedHostNode {
 $hostNode = Resolve-SharedHostNode
 
 Write-Host "============================================================" -ForegroundColor Cyan
-Write-Host " dsh-wsl-sandbox — Real Windows + WSL 2 Verification Suite" -ForegroundColor Cyan
+Write-Host " dsh-wsl-sandbox - Real Windows + WSL 2 Verification Suite" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
 
 # Step 1: Build dist/ and auto-discover WSL 2 distro if omitted
@@ -118,7 +121,7 @@ Write-Host "Staged native ext4 runner: $($staged.runnerPath) (zero /mnt dependen
 
 # Step 2: Run dsh-wsl-doctor inside real WSL 2 kernel via shared Linux Node resolver
 Write-Host "`n[2/5] Running dsh-wsl-doctor --strict-wsl2 inside '$Distro'..."
-$wslNodeBootstrap = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; exec node "$@"'
+$wslNodeBootstrap = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; exec node "$@"'
 $doctorArgs = @("-d", $Distro, "--cd", "~", "--", "sh", "-c", $wslNodeBootstrap, "dsh-wsl-doctor", $staged.doctorPath, "--strict-wsl2")
 if ($Profile) {
   $doctorArgs += @("--profile", $Profile)
@@ -155,11 +158,29 @@ try {
 # Step 4: Run real Linux kernel sandbox test suite inside WSL 2 (if /mnt path is available, else skip with clear notice)
 Write-Host "`n[4/5] Running real Linux kernel sandbox test suite inside WSL 2 '$Distro'..."
 $linuxRepo = ""
+$prevErrPref = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
 try {
-  $linuxRepo = (& wsl.exe -d $Distro --cd ~ -- wslpath -a ($RepoRoot.Replace('\', '/')) 2>$null).Trim()
-} catch { }
-if ($linuxRepo -and (& wsl.exe -d $Distro --cd ~ -- test -f "$linuxRepo/scripts/run-tests.mjs"; $LASTEXITCODE -eq 0)) {
-  $runTestSh = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin:$PATH"; cd "$1" && exec node scripts/run-tests.mjs --suite linux-sandbox'
+  $wslPathOut = & wsl.exe -d $Distro --cd ~ -- wslpath -a ($RepoRoot.Replace('\', '/')) 2>$null
+  if ($LASTEXITCODE -eq 0 -and $wslPathOut) {
+    $linuxRepo = ($wslPathOut -join "`n").Trim()
+  }
+} catch { } finally {
+  $ErrorActionPreference = $prevErrPref
+}
+$hasRunTests = $false
+if ($linuxRepo) {
+  $prevErrPref = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    & wsl.exe -d $Distro --cd ~ -- test -f "$linuxRepo/scripts/run-tests.mjs" 2>$null
+    $hasRunTests = ($LASTEXITCODE -eq 0)
+  } finally {
+    $ErrorActionPreference = $prevErrPref
+  }
+}
+if ($hasRunTests) {
+  $runTestSh = '[ -f "$HOME/.dsh-wsl-env.sh" ] && . "$HOME/.dsh-wsl-env.sh" >/dev/null 2>&1 || true; CLEAN_PATH=""; OLD_IFS="$IFS"; IFS=":"; for p in $PATH; do case "$p" in /mnt/*|"") ;; *) CLEAN_PATH="${CLEAN_PATH:+$CLEAN_PATH:}$p" ;; esac; done; IFS="$OLD_IFS"; export PATH="$HOME/.dsh/runtime/bin:$HOME/.local/share/dsh/node/bin:$HOME/.local/share/dsh-wsl-sandbox/toolchains/node/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.volta/bin:/usr/local/bin:/usr/bin:/bin${CLEAN_PATH:+:$CLEAN_PATH}"; export DSH_STRICT_KERNEL_TESTS=1; cd "$1" && exec node scripts/run-tests.mjs --suite linux-sandbox'
   & wsl.exe -d $Distro --cd ~ -- sh -c $runTestSh dsh-test $linuxRepo
   if ($LASTEXITCODE -ne 0) {
     throw "Real kernel sandbox test suite failed inside WSL 2!"
@@ -172,9 +193,17 @@ if ($linuxRepo -and (& wsl.exe -d $Distro --cd ~ -- test -f "$linuxRepo/scripts/
 Write-Host "`n[5/5] Checking optional USBIP & WSL 2 kernel USB driver readiness..."
 $usbipd = Get-Command usbipd -ErrorAction SilentlyContinue
 if ($usbipd) {
-  Write-Host "[OK] usbipd found at $($usbipd.Source) — host-to-WSL2 USB passthrough CLI is installed." -ForegroundColor Green
-  $vhciCheck = (& wsl.exe -d $Distro --cd ~ -- sh -c 'if [ -d /sys/devices/platform/vhci_hcd.0 ] || [ -d /sys/module/vhci_hcd ]; then echo vhci-ready; else echo vhci-unloaded; fi' 2>$null).Trim()
-  $lsusbCheck = (& wsl.exe -d $Distro --cd ~ -- sh -c 'command -v lsusb >/dev/null 2>&1 && echo yes || echo no' 2>$null).Trim()
+  Write-Host "[OK] usbipd found at $($usbipd.Source) - host-to-WSL2 USB passthrough CLI is installed." -ForegroundColor Green
+  $prevErrPref = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $vhciOut = & wsl.exe -d $Distro --cd ~ -- sh -c 'if [ -d /sys/devices/platform/vhci_hcd.0 ] || [ -d /sys/module/vhci_hcd ]; then echo vhci-ready; else echo vhci-unloaded; fi' 2>$null
+    $lsusbOut = & wsl.exe -d $Distro --cd ~ -- sh -c 'command -v lsusb >/dev/null 2>&1 && echo yes || echo no' 2>$null
+  } finally {
+    $ErrorActionPreference = $prevErrPref
+  }
+  $vhciCheck = if ($vhciOut) { ($vhciOut -join "`n").Trim() } else { "unknown" }
+  $lsusbCheck = if ($lsusbOut) { ($lsusbOut -join "`n").Trim() } else { "unknown" }
   Write-Host "     WSL 2 kernel vhci_hcd : $vhciCheck  |  usbutils (lsusb): $lsusbCheck"
   Write-Host "     [Driver Note] USBIP supports ANY USB device, not just serial boards:" -ForegroundColor DarkGray
   Write-Host "       - User-space USB (e.g., phone ADB/Fastboot/EDL/DFU via libusb -> /dev/bus/usb/NNN/NNN, HID -> /dev/hidraw*)" -ForegroundColor DarkGray

@@ -44,6 +44,8 @@ export interface DoctorReport {
     readonly distroId?: string;
     readonly distroPrettyName?: string;
     readonly drvfsAutomountActive: boolean;
+    readonly initSystem?: 'systemd' | 'openrc' | 'runit' | 'wsl-init';
+    readonly isNixOs?: boolean;
   };
   readonly user: {
     readonly uid: number;
@@ -73,6 +75,8 @@ export interface DoctorReport {
   readonly network: {
     readonly upstreamProxy?: string;
     readonly upstreamReachable?: boolean;
+    readonly wslNetworkingMode?: 'nat' | 'mirrored' | 'unknown';
+    readonly natGatewayHint?: string;
   };
   readonly verdict: 'ready' | 'degraded' | 'blocked';
   readonly remediation: string[];
@@ -126,24 +130,146 @@ const TOOL_MATRIX: ReadonlyArray<{
  */
 function getSearchDirs(): string[] {
   const home = os.homedir();
+  const username = (() => {
+    try {
+      return os.userInfo().username;
+    } catch {
+      return path.basename(home);
+    }
+  })();
   const extra = [
     path.join(home, '.dsh', 'runtime', 'bin'),
     path.join(home, '.local', 'share', 'dsh', 'node', 'bin'),
+    path.join(home, '.local', 'share', 'dsh-wsl-sandbox', 'toolchains', 'node', 'bin'),
+    path.join(home, '.local', 'share', 'dsh-wsl-sandbox', 'toolchains', 'go', 'bin'),
     path.join(home, '.local', 'share', 'mise', 'shims'),
     path.join(home, '.local', 'bin'),
     path.join(home, '.nvm', 'current', 'bin'),
     path.join(home, '.local', 'share', 'fnm', 'aliases', 'default', 'bin'),
+    path.join(home, '.fnm', 'aliases', 'default', 'bin'),
     path.join(home, '.volta', 'bin'),
+    path.join(home, '.asdf', 'shims'),
+    path.join(home, '.nix-profile', 'bin'),
+    `/etc/profiles/per-user/${username}/bin`,
+  ];
+
+  const pushSortedVersions = (baseDir: string, suffixParts: readonly string[], minMajor = 20): void => {
+    try {
+      if (fs.existsSync(baseDir)) {
+        const vers = fs
+          .readdirSync(baseDir)
+          .filter((v) => {
+            const m = v.match(/^v?(\d+)/);
+            return m !== null && Number(m[1]) >= minMajor;
+          })
+          .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
+        for (const v of vers) {
+          extra.push(path.join(baseDir, v, ...suffixParts));
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  pushSortedVersions(path.join(home, '.nvm', 'versions', 'node'), ['bin'], 20);
+  pushSortedVersions(path.join(home, '.local', 'share', 'fnm', 'node-versions'), ['installation', 'bin'], 20);
+  pushSortedVersions(path.join(home, '.fnm', 'node-versions'), ['installation', 'bin'], 20);
+  pushSortedVersions(path.join(home, '.asdf', 'installs', 'nodejs'), ['bin'], 20);
+
+  extra.push(
     path.join(home, '.cargo', 'bin'),
     path.join(home, '.bun', 'bin'),
+    '/run/current-system/sw/bin',
+    '/nix/var/nix/profiles/default/bin',
     '/opt/dsh-toolchain/shims',
     '/opt/dsh-toolchain/bin',
     '/usr/local/go/bin',
-  ];
+  );
   const envDirs = (process.env.PATH ?? '')
     .split(path.delimiter)
     .filter((p) => Boolean(p) && !p.startsWith('/mnt/'));
   return [...new Set([...extra, ...envDirs, '/usr/local/bin', '/usr/bin', '/bin'])];
+}
+
+function detectInitSystem(): 'systemd' | 'openrc' | 'runit' | 'wsl-init' {
+  try {
+    if (fs.existsSync('/run/systemd/system')) return 'systemd';
+    if (fs.existsSync('/run/openrc')) return 'openrc';
+    if (fs.existsSync('/run/runit')) return 'runit';
+  } catch {
+    // ignore
+  }
+  return 'wsl-init';
+}
+
+function detectNixOs(distroId?: string): boolean {
+  if (distroId?.toLowerCase() === 'nixos') return true;
+  try {
+    return fs.existsSync('/etc/nixos') || fs.existsSync('/run/current-system');
+  } catch {
+    return false;
+  }
+}
+
+function parseHexRouteGatewayIpv4(hexGateway: string): string | undefined {
+  if (!/^[0-9a-fA-F]{8}$/.test(hexGateway) || hexGateway === '00000000') return undefined;
+  const bytes = [
+    Number.parseInt(hexGateway.slice(0, 2), 16),
+    Number.parseInt(hexGateway.slice(2, 4), 16),
+    Number.parseInt(hexGateway.slice(4, 6), 16),
+    Number.parseInt(hexGateway.slice(6, 8), 16),
+  ];
+  const ordered = os.endianness() === 'LE' ? bytes.reverse() : bytes;
+  return ordered.join('.');
+}
+
+function detectWslNetworkHint(): {
+  mode: 'nat' | 'mirrored' | 'unknown';
+  gatewayHint?: string;
+} {
+  let gatewayHint: string | undefined;
+  try {
+    if (fs.existsSync('/proc/net/route')) {
+      const lines = fs.readFileSync('/proc/net/route', 'utf8').split(/\r?\n/);
+      for (const line of lines.slice(1)) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length >= 3 && cols[1] === '00000000') {
+          gatewayHint = parseHexRouteGatewayIpv4(cols[2]!);
+          if (gatewayHint) break;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  if (!gatewayHint) {
+    try {
+      if (fs.existsSync('/etc/resolv.conf')) {
+        const resolv = fs.readFileSync('/etc/resolv.conf', 'utf8');
+        const m = resolv.match(/^nameserver\s+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/m);
+        if (m?.[1] && !m[1].startsWith('10.255.255.')) {
+          gatewayHint = m[1];
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+  try {
+    if (fs.existsSync('/sys/class/net/loopback0')) {
+      return { mode: 'mirrored', gatewayHint };
+    }
+  } catch {
+    // ignore
+  }
+  if (gatewayHint) {
+    const octets = gatewayHint.split('.').map(Number);
+    if (octets[0] === 172 && octets[1] !== undefined && octets[1] >= 16 && octets[1] <= 31) {
+      return { mode: 'nat', gatewayHint };
+    }
+  }
+  return { mode: 'unknown', gatewayHint };
 }
 
 function findExecutable(bin: string): string | null {
@@ -429,12 +555,20 @@ export async function runDoctor(options?: {
   const isWsl2 = detectWsl2(kernel);
   const drvfsAutomountActive = detectDrvfsAutomount();
   const osRel = readOsRelease();
+  const initSystem = detectInitSystem();
+  const isNixOs = detectNixOs(osRel.id);
+  const netHint = detectWslNetworkHint();
   const uid = typeof process.getuid === 'function' ? process.getuid() : -1;
   const username = os.userInfo().username;
   const nonRoot = uid > 0;
 
   const remediation: string[] = [];
-  const sandboxDetails: string[] = [];
+  const sandboxDetails: string[] = [
+    `initSystem: ${initSystem} (dsh-wsl-sandbox runtime requires ZERO systemd dependency)`,
+  ];
+  if (isNixOs) {
+    sandboxDetails.push('distroMode: NixOS / declarative immutable root (/run/current-system)');
+  }
 
   if (!nonRoot) {
     remediation.push('Switch to a non-root WSL user (UID > 0); root execution is blocked by dsh-wsl-sandbox.');
@@ -450,7 +584,6 @@ export async function runDoctor(options?: {
   }
 
   const bwrapPath = findExecutable('bwrap');
-  const trueBin = findExecutable('true') ?? '/bin/true';
   const shellBin = findExecutable('bash') ?? findExecutable('sh') ?? '/bin/sh';
   let bwrapVersion: string | null = null;
   let unprivilegedUserns = false;
@@ -478,7 +611,7 @@ export async function runDoctor(options?: {
         '--new-session',
         '--die-with-parent',
         '--',
-        trueBin,
+        shellBin, '-c', ':',
       ],
       { encoding: 'utf8', timeout: 5000 },
     );
@@ -501,7 +634,7 @@ export async function runDoctor(options?: {
         '--new-session',
         '--die-with-parent',
         '--',
-        trueBin,
+        shellBin, '-c', ':',
       ],
       { encoding: 'utf8', timeout: 5000 },
     );
@@ -547,7 +680,7 @@ export async function runDoctor(options?: {
         '--new-session',
         '--die-with-parent',
         '--',
-        shellBin, '-c', `test -z "$(ls -A '${checkDir}' 2>/dev/null)" && ! touch '${checkDir}/__probe' 2>/dev/null`,
+        shellBin, '-c', 'test -z "$(ls -A "$1" 2>/dev/null)" && ! touch "$1/__probe" 2>/dev/null', 'dsh-doctor-mask', checkDir,
       );
       const cfgMaskRes = spawnSync(bwrapPath, maskArgs, { encoding: 'utf8', timeout: 5000 });
       configMaskSelfTest = cfgMaskRes.status === 0;
@@ -573,10 +706,22 @@ export async function runDoctor(options?: {
   const missingUniversal = tools.filter((t) => t.tier === 'universal' && !t.present);
 
   if (missingMandatory.length > 0) {
-    remediation.push(`Install mandatory sandbox tools: ${missingMandatory.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile} --step base)`);
+    if (isNixOs) {
+      remediation.push(
+        `NixOS detected — add missing sandbox primitives (${missingMandatory.map((t) => t.name).join(', ')}) to /etc/nixos/configuration.nix (environment.systemPackages = with pkgs; [ bubblewrap util-linux socat bash nodejs_24 ]) or run: nix profile install nixpkgs#bubblewrap nixpkgs#util-linux nixpkgs#socat nixpkgs#nodejs_24`,
+      );
+    } else {
+      remediation.push(`Install mandatory sandbox tools: ${missingMandatory.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile} --step base)`);
+    }
   }
   if (missingCore.length > 0) {
-    remediation.push(`Install missing core Codex CLI tools: ${missingCore.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile} --step cli)`);
+    if (isNixOs) {
+      remediation.push(
+        `NixOS missing core tools (${missingCore.map((t) => t.name).join(', ')}) — add pkgs.{git,ripgrep,fd,jq,curl,python3,gcc,cmake} to configuration.nix (enable programs.nix-ld.enable = true if running generic glibc tarballs)`,
+      );
+    } else {
+      remediation.push(`Install missing core Codex CLI tools: ${missingCore.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile} --step cli)`);
+    }
   }
   if ((selectedProfile === 'standard' || selectedProfile === 'universal') && missingStandard.length > 0) {
     remediation.push(`Missing '${selectedProfile}' profile tools: ${missingStandard.map((t) => t.name).join(', ')} (run provision-wsl.sh --profile ${selectedProfile})`);
@@ -589,7 +734,25 @@ export async function runDoctor(options?: {
   if (options?.upstreamProxy) {
     upstreamReachable = await testTcpReachable(options.upstreamProxy);
     if (!upstreamReachable) {
-      remediation.push(`Upstream proxy ${options.upstreamProxy} is unreachable from Linux; verify local proxy Allow LAN or WSL networkingMode=mirrored.`);
+      let proxyHost = '';
+      let proxyPort = '7890';
+      try {
+        const u = new URL(options.upstreamProxy);
+        proxyHost = u.hostname.toLowerCase();
+        proxyPort = u.port || (u.protocol === 'https:' ? '443' : '80');
+      } catch {
+        // ignore invalid URL
+      }
+      if (isWsl2 && (proxyHost === '127.0.0.1' || proxyHost === 'localhost' || proxyHost === '::1')) {
+        const gwHint = netHint.gatewayHint
+          ? ` Detected NAT Windows host gateway: http://${netHint.gatewayHint}:${proxyPort}`
+          : '';
+        remediation.push(
+          `Upstream proxy ${options.upstreamProxy} targets loopback (${proxyHost}), which resolves to the WSL VM itself under default NAT networking (mode=${netHint.mode}). Recommended for stability & USB/VPN testing: keep WSL networkingMode=NAT, enable "Allow LAN" in your Windows proxy client (Clash/Mihomo/v2rayN), and set upstreamProxy to the Windows NAT gateway IP.${gwHint} (Only if you specifically need 127.0.0.1 in WSL without Allow LAN on Win11 22H2+ & WSL >= 2.4.0, set networkingMode=mirrored in %USERPROFILE%\\.wslconfig).`,
+        );
+      } else {
+        remediation.push(`Upstream proxy ${options.upstreamProxy} is unreachable from Linux; verify local proxy Allow LAN or host firewall rules.`);
+      }
     }
   }
 
@@ -606,6 +769,8 @@ export async function runDoctor(options?: {
 
   const profileDegraded =
     !permCheck.ok ||
+    seccompIoUringBlocked === null ||
+    seccompAfVsockBlocked === null ||
     missingCore.length > 0 ||
     ((selectedProfile === 'standard' || selectedProfile === 'universal') && missingStandard.length > 0) ||
     (selectedProfile === 'universal' && missingUniversal.length > 0) ||
@@ -629,6 +794,8 @@ export async function runDoctor(options?: {
       distroId: osRel.id,
       distroPrettyName: osRel.prettyName,
       drvfsAutomountActive,
+      initSystem,
+      isNixOs,
     },
     user: { uid, username, nonRoot },
     sandbox: {
@@ -648,6 +815,8 @@ export async function runDoctor(options?: {
     network: {
       upstreamProxy: options?.upstreamProxy,
       upstreamReachable,
+      wslNetworkingMode: netHint.mode,
+      natGatewayHint: netHint.gatewayHint,
     },
     verdict,
     remediation,
@@ -659,15 +828,15 @@ function formatHumanReport(report: DoctorReport): string {
   lines.push('============================================================');
   lines.push(` dsh-wsl-doctor  |  Profile: ${report.selectedProfile}  |  Verdict: ${report.verdict.toUpperCase()}`);
   lines.push('============================================================');
-  lines.push(`OS       : ${report.os.distroPrettyName ?? report.os.platform} (${report.os.arch}, kernel ${report.os.kernel}, WSL2=${report.os.isWsl2}${report.os.wslDistroName ? `, distro=${report.os.wslDistroName}` : ''})`);
+  lines.push(`OS       : ${report.os.distroPrettyName ?? report.os.platform} (${report.os.arch}, kernel ${report.os.kernel}, WSL2=${report.os.isWsl2}${report.os.wslDistroName ? `, distro=${report.os.wslDistroName}` : ''}, init=${report.os.initSystem ?? 'unknown'}${report.os.isNixOs ? ', NixOS' : ''})`);
   lines.push(`Mounts   : host DrvFS /mnt/* automount=${report.os.drvfsAutomountActive ? 'active (masked inside bwrap via --tmpfs /mnt)' : 'disabled'}`);
   lines.push(`User     : ${report.user.username} (uid=${report.user.uid}, nonRoot=${report.user.nonRoot})`);
   lines.push(`bwrap    : ${report.sandbox.bwrapVersion ?? 'MISSING'} (${report.sandbox.bwrapPath ?? 'not found'})`);
   lines.push(`Sandbox  : userns=${report.sandbox.unprivilegedUserns}, disable-userns=${report.sandbox.disableUsernsFlag}, escapeMask=${report.sandbox.escapeMaskSelfTest}, configMask=${report.sandbox.configMaskSelfTest}, configACL=${report.sandbox.configDirPermsOk}`);
   lines.push(`Seccomp  : io_uring_EPERM=${String(report.sandbox.seccompIoUringBlocked)}, AF_VSOCK_EPERM=${String(report.sandbox.seccompAfVsockBlocked)}`);
   lines.push(`USB/HW   : vhci_hcd=${report.hardware.vhciHcdReady}, lsusb=${report.hardware.lsusbPresent}, /dev/bus/usb nodes=${report.hardware.usbBusNodesCount}, charNodes=[${report.hardware.serialAndHidNodes.join(', ')}]`);
-  if (report.network.upstreamProxy) {
-    lines.push(`Proxy    : ${report.network.upstreamProxy} (reachable=${String(report.network.upstreamReachable)})`);
+  if (report.network.upstreamProxy || report.network.wslNetworkingMode) {
+    lines.push(`Network  : wslMode=${report.network.wslNetworkingMode ?? 'unknown'}${report.network.natGatewayHint ? `, gateway=${report.network.natGatewayHint}` : ''}${report.network.upstreamProxy ? `, proxy=${report.network.upstreamProxy} (reachable=${String(report.network.upstreamReachable)})` : ''}`);
   }
   lines.push('');
   lines.push(`Codex Tool Matrix (selected profile: ${report.selectedProfile}):`);

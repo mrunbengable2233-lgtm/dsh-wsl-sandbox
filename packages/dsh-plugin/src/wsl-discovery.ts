@@ -1,5 +1,9 @@
-import { spawnSync } from 'node:child_process';
-import { isInternalContainerDistro, isValidIdentifier } from '../../core/src/index.ts';
+import { spawn, spawnSync } from 'node:child_process';
+import {
+  isInternalContainerDistro,
+  isValidDistroName,
+  isValidLinuxUsername,
+} from '../../core/src/index.ts';
 
 export interface DiscoveredWslDistro {
   readonly name: string;
@@ -25,10 +29,22 @@ export interface ProbedDistroUser {
   readonly osPrettyName?: string;
 }
 
+export interface HostWslVersionInfo {
+  readonly raw?: string;
+  readonly wslVersion?: string;
+  readonly kernelVersion?: string;
+  readonly majorMinor?: readonly [number, number, number];
+  readonly isLegacyInboxWsl: boolean;
+  readonly isBelow24: boolean;
+  readonly isBelow244: boolean;
+  readonly warnings: readonly string[];
+}
+
 export interface WslDiscoveryReport {
   readonly platform: string;
   readonly distros: readonly DiscoveredWslDistro[];
   readonly recommendedDistro: string;
+  readonly wslVersionInfo?: HostWslVersionInfo;
   readonly wslSettingsSharedPaths: {
     readonly windowsGlobalConfig: string;
     readonly distroConfig: string;
@@ -74,7 +90,7 @@ export function parseWslListVerbose(raw: Buffer | string): DiscoveredWslDistro[]
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]!;
     // Skip header line (e.g. "  NAME   STATE   VERSION" or localized equivalents without trailing digit)
-    const m = line.match(/^\s*(\*)?\s*(\S+)\s+(\S+(?:\s+\S+)?)\s+(\d+)\s*$/);
+    const m = line.match(/^\s*(\*)?\s*(.+?)\s{2,}(\S.*?)\s+(\d+)\s*$/);
     if (!m) continue;
     const isDefault = m[1] === '*';
     const name = m[2]!.trim();
@@ -88,7 +104,7 @@ export function parseWslListVerbose(raw: Buffer | string): DiscoveredWslDistro[]
       wslVersion,
       isDefault,
       isInternalContainer: isInternal,
-      supported: wslVersion === 2 && !isInternal && isValidIdentifier(name),
+      supported: wslVersion === 2 && !isInternal && isValidDistroName(name),
     });
   }
   return results;
@@ -139,7 +155,7 @@ export function mergeWslDistrosWithLxss(
       wslVersion: ver,
       isDefault: false,
       isInternalContainer: isInternal,
-      supported: ver === 2 && !isInternal && isValidIdentifier(name),
+      supported: ver === 2 && !isInternal && isValidDistroName(name),
       basePath,
       isCustomDiskLocation: Boolean(
         basePath && !/[\\/]appdata[\\/]local[\\/]packages[\\/]/i.test(basePath),
@@ -151,8 +167,196 @@ export function mergeWslDistrosWithLxss(
   return merged;
 }
 
+function parseRegDword(rawVal: string): number | undefined {
+  const t = rawVal.trim();
+  if (!t) return undefined;
+  const n = /^0x/i.test(t) ? Number.parseInt(t, 16) : Number.parseInt(t, 10);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
+/**
+ * Pure parser for `reg.exe query HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss /s` output.
+ */
+export function parseRegQueryLxssOutput(raw: string): Map<string, LxssRegistryEntry> {
+  const map = new Map<string, LxssRegistryEntry>();
+  const lines = raw.replace(/^\uFEFF/, '').split(/\r?\n/);
+  let current: {
+    DistributionName?: string;
+    BasePath?: string;
+    Version?: number;
+    DefaultUid?: number;
+  } | null = null;
+
+  const flush = (): void => {
+    if (current?.DistributionName) {
+      map.set(current.DistributionName.toLowerCase(), {
+        DistributionName: current.DistributionName,
+        ...(current.BasePath !== undefined ? { BasePath: current.BasePath } : {}),
+        ...(current.Version !== undefined ? { Version: current.Version } : {}),
+        ...(current.DefaultUid !== undefined ? { DefaultUid: current.DefaultUid } : {}),
+      });
+    }
+    current = null;
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flush();
+      continue;
+    }
+    if (/^HKEY_/i.test(trimmed)) {
+      flush();
+      current = {};
+      continue;
+    }
+    if (!current) continue;
+    const m = line.match(/^\s+(\S+)\s+(REG_[A-Z0-9_]+)(?:\s+(.*))?$/);
+    if (!m) continue;
+    const field = m[1]!;
+    const value = (m[3] ?? '').trim();
+    if (field === 'DistributionName' && value) {
+      current.DistributionName = value;
+    } else if (field === 'BasePath' && value) {
+      current.BasePath = value.replace(/^\\\\\?\\/, '');
+    } else if (field === 'Version') {
+      const ver = parseRegDword(value);
+      if (ver !== undefined) current.Version = ver;
+    } else if (field === 'DefaultUid') {
+      const uid = parseRegDword(value);
+      if (uid !== undefined) current.DefaultUid = uid;
+    }
+  }
+  flush();
+  return map;
+}
+
 export function isHostSpawnDisabled(): boolean {
   return process.env.DSH_WSL_NO_HOST_SPAWN === '1';
+}
+
+/**
+ * 解析 `wsl.exe --version` 输出（兼容中/英双语以及旧版 Windows Inbox WSL `< 2.0` 返回非零退出码）。
+ * 重点识别 WSL `< 2.4`（现代 `.wsl` 安装包 / `wsl --install --name` 需 `>= 2.4.4`，
+ * 早期 `2.0–2.3` 的 `mirrored` 模式易出现环回/VPN 兼容问题，测试环境建议优先使用默认 `NAT` 模式）。
+ */
+export function parseWslVersionOutput(
+  raw: Buffer | string,
+  exitStatus: number | null = 0,
+): HostWslVersionInfo {
+  const text = decodeWslOutput(raw).trim();
+  const wslMatch = text.match(/^\s*WSL\s*(?:version|版本)\s*[:：]\s*(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?/im);
+  const kernelMatch = text.match(/^\s*(?:Kernel\s*version|内核版本)\s*[:：]\s*([^\r\n]+)/im);
+  const warnings: string[] = [];
+
+  if (!wslMatch) {
+    const isLegacy = exitStatus !== 0 || text.length === 0 || /--version|help|用法/i.test(text);
+    warnings.push(
+      '未检测到新版 Microsoft Store / MSI WSL 版本信息（可能是旧版 Windows Inbox WSL < 2.0）：' +
+      '不支持 .wsl 格式新发行版与 mirrored 网络模式，建议保持默认 NAT 网络模式或执行 wsl.exe --update 升级至 2.4+。',
+    );
+    return {
+      raw: text || undefined,
+      isLegacyInboxWsl: isLegacy,
+      isBelow24: true,
+      isBelow244: true,
+      warnings,
+    };
+  }
+
+  const major = Number(wslMatch[1]);
+  const minor = Number(wslMatch[2]);
+  const patch = Number(wslMatch[3]);
+  const build = wslMatch[4];
+  const versionStr = build ? `${major}.${minor}.${patch}.${build}` : `${major}.${minor}.${patch}`;
+  const isBelow24 = major < 2 || (major === 2 && minor < 4);
+  const isBelow244 = major < 2 || (major === 2 && (minor < 4 || (minor === 4 && patch < 4)));
+
+  if (isBelow24) {
+    warnings.push(
+      `检测到宿主机 WSL 版本为 ${versionStr}（低于 2.4.0）：` +
+      '2.4 以下版本的 mirrored 网络模式对环回端口/VPN 兼容性较差，测试环境强烈建议使用默认 NAT 网络模式；' +
+      '且不支持新版 .wsl 单文件发行版，如需新版 Arch/Ubuntu 发行版建议执行 wsl.exe --update。',
+    );
+  } else if (isBelow244) {
+    warnings.push(
+      `检测到宿主机 WSL 版本为 ${versionStr}（低于 2.4.4）：现代 .wsl 格式发行版与 wsl --install --name 参数需 WSL >= 2.4.4。`,
+    );
+  }
+
+  return {
+    raw: text,
+    wslVersion: versionStr,
+    kernelVersion: kernelMatch?.[1]?.trim(),
+    majorMinor: [major, minor, patch],
+    isLegacyInboxWsl: false,
+    isBelow24,
+    isBelow244,
+    warnings,
+  };
+}
+
+export function probeHostWslVersion(): HostWslVersionInfo | undefined {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) return undefined;
+  const res = spawnSync('wsl.exe', ['--version'], {
+    timeout: 4000,
+    windowsHide: true,
+  });
+  return parseWslVersionOutput(res.stdout ?? Buffer.alloc(0), res.status);
+}
+
+export async function probeHostWslVersionAsync(): Promise<HostWslVersionInfo | undefined> {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) return undefined;
+  const res = await spawnBufferAsync('wsl.exe', ['--version'], 4000);
+  return parseWslVersionOutput(res.stdout, res.status);
+}
+
+function spawnBufferAsync(
+  command: string,
+  args: readonly string[],
+  timeoutMs: number,
+): Promise<{ status: number | null; stdout: Buffer }> {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, [...args], {
+        stdio: ['ignore', 'pipe', 'ignore'],
+        shell: false,
+        windowsHide: true,
+      });
+    } catch {
+      resolve({ status: null, stdout: Buffer.alloc(0) });
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      if (!settled) {
+        settled = true;
+        resolve({ status: null, stdout: Buffer.concat(chunks) });
+      }
+    }, timeoutMs);
+    timer.unref();
+
+    child.stdout?.on('data', (chunk: Buffer) => chunks.push(chunk));
+    child.once('error', () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: null, stdout: Buffer.concat(chunks) });
+    });
+    child.once('close', (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ status: code, stdout: Buffer.concat(chunks) });
+    });
+  });
 }
 
 /**
@@ -200,27 +404,66 @@ export function queryWindowsLxssRegistry(): Map<string, LxssRegistryEntry> {
   return map;
 }
 
+export async function queryWindowsLxssRegistryAsync(): Promise<Map<string, LxssRegistryEntry>> {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) {
+    return new Map<string, LxssRegistryEntry>();
+  }
+  const res = await spawnBufferAsync(
+    'reg.exe',
+    ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss', '/s'],
+    6000,
+  );
+  if (res.status !== 0 || res.stdout.length === 0) {
+    return new Map<string, LxssRegistryEntry>();
+  }
+  return parseRegQueryLxssOutput(res.stdout.toString('utf8'));
+}
+
+const SHARED_WSL_PATHS = {
+  windowsGlobalConfig: '%USERPROFILE%\\.wslconfig',
+  distroConfig: '/etc/wsl.conf',
+  lxssRegistryKey: 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
+} as const;
+
+function buildDiscoveryReport(
+  merged: DiscoveredWslDistro[],
+  wslVersionInfo?: HostWslVersionInfo,
+): WslDiscoveryReport {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) {
+    if (merged.length === 0) {
+      return {
+        platform: process.platform,
+        distros: [],
+        recommendedDistro:
+          process.platform !== 'win32'
+            ? (process.env.WSL_DISTRO_NAME || 'local-linux')
+            : 'Ubuntu-26.04',
+        ...(wslVersionInfo ? { wslVersionInfo } : {}),
+        wslSettingsSharedPaths: SHARED_WSL_PATHS,
+      };
+    }
+  }
+  const preferred =
+    merged.find((d) => d.supported && d.isDefault) ??
+    merged.find((d) => d.supported) ??
+    undefined;
+
+  return {
+    platform: process.platform,
+    distros: merged,
+    recommendedDistro: preferred?.name ?? 'Ubuntu-26.04',
+    ...(wslVersionInfo ? { wslVersionInfo } : {}),
+    wslSettingsSharedPaths: SHARED_WSL_PATHS,
+  };
+}
+
 /**
- * Discovers all registered WSL distros on Windows (combining `wsl.exe -l -v` + read-only Lxss registry),
- * supporting Ubuntu 26.04, Ubuntu 24.04, Debian, Fedora, Arch, Kali, and custom WSL Manager imports.
+ * 探测 Windows 上所有已注册的 WSL 发行版（合并 `wsl.exe -l -v` 与只读 `Lxss` 注册表，
+ * 并采集宿主机 `wsl.exe --version` 兼容性信息），兼容 Ubuntu/Debian/Fedora/Arch/NixOS 及 WSL Manager 迁移实例。
  */
 export function discoverWslDistros(): WslDiscoveryReport {
-  const sharedPaths = {
-    windowsGlobalConfig: '%USERPROFILE%\\.wslconfig',
-    distroConfig: '/etc/wsl.conf',
-    lxssRegistryKey: 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss',
-  };
-
   if (process.platform !== 'win32' || isHostSpawnDisabled()) {
-    return {
-      platform: process.platform,
-      distros: [],
-      recommendedDistro:
-        process.platform !== 'win32'
-          ? (process.env.WSL_DISTRO_NAME || 'local-linux')
-          : 'Ubuntu-26.04',
-      wslSettingsSharedPaths: sharedPaths,
-    };
+    return buildDiscoveryReport([]);
   }
 
   const lxss = queryWindowsLxssRegistry();
@@ -231,43 +474,52 @@ export function discoverWslDistros(): WslDiscoveryReport {
 
   const parsed = res.status === 0 && res.stdout ? parseWslListVerbose(res.stdout) : [];
   const merged = mergeWslDistrosWithLxss(parsed, lxss);
-
-  const preferred =
-    merged.find((d) => d.supported && d.isDefault) ??
-    merged.find((d) => d.supported) ??
-    undefined;
-
-  return {
-    platform: process.platform,
-    distros: merged,
-    recommendedDistro: preferred?.name ?? 'Ubuntu-26.04',
-    wslSettingsSharedPaths: sharedPaths,
-  };
+  return buildDiscoveryReport(merged);
 }
 
-/**
- * Probes the real non-root Linux UID, username, $HOME, and OS ID inside a registered WSL 2 distro.
- * Uses `--cd ~` so it never locks any Windows NTFS directory.
- */
-export function probeWslDistroUser(distro: string, username?: string): ProbedDistroUser | null {
-  if (process.platform !== 'win32' || isHostSpawnDisabled() || !isValidIdentifier(distro)) return null;
-  const args = ['-d', distro, '--cd', '~'];
-  if (username && isValidIdentifier(username)) {
-    args.push('-u', username);
+export async function discoverWslDistrosAsync(): Promise<WslDiscoveryReport> {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) {
+    return buildDiscoveryReport([]);
   }
-  args.push(
-    '--',
-    'sh',
-    '-c',
-    'os_id=""; os_name=""; if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null; os_id="$ID"; os_name="$PRETTY_NAME"; fi; printf "%s\n%s\n%s\n%s\n%s\n" "$(id -u)" "$(id -un)" "$HOME" "$os_id" "$os_name"',
-  );
-  const res = spawnSync('wsl.exe', args, {
-    encoding: 'utf8',
-    timeout: 10_000,
-    windowsHide: true,
-  });
-  if (res.status !== 0 || !res.stdout) return null;
-  const lines = res.stdout.replace(/\r/g, '').split('\n');
+  const [lxss, res] = await Promise.all([
+    queryWindowsLxssRegistryAsync(),
+    spawnBufferAsync('wsl.exe', ['--list', '--verbose'], 6000),
+  ]);
+  const parsed = res.status === 0 && res.stdout.length > 0 ? parseWslListVerbose(res.stdout) : [];
+  const merged = mergeWslDistrosWithLxss(parsed, lxss);
+  return buildDiscoveryReport(merged);
+}
+
+function buildProbeUserArgs(distro: string, username?: string): string[] | null {
+  if (!isValidDistroName(distro)) return null;
+  const trimmedUser = username?.trim();
+  if (trimmedUser && !isValidLinuxUsername(trimmedUser)) return null;
+
+  const args = ['-d', distro, '--cd', '~'];
+  if (trimmedUser) {
+    args.push('-u', trimmedUser);
+  }
+  const probeSh = [
+    'cd "$HOME" 2>/dev/null || true',
+    'u_uid="$(id -u)"; u_name="$(id -un)"; u_home="$HOME"',
+    'if [ -z "$1" ] && [ "$u_uid" = "0" ] && [ -r /etc/passwd ]; then',
+    '  pw="$(awk -F: \'$3 >= 1000 && $3 < 65534 && $1 != "nobody" && $6 ~ /^\\// { print $3 "\\n" $1 "\\n" $6; exit }\' /etc/passwd 2>/dev/null || true)"',
+    '  if [ -n "$pw" ]; then',
+    '    u_uid="$(printf "%s\\n" "$pw" | sed -n "1p")"',
+    '    u_name="$(printf "%s\\n" "$pw" | sed -n "2p")"',
+    '    u_home="$(printf "%s\\n" "$pw" | sed -n "3p")"',
+    '  fi',
+    'fi',
+    'os_id=""; os_name=""',
+    'if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null; os_id="$ID"; os_name="$PRETTY_NAME"; fi',
+    'printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$u_uid" "$u_name" "$u_home" "$os_id" "$os_name"',
+  ].join('\n');
+  args.push('--', 'sh', '-c', probeSh, 'dsh-probe', trimmedUser ?? '');
+  return args;
+}
+
+function parseProbeUserStdout(distro: string, rawStdout: string): ProbedDistroUser | null {
+  const lines = rawStdout.replace(/\r/g, '').split('\n');
   const uid = Number(lines[0]?.trim());
   const user = lines[1]?.trim() ?? '';
   const homeDir = lines[2]?.trim() ?? '';
@@ -280,6 +532,32 @@ export function probeWslDistroUser(distro: string, username?: string): ProbedDis
     osId: lines[3]?.trim() || undefined,
     osPrettyName: lines[4]?.trim() || undefined,
   };
+}
+
+/**
+ * Probes the real non-root Linux UID, username, $HOME, and OS ID inside a registered WSL 2 distro.
+ * Uses `--cd ~` so it never locks any Windows NTFS directory.
+ */
+export function probeWslDistroUser(distro: string, username?: string): ProbedDistroUser | null {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) return null;
+  const args = buildProbeUserArgs(distro, username);
+  if (!args) return null;
+  const res = spawnSync('wsl.exe', args, {
+    encoding: 'utf8',
+    timeout: 10_000,
+    windowsHide: true,
+  });
+  if (res.status !== 0 || !res.stdout) return null;
+  return parseProbeUserStdout(distro, res.stdout);
+}
+
+export async function probeWslDistroUserAsync(distro: string, username?: string): Promise<ProbedDistroUser | null> {
+  if (process.platform !== 'win32' || isHostSpawnDisabled()) return null;
+  const args = buildProbeUserArgs(distro, username);
+  if (!args) return null;
+  const res = await spawnBufferAsync('wsl.exe', args, 10_000);
+  if (res.status !== 0 || res.stdout.length === 0) return null;
+  return parseProbeUserStdout(distro, res.stdout.toString('utf8'));
 }
 
 /**

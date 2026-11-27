@@ -70,6 +70,8 @@ export const DEFAULT_SANDBOX_PATH = [
   '/opt/dsh-toolchain/shims',
   '/opt/dsh-toolchain/bin',
   '/usr/local/go/bin',
+  '/run/current-system/sw/bin',
+  '/nix/var/nix/profiles/default/bin',
   '/usr/local/sbin',
   '/usr/local/bin',
   '/usr/sbin',
@@ -79,25 +81,28 @@ export const DEFAULT_SANDBOX_PATH = [
 ].join(':');
 
 /**
- * Builds a clean POSIX `PATH` inside the `bwrap` sandbox that includes user-installed prebuilt
- * toolchains (`~/.dsh/runtime/bin`, `mise` shims, `uv`/`~/.local/bin`, `cargo`, `bun`, `/usr/local/go/bin`)
- * while strictly excluding `/mnt/*` Windows host directories.
+ * 构建 `bwrap` 沙箱内部纯净的 POSIX `PATH`：纳入用户态预编译工具链（`~/.dsh/runtime/bin`、
+ * `mise`、`uv`、`cargo`、`bun`、用户态 Go、NixOS profile 与 `/usr/local/go/bin`），并彻底排除 `/mnt/*`。
  */
 export function buildDefaultSandboxPath(homeDir?: string): string {
   const cleanHome = homeDir?.trim().replace(/\/+$/, '');
   if (!cleanHome || !cleanHome.startsWith('/') || cleanHome.startsWith('/mnt/')) {
     return DEFAULT_SANDBOX_PATH;
   }
+  const userName = cleanHome.split('/').pop() || 'dev';
   return [
     `${cleanHome}/.dsh/runtime/bin`,
     `${cleanHome}/.local/share/dsh/node/bin`,
     `${cleanHome}/.local/share/dsh-wsl-sandbox/toolchains/node/bin`,
+    `${cleanHome}/.local/share/dsh-wsl-sandbox/toolchains/go/bin`,
     `${cleanHome}/.local/share/mise/shims`,
     `${cleanHome}/.local/bin`,
     `${cleanHome}/.nvm/current/bin`,
     `${cleanHome}/.volta/bin`,
     `${cleanHome}/.cargo/bin`,
     `${cleanHome}/.bun/bin`,
+    `${cleanHome}/.nix-profile/bin`,
+    `/etc/profiles/per-user/${userName}/bin`,
     DEFAULT_SANDBOX_PATH,
   ].join(':');
 }

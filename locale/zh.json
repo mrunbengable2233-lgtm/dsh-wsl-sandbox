@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "WSL 2 沙箱后端",
-    "description": "Codex 级 WSL 2 Linux 内核隔离执行后端（bwrap + seccomp + UDS 代理），内置单壳方言防呆门禁、零 Token 独立人工审批与物理硬件单次锁。",
+    "description": "DeepSeek Harness (DSH) Codex 级 WSL 2 Linux 内核隔离执行后端（bwrap + seccomp-bpf + UDS 代理），集成微软官方 PowerShell AST 与 8 层 Bash 防呆门禁、DIY 发行版自动部署、零 Token 独立人工审批及物理硬件单次锁。",
     "detail": "README.md"
   }
 }

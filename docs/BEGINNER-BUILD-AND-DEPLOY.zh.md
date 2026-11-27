@@ -1,5 +1,7 @@
 # `dsh-wsl-sandbox` 小白零基础编译、测试与部署全攻略（保姆级手把手版）
 
+> **主页导航**：[**简体中文主页 (README.md)**](../README.md) | [**English Overview (README.en.md)**](../README.en.md)
+
 哪怕你以前**从来没自己编译过 Node.js / TypeScript 项目、没配过终端编码、没用过 WSL 2，甚至刚装好 DeepSeek Harness (DSH)**，只要按顺序一步步复制粘贴命令，10 分钟内就能一次配齐、终身省心。
 
 ---
@@ -143,11 +145,11 @@ wsl.exe -l -v
 
 ---
 
-## 四、路线 A：纯小白直接安装部署（不改源码，最快 2 步搞定）
+## 四、路线 A：纯小白直接安装部署（不改源码，两条自洽入口任选其一）
 
-如果你只是想把插件装进 DSH 里用起来，拿到解压后的插件文件夹（或 `.tgz` 安装包）后，在 **PowerShell 7** 里按下面两步走：
+> **入口统一防踩坑说明**：本插件在常态下会**默认从底层禁止 AI 私自运行安装或卸载脚本**，避免「既让你手动跑脚本、又让 AI 暗中跑脚本」的冲突。你可以任选下方「先跑脚本再装插件」**或**「先装插件再在设置页开引导通道让 AI 按四步预览确认后帮装」：
 
-### 第 1 步：进入插件文件夹，一键配好 WSL 2 沙箱环境
+### 方法一（推荐）：自己先用脚本一键配齐环境，再把插件装进 DSH
 
 假设你把插件解压到了 `D:\Plugins\dsh-wsl-sandbox`：
 
@@ -158,9 +160,18 @@ Set-Location "D:\Plugins\dsh-wsl-sandbox"
 # 2. 临时允许当前窗口运行本地安装脚本（关掉窗口自动恢复默认，很安全）
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
-# 3. 运行一键安装向导（国内网络推荐加上 -Mirror cn 走清华/阿里镜像加速）
+# 3. 先做一次零写入预览（确认发行版、档位、路径与 SHA-256 校验值）：
+.\packages\bootstrap\install-dsh-plugin.ps1 -Provision -Profile standard -Mirror cn -DryRun
+
+# 4. 确认无误后正式运行安装向导（国内网络推荐加上 -Mirror cn 走清华/阿里镜像加速）：
 .\packages\bootstrap\install-dsh-plugin.ps1 -Provision -Profile standard -Mirror cn
 ```
+
+### 方法二：先把插件导入 DSH -> 设置页预览脚本 -> 让 AI 在「受控引导通道」分四步帮装
+
+1. 先按下面第 2 步把 `.tgz` 插件包导入 DSH Desktop 或 Web；
+2. 打开 DSH **「设置 -> WSL 2 沙箱」**，点击 **「预览安装脚本与 SHA-256」** 亲眼确认待运行脚本；
+3. 点击 **「开启受控引导通道并复制会话指令」** 并粘贴给 AI，之后严格看 AI 按 **1 探测 -> 2 `-DryRun` 确认卡片 -> 3 单次弹窗批准确认（如 WSL 内 `sudo` 需输密码会自动弹出独立黑框输入）-> 4 `dsh-wsl-doctor` 自检全绿后自动关闸** 完成配环境。
 
 **运行过程中会发生什么？**
 1. 自动找到你电脑里的 WSL 2 发行版（有多个会列出序号让你选）。
@@ -177,15 +188,15 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 任选**图形界面**或**命令行**其中一种：
 
 - **方法 1：DSH 桌面版（图形界面导入，最适合小白）**
-  打开 **DSH Desktop** -> 左下角 **设置（Settings） -> 插件（Plugins）** -> 导入本地插件 -> 选择 **`dsh-wsl-sandbox-0.2.0.tgz`** 压缩包（或直接选 `D:\Plugins\dsh-wsl-sandbox` 文件夹），启用即可。
+  打开 **DSH Desktop** -> 左下角 **设置（Settings） -> 插件（Plugins）** -> 导入本地插件 -> 选择 **`dsh-wsl-sandbox-0.3.0.tgz`** 压缩包（或直接选 `D:\Plugins\dsh-wsl-sandbox` 文件夹），启用即可。
 
 - **方法 2：DSH 命令行一键添加**
   ```powershell
   # 如果你用 DSH 桌面版：
-  dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.2.0.tgz
+  dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.3.0.tgz
 
   # 如果你用 DSH 网页版 / CLI：
-  dsh plugin --profile web add .\dsh-wsl-sandbox-0.2.0.tgz
+  dsh plugin --profile web add .\dsh-wsl-sandbox-0.3.0.tgz
   ```
 
 ### 第 3 步：确认插件已经生效
@@ -204,12 +215,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 | 操作 | 在 Windows PowerShell 7 跑 | 在 WSL 2 (Ubuntu) 终端里跑 |
 | :--- | :--- | :--- |
 | **`npm run build`（编译源码）** | 完全支持 | 完全支持 |
-| **`node test` 或 `npm test`（跑单测）** | 支持！自动跑核心逻辑、红队门禁与插件兼容测试，并**自动跳过**仅 Linux 内核才有的 `bwrap` 测试项 | **最推荐！** 60 项测试（含真 Linux 内核命名空间、`seccomp-bpf` 系统调用拦截、进程防泄漏）**100% 全量真跑** |
+| **`node test` 或 `npm test`（跑单测）** | 支持！自动启用 `DSH_WSL_NO_HOST_SPAWN=1` 隔离锁（绝不触碰你电脑里的 WSL 实例），跑完核心逻辑、官方 PowerShell AST 门禁与 Top-27 插件兼容共 **71 项测试**，并自动跳过 10 项仅 Linux 内核才有的 `bwrap` 测试项 | **最推荐！** 全部 **81 项测试**（含真 Linux 内核命名空间、`seccomp-bpf` 系统调用拦截、进程防泄漏）**100% 全量真跑** |
 | **`npm run fuzz:check`（危险命令红队校验）** | 完全支持（零执行纯内存校验，绝对安全） | 完全支持 |
 | **`npm pack`（生成 `.tgz` 安装包）** | 完全支持 | 完全支持 |
 
 > **需要提前装 `npm install` 吗？**
-> 本项目**零第三方运行时依赖**！只要有 Node.js（`>= 22.19` 或 `Node 24 LTS`），连 `npm install` 都不需要下载任何外部包，断网离线都能 1 秒完成编译！
+> 本项目**零第三方运行时依赖**！只要有 Node.js（`>= 20.11`，推荐 `22.19+` 或 `Node 24 LTS`），连 `npm install` 都不需要下载任何外部包，断网离线都能 1 秒完成编译！
 
 ### 手把手 4 步完成编译、全量单测与打包（推荐在 WSL 2 终端执行）
 
@@ -243,14 +254,14 @@ node --test
 ```bash
 npm pack
 ```
-当前目录下就会生成 **`dsh-wsl-sandbox-0.2.0.tgz`**。
+当前目录下就会生成 **`dsh-wsl-sandbox-0.3.0.tgz`**。
 
 ---
 
 ## 六、新手常见报错与排坑速查表（FAQ）
 
 ### Q1：为什么以前有人反馈 `node test` 跑不起来？现在修好了吗？
-**在 `v0.2.0` 中已彻底修好！** 之前跑不起来是因为：
+**在 `v0.2.0+`（当前 `v0.3.0`）中已彻底修好！** 之前跑不起来是因为：
 1. 有人直接敲 `node test`（少写了 `--`），旧版根目录没有 `test.js` 入口文件；
 2. 旧版 `package.json` 打包配置漏了 `tests/` 目录，或没跑 `npm run build` 直接跑单测导致缺 `client.js` / `dist/`；
 3. 在纯 Windows 命令行下跑 Linux 专属的 `bwrap` 内核测试未自动标记跳过。
@@ -279,3 +290,9 @@ npm pack
 .\packages\bootstrap\uninstall-dsh-plugin.ps1 -PurgeToolchains
 ```
 执行完后，直接把插件源码/安装包文件夹拖进回收站即可，零残留、零文件占用锁！
+
+### Q5：需要专门去 `.wslconfig` 里把 WSL 网络模式改成 `mirrored` 吗？选 `NAT` 还是 `mirrored`？
+**不需要改！普通用户和要做手机/USB 硬件联调的测试环境，保持 WSL 2 默认自带的 `NAT` 模式最稳定：**
+1. `dsh-wsl-sandbox` 插件本体通过 `wsl.exe` 管道和 Linux 内部的 Unix Socket（`AF_UNIX`）通信，**完全不需要 `mirrored` 模式**。
+2. **`NAT` 模式（默认，强烈推荐）** 把 WSL 虚拟网卡隔离在独立内网子网里，不干扰你的 Windows 宿主机网口、手机刷机/ADB 驱动或 VPN，也完美兼容 Win10 和 WSL 2.4 以下的老版本；如果你电脑上开了 Clash / Mihomo / v2rayN 想让 WSL 走代理，只需在代理软件里打开 **「允许局域网连接 (Allow LAN)」**，然后在本插件设置里把「上游代理」填成 `http://<你的Windows NAT 网关IP>:7890`（`dsh-wsl-doctor` 自检会自动帮你查出这个 IP）。
+3. 只有 Win11 + 新版 WSL `>= 2.4`、且不想开 Allow LAN、非要让 WSL 直接用 `127.0.0.1` 访问宿主机端口时，才按需去配置 `mirrored`。

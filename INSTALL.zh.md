@@ -1,5 +1,6 @@
 # `dsh-wsl-sandbox` 本地安装、多发行版与 WSL Manager 兼容、配置备份与发布指南
 
+> **主页导航**：[**简体中文主页 (README.md)**](./README.md) | [**English Overview (README.en.md)**](./README.en.md)  
 > **如果你是第一次接触命令行、PowerShell 7 UTF-8 配置、WSL 2 或源码编译的新手**，请优先阅读保姆级教程：[`docs/BEGINNER-BUILD-AND-DEPLOY.zh.md`](./docs/BEGINNER-BUILD-AND-DEPLOY.zh.md)。  
 > **如需让 AI 批量生成危险命令测试集进行门禁红队压测**，请参阅：[`docs/AI-DANGEROUS-COMMAND-FUZZING-GUIDE.zh.md`](./docs/AI-DANGEROUS-COMMAND-FUZZING-GUIDE.zh.md)。
 
@@ -7,49 +8,70 @@
 
 ---
 
-## 一、Windows 10/11 + WSL 2 本地快速安装（2 步完成）
+## 一、Windows 10/11 + WSL 2 两条自洽安装路径（彻底解决「脚本 vs AI」入口冲突）
 
-> **前置条件**：Windows 10 (21H2+) 或 Windows 11，推荐先安装 **PowerShell 7 (`pwsh.exe`)** 并持久化 UTF-8 编码为默认首选终端（见 [`docs/BEGINNER-BUILD-AND-DEPLOY.zh.md` 第二节](./docs/BEGINNER-BUILD-AND-DEPLOY.zh.md)），已启用 WSL 2（支持任意已注册的 WSL 2 发行版：默认推荐 `Ubuntu-26.04`，也完全支持 `Ubuntu-24.04`、`Debian`、`Fedora`、`Arch`、`kali-linux` 以及通过 **WSL Manager** 导入/迁移 VHDX 磁盘的自定义实例）。
+> **核心安全机制**：为了彻底消除「明明人类自己跑了脚本，却还留着 AI 直接跑安装脚本的口子」的自相矛盾，本插件在宿主机 `ctx.tools.guard` 中加入**常态安装脚本锁**：
+> - 未开启引导通道前，**AI 无权直接执行** `install-dsh-plugin.ps1`、`stage-wsl-runner.mjs`、`provision-wsl.sh` 或任何真实卸载命令（直接触发 `L0 deny`）；
+> - 你可以自由选择以下**两条完全自洽的路径之一**：
+>   - **路径 A（前置脚本安装，最稳妥）**：你自己先在 PowerShell 7 预览并运行安装脚本 -> 再 `dsh plugin add`；
+>   - **路径 B（先装插件 -> UI 预览脚本 -> AI 受控引导安装）**：先导入插件进 DSH，在设置页预览完整安装脚本源码与 `SHA-256` 哈希后手动点击 **「开启受控引导通道」**（20 分钟限时，首次就绪后自动关闸），让 AI 严格按 **`1 探测 -> 2 -DryRun 卡片预览确认 -> 3 单次审批安装 -> 4 doctor 闭环`** 推进。
+
+> **前置条件**：Windows 10 (21H2+) 或 Windows 11，推荐先安装 **PowerShell 7 (`pwsh.exe`)** 并持久化 UTF-8 编码为默认首选终端（见 [`docs/BEGINNER-BUILD-AND-DEPLOY.zh.md` 第二节](./docs/BEGINNER-BUILD-AND-DEPLOY.zh.md)），已启用 WSL 2（覆盖主流发行版：`Ubuntu-26.04`/`24.04`/`22.04`、`Debian`、`Fedora`、`Arch`、`kali-linux`、`openSUSE`、`Alpine` 以及通过 **WSL Manager** 导入/迁移 VHDX 磁盘的自定义实例）。
 >
 > **关于 Node.js 版本（直接与 DSH 共用，无需重复安装）**：
-> - 本插件声明 `"engines": { "node": "^22.19.0 || >=24.0.0" }`，与 `@deepseek-ai/dsh@0.2.2-rc.5`（内置 Node `>=24.9.0`）及其他现代 DSH 插件完全对齐。
+> - 本插件声明 `"engines": { "node": ">=20.11.0" }`（推荐 Node `22.19+` / `24 LTS`），与 `@deepseek-ai/dsh@0.2.2-rc.5`（内置 Node `>=24.9.0`）及其他现代 DSH 插件完全对齐。
 > - **Windows 宿主侧**：插件直接在 DSH 进程内运行，子进程与安装脚本自动复用 DSH 自带的 Node 载体（`process.execPath` / Electron 下自动携带 `ELECTRON_RUN_AS_NODE=1`，若使用预编译包甚至可直接走 Windows 自带 `tar.exe` 零 Node 安装部署）。
 > - **WSL 2 Linux 侧**：自动发现并共用 `~/.dsh/runtime/bin`、`mise`、`nvm`、`fnm`、`volta` 或 `/usr/bin` 下任意已安装的 Linux Node（`>=22`）；仅在全新无 Node 环境下自动安装预编译 **Node 24 Active LTS**（拒绝跨界调用 `/mnt/c/.../node.exe`）。
 
-### 第 1 步：运行交互式 Windows 安装与环境建置向导（零硬编码）
+### 路径 A：前置终端手动预览 + 安装（两步完成）
 
-在仓库根目录的 Windows PowerShell 中直接执行（无需手写发行版名或 Linux 用户名）：
+在仓库根目录的 Windows PowerShell 7 中执行：
 
 ```powershell
-# 自动探测已注册的 WSL 2 实例（含 WSL Manager 迁移磁盘实例），先检测并补齐 bwrap/prlimit/socat/node，
-# 自动只读备份原有 .wslconfig 与 /etc/wsl.conf，将 Runner 部署到 WSL 原生 ext4（零 /mnt 锁占用），
-# 验证就绪后再写入 config.json 并执行 dsh-wsl-doctor 闭环体检：
-.\packages\bootstrap\install-dsh-plugin.ps1 -Provision -Mirror cn -UpsertAgentsMd
+# 0. 先做零写入预览（校验 SHA-256 哈希、目标发行版与待修改路径）：
+.\packages\bootstrap\install-dsh-plugin.ps1 -Provision -Profile standard -Mirror cn -DryRun
+
+# 1. 自动探测已注册的 WSL 2 实例（含 WSL Manager 迁移磁盘实例），先检测并补齐 bwrap/prlimit/socat/node，
+#    自动只读备份原有 .wslconfig 与 /etc/wsl.conf，将 Runner 部署到 WSL 原生 ext4（零 /mnt 锁占用），
+#    验证就绪后再写入 config.json 并执行 dsh-wsl-doctor 闭环体检：
+.\packages\bootstrap\install-dsh-plugin.ps1 -Provision -Profile standard -Mirror cn -UpsertAgentsMd
 ```
 
 > **支持哪些非交互 / 自定义参数？**
 > - 指定已有发行版（包括 WSL Manager 自定义名称）：`-Distro MyMovedDebian`
+> - 指定分步安装（断点续跑某一项）：`-Step all|base|cli|node|python|go|rust|go-rust|extra`
 > - 指定三档工具链配置（严格按 spec 生效并持久化到 `~/.config/dsh-wsl-sandbox/profile.json`）：
 >   - `-Profile core`（~350MB，约 2 分钟）：`bwrap`/`prlimit`/`socat` + Codex 高频 CLI + C/C++ 基础 + `python3` + 共用 Linux Node `>=22`（全新环境默认安装 **Node 24 Active LTS**）
 >   - `-Profile standard`（~1.2GB，默认推荐）：`core` + `ccache`/`protobuf`/`libpq`/`libxml2` + `mise` + `uv`/`pytest`/`ruff`/`mypy`/`pyright`/`black` + `pnpm`/`yarn`/`bun`/`typescript`/`eslint`/`prettier` + Go + `golangci-lint` + Rust 最小化套件
 >   - `-Profile universal`（~3.5GB，纯预编译）：`standard` + `clang`/`bazelisk` + `mise` Node 22/24 LTS（默认 `node@24`）+ `poetry`/`isort` + OpenJDK 21 + `maven`/`gradle` + `ruby` + `php-cli`/`composer`
-> - 使用上游代理：`-Proxy http://127.0.0.1:7890`
+> - 使用上游代理：`-Proxy http://172.x.x.1:7890`（`NAT` 模式下建议填宿主机网关 IP，详见第二节第 7 节）
 > - 仅备份原有 WSL 配置到任意自定义目录：`-BackupOnly -BackupDir "D:\Backups\WSL-Orig" -OpenBackupFolder`
-> - 如尚未安装任何 WSL 2 发行版，向导会提示可选的官方发行版列表（默认推荐 `Ubuntu-26.04`，也可选择 `Ubuntu-24.04`、`Debian`、`FedoraLinux-42`、`Arch`、`kali-linux` 等）。
+> - 如尚未安装任何 WSL 2 发行版，向导会提示可选的官方发行版列表（默认推荐 `Ubuntu-26.04`，也可选择 `Ubuntu-24.04`、`Debian`、`FedoraLinux-42`、`archlinux`、`kali-linux` 等）。
+
+然后在 DeepSeek Harness (DSH) 中注册插件：
+```powershell
+# 注册到 DSH（按你使用的模式选择 web 或 desktop，也可直接在 DSH Desktop 插件设置中导入 .tgz 或源码目录）：
+dsh plugin --profile web add .\dsh-wsl-sandbox-0.3.0.tgz
+dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.3.0.tgz
+```
+
+### 路径 B：先安装插件 -> 在 DSH 设置页预览脚本并开启受控 AI 引导通道
+
+1. 先按上文把 `dsh-wsl-sandbox-0.3.0.tgz` 导入并启用进 DSH（未配齐 WSL 2 环境前，安装脚本处于 `L0` 常态锁死状态，AI 无法擅自乱装）；
+2. 打开 DSH **「设置 -> WSL 2 沙箱」**（或访问同源控制台 `/wsl-sandbox/ui`），找到 **「受控 AI 初始化引导与安装脚本预览」** 卡片：
+   - 点击 **「预览安装脚本与 SHA-256」**：零子进程只读审阅 `install-dsh-plugin.ps1`、`stage-wsl-runner.mjs`、`provision-wsl.sh` 源码与校验和；
+   - 点击 **「开启受控引导通道并复制会话指令」**（限时 20 分钟，可选锁定具体目标发行版名称）并发送给 AI；
+3. AI 必须严格按宿主顺序门禁分 **四步** 推进：
+   - **步骤 1/4（只读探测）**：探测 `wsl.exe -l -v` 与目标发行版工具状态，向你确认发行版、档位和镜像/代理；
+   - **步骤 2/4（`-DryRun` 预览确认卡片）**：**未先批准执行 `-DryRun` 预览前，真实安装命令会被 `L0` 机械拒绝**；预览完由 AI 给出固定格式的《安装脚本与变更预览卡片》供你核对；
+   - **步骤 3/4（单次审批安装）**：仅在你回复同意后申请执行 `install-dsh-plugin.ps1 -NonInteractive -Distro <目标> ... -Provision`（非 TTY 下若 `sudo` 需输密码会自动弹出独立可见 WSL 终端供安全输入）；
+   - **步骤 4/4（`doctor` 闭环自动关闸）**：运行 `dsh-wsl-doctor --strict-wsl2 --json` 全绿通过，首次绑定 `wsl_bash` 后引导通道自动关闭。
 
 如果你已经在 WSL 内，也可以随时直接按需运行单步幂等脚本与体检：
 ```bash
 # 支持 --step all|base|cli|node|python|go|rust|go-rust|extra （升级已有 Node 22 到 24 可加 --upgrade-node）
 bash ~/.local/share/dsh-wsl-sandbox/runner/packages/bootstrap/provision-wsl.sh --profile standard --mirror cn
 node ~/.local/share/dsh-wsl-sandbox/runner/dist/packages/bootstrap/src/doctor.js --strict-wsl2 --profile standard
-```
-
-### 第 2 步：在 DeepSeek Harness (DSH) 中注册插件
-
-```powershell
-# 注册到 DSH（按你使用的模式选择 web 或 desktop，也可直接在 DSH Desktop 插件设置中导入 .tgz 或源码目录）：
-dsh plugin --profile web add .\dsh-wsl-sandbox-0.2.0.tgz
-dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.2.0.tgz
 ```
 
 - 启动 DSH 后打开 **设置（Settings） -> WSL 2 沙箱**（原生挂载 `settings.section`，与 `dsh-purge`、`dshmarket`、`cc-safety-net` 等 Top 27 插件零冲突共存）。
@@ -99,7 +121,29 @@ dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.2.0.tgz
   4. **单边落盘 + 滚动限额（`5 MiB × 3`）**：WSL Runner 日志通过内存管道汇总至宿主统一落盘，不在 WSL `ext4.vhdx` 虚拟磁盘内二次写文件；总日志体积硬上限 `15 MiB`。
   5. **全内存查询与敏感信息脱敏**：Web UI 轮询 `/wsl-sandbox/api/logs` 100% 从内存环形缓冲区返回（**`0` 次磁盘读取**，切到后台标签页自动暂停轮询），并自动脱敏 `API_KEY`、`TOKEN`、`Bearer`、`sk-...`、`ghp_...` 等密钥。
 
-### 7. 持久化落盘清单（13 项全透明对账）与一键可逆卸载
+### 7. WSL 2 网络模式选型（`NAT` vs `mirrored`）、低版本 WSL `< 2.4` 与发行版兼容审计结论
+
+#### （1）WSL 网络模式选型：**不需要**强制改成 `mirrored`，你的测试环境强烈推荐默认 `NAT`
+
+- **本插件完全不强制要求 `mirrored`**：宿主机 DSH 插件与 `wsl-runner` 通过 `wsl.exe` 标准输入输出（stdio）管道通信（不走 TCP）；沙箱内部开启 `--unshare-net` 隔离网卡，通过 `/run/dsh-proxy/proxy.sock`（`AF_UNIX` 域套接字）连向沙箱外 `UdsAllowlistProxy`，同样**不依赖 Windows 镜像网卡**。
+- **主流 WSL 2 网络模式对比与推荐选型**：
+
+| 网络模式 | 适用条件 | 核心特点 | 适合你的硬件 / 手机 / 多版本测试环境？ |
+| :--- | :--- | :--- | :--- |
+| **`NAT`（WSL 2 默认，强烈推荐）** | 全版本 Windows 10/11 与 WSL 2（含 WSL `< 2.4`） | WSL 位于独立 Hyper-V 虚拟交换机子网（常见 `172.16-31.x.1` 为 Windows 宿主网关），Linux `127.0.0.1` 与 Windows `127.0.0.1` 相互隔离 | **最稳首选**：对 Windows 宿主机手机 ADB/Fastboot 驱动、免驱 USB 网卡热插拔、VPN 与老版本 WSL `< 2.4` 无任何干扰；若需串联 Clash/Mihomo 代理，只需在代理软件开启 **Allow LAN** 并把 `upstreamProxy` 填为 `http://<NAT网关IP>:7890`（`dsh-wsl-doctor` 可自动提示网关地址） |
+| **`mirrored`（按需可选）** | 仅 Win11 22H2+ 且建议 WSL **`>= 2.4.0`** | 将 Windows 网卡与 `127.0.0.1` 镜像进 WSL，Linux 内可直接 `http://127.0.0.1:7890` 访宿主代理 | **仅在特殊需求下按需开启**：WSL `< 2.4` 早期 `mirrored` 对环回、VPN 与虚拟网卡偶发断流或与手机/USB 网卡切换交互产生抖动；常规使用保持 `NAT` 即可 |
+| **`none` / 沙箱 `offline`** | 离线审计与极高危样本隔离 | 内核网络彻底切断（配合本插件 `networkMode=offline` + `seccomp` 拦截 `AF_INET`/`AF_INET6`） | 适合纯断网代码审计与安全实验（可在控制台一键切换） |
+
+#### （2）主流发行版可用性保障 + 特殊环境审计结论
+- **保证主流发行版开箱即用**：`Ubuntu (26.04 / 24.04 / 22.04)`、`Debian`、`Kali`、`Fedora`、`Arch Linux`、`openSUSE`、`Alpine` 均有完整包映射、非 `root` 检测与工具链置备覆盖（Alpine / `musl` 下 Go/Rust 自动改走 `apk` 而不强拉 glibc 安装包）。
+- **无 `systemd` 发行版**：运行期（`bwrap`、`seccomp-bpf`、`prlimit`、PGID 追踪、`/dev/shm` 临时目录回退）**零 `systemd` 依赖**；`packages/bootstrap/templates/*.ini` 已将 `[boot] systemd = true` 默认设为注释，防止误复制到 Alpine/Void 等无 `systemd` 系统导致启动异常。
+- **NixOS / 不可变系统**：`bwrap-builder.ts`（保留 `/run/current-system`）与 `node-runtime.ts` / `doctor.ts`（检索 `/run/current-system/sw/bin` 与 `~/.nix-profile/bin`）已完成路径适配；`provision-wsl.sh` 已加声明式与无 `nix-ld` 加载器校验及 `configuration.nix` / `nix profile install` 指引；`step_go` 在无 `/usr/local` 写权限时自动降级用户态目录 `~/.local/share/dsh-wsl-sandbox/toolchains/go`。
+- **低版本 WSL（`< 2.4.0` / `< 2.4.4`）审计要点**：
+  1. Windows `< 2.0` 旧版系统内置 Inbox WSL 不支持 `wsl.exe --version`；`wsl-discovery.ts` 提供 `parseWslVersionOutput` 安全识别并降级提示；
+  2. 新版单文件 `.wsl` 发行版格式（如新版 Arch / Ubuntu）与 `wsl --install --name` 均需 WSL **`>= 2.4.4`**，旧版仍应使用传统 `--install -d` 或 `--import`；
+  3. 全链路 `wsl.exe` 调用同时传 `--cd ~` 并在远端 `sh -c` 显式前置 `cd "$HOME" 2>/dev/null || true`，规避 `< 2.4` 偶发的初始工作目录回落 `/mnt/c` 问题。
+
+### 8. 持久化落盘清单（13 项全透明对账）与一键可逆卸载
 
 > **设计透明性说明**：`bwrap` 的 `--tmpfs` 内存盘仅用于遮蔽 `/tmp`、`/run`、`/mnt` 及 `$HOME` 敏感凭证目录；插件的安装配置、备份、工作区缓存与工具链属于明确的持久化落盘，全部记录在 `install-manifest.json` 与 `provision-manifest.json` 中，**绝不留隐蔽垃圾，也无需翻查安装日志**。
 
@@ -135,22 +179,22 @@ dsh plugin --profile desktop add .\dsh-wsl-sandbox-0.2.0.tgz
 
 ---
 
-## 三、通过 GitHub Desktop 或命令行提交独立版本 PR（`release/v0.2.0` -> `main`）
+## 三、通过 GitHub Desktop 或命令行提交独立版本 PR（`0.3.0` -> `main`）
 
 ### 方式 1：GitHub Desktop 零命令创建 PR（推荐）
 1. 解压 `dsh-wsl-sandbox-github-desktop.zip` 到本地目录。
 2. 打开 **GitHub Desktop** -> `File` -> `Add local repository...` -> 选择解压出来的 `dsh-wsl-sandbox` 文件夹。
-3. 顶部当前分支已自动切好在独立分支 **`release/v0.2.0`**（基于线上 `origin/main` 分叉，无任何冲突）：
-   - 点击顶部 **`Publish branch`** 推送 `release/v0.2.0` 分支；
-   - 紧接着点击 **`Preview Pull Request` / `Create Pull Request`**，即可在 GitHub 网页一键发起 `release/v0.2.0 -> main` 的独立版本 PR。
+3. 顶部当前分支已自动切好在独立分支 **`0.3.0`**（基于线上 `origin/main` 分叉，无任何冲突）：
+   - 点击顶部 **`Publish branch`** 推送 `0.3.0` 分支；
+   - 紧接着点击 **`Preview Pull Request` / `Create Pull Request`**，即可在 GitHub 网页一键发起 `0.3.0 -> main` 的独立版本 PR。
 
-### 方式 2：使用 `dsh-wsl-sandbox-v0.2.0.bundle` 命令行推送分支提 PR
+### 方式 2：使用 `dsh-wsl-sandbox-v0.3.0.bundle` 命令行推送分支提 PR
 ```zsh
-git clone dsh-wsl-sandbox-v0.2.0.bundle dsh-wsl-sandbox-pr
+git clone dsh-wsl-sandbox-v0.3.0.bundle dsh-wsl-sandbox-pr
 cd dsh-wsl-sandbox-pr
-git checkout release/v0.2.0
+git checkout 0.3.0
 git remote set-url origin https://github.com/mrunbengable2233-lgtm/dsh-wsl-sandbox.git
-git push -u origin release/v0.2.0
+git push -u origin 0.3.0
 # 推送后打开提示的 GitHub Pull Request 链接点击 Create pull request 即可
 ```
 

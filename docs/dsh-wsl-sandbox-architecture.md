@@ -1,6 +1,7 @@
 # DeepSeek Harness (DSH) WSL 后端与 Codex 级 Linux 沙箱：架构设计、开源调研与原文归档
 
-> **整理日期**：2026-11-23  
+> **主页导航**：[**简体中文主页 (README.md)**](../README.md) | [**English Overview (README.en.md)**](../README.en.md)  
+> **整理日期**：2026-11-23（初版调研与归档；实际工程实现请见 [`specification-v2.0.md`](./specification-v2.0.md) 与 [`KERNEL-SECURITY-HANDOFF.zh.md`](./KERNEL-SECURITY-HANDOFF.zh.md)）  
 > **核心目标**：为 Windows 下的 **DeepSeek Harness (`dsh`)** 构建/改造一个真正可靠的 **WSL 2 执行后端与 OS 级命令沙箱**——既解决 DSH 在 Windows 上强绑 PowerShell (`pwsh`) 与 `sandbox-windows-acl` 导致“模型不会用 PowerShell、低完整性标签污染工作区、管不住 WSL 内核进程”的痛点，又在不依赖昂贵云端 LLM Auto-review（零额外 Token 消耗）的前提下，对齐 **OpenAI Codex**、**Anthropic `sandbox-runtime`**、**Google `gemini-cli` / `CaMeL` / `nsjail`** 与 **OpenCode** 的多层防护体系。
 
 ## 目录导航

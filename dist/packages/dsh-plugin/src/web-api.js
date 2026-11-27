@@ -30,16 +30,28 @@ import {
                        
   getOptionalService,
 } from './cordis-types.js';
-import { removeAgentsMdWslSection, upsertAgentsMdWslSection } from './prompt-injector.js';
-                                                           
+import {
+  computeRemoveAgentsMdContent,
+  computeUpsertAgentsMdContent,
+  removeAgentsMdWslSection,
+  upsertAgentsMdWslSection,
+} from './prompt-injector.js';
+import { findPluginPackageRoot,                               } from './tools.js';
 import { renderWslSandboxUiHtml } from './web-ui-entry.js';
-import { discoverWslDistros, isInsideLxssBasePath, probeWslDistroUser } from './wsl-discovery.js';
+import {
+  discoverWslDistrosAsync,
+  isHostSpawnDisabled,
+  isInsideLxssBasePath,
+  probeWslDistroUserAsync,
+} from './wsl-discovery.js';
 
                              
                                     
                                                     
                                           
                                      
+                                    
+                                   
  
 
                       
@@ -89,18 +101,50 @@ function safe(handler                )                 {
   };
 }
 
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+
+function extractHostHostname(rawHost                    )         {
+  if (!rawHost) return '';
+  const trimmed = rawHost.trim().toLowerCase();
+  if (trimmed.startsWith('[')) {
+    const end = trimmed.indexOf(']');
+    return end > 0 ? trimmed.slice(1, end) : trimmed;
+  }
+  const firstColon = trimmed.indexOf(':');
+  if (firstColon !== -1 && trimmed.indexOf(':', firstColon + 1) === -1) {
+    return trimmed.slice(0, firstColon);
+  }
+  return trimmed;
+}
+
+function isAllowedHostHeader(req                 )          {
+  return LOOPBACK_HOSTS.has(extractHostHostname(req.headers.host));
+}
+
 function isSameOriginOrLoopback(req                 )          {
+  const secFetchSite = String(req.headers['sec-fetch-site'] ?? '').trim().toLowerCase();
+  if (secFetchSite === 'cross-site') {
+    return false;
+  }
   const origin = req.headers.origin;
   const host = req.headers.host;
+  const hasClientHeader = req.headers['x-dsh-wsl-client'] === '1';
   if (!origin) return true;
   if (origin === 'null') {
     // Electron file:// origin allowed ONLY when explicit custom client header is present
-    return req.headers['x-dsh-wsl-client'] === '1';
+    return hasClientHeader;
   }
   try {
     const parsed = new URL(origin);
-    if (host && parsed.host === host) return true;
-    return parsed.hostname === '127.0.0.1' || parsed.hostname === 'localhost' || parsed.hostname === '[::1]';
+    const originHost = parsed.hostname.toLowerCase();
+    const isLoopbackOrigin =
+      originHost === '127.0.0.1' ||
+      originHost === 'localhost' ||
+      originHost === '[::1]' ||
+      originHost === '::1';
+    if (!isLoopbackOrigin) return false;
+    if (host && parsed.host.toLowerCase() !== host.toLowerCase()) return false;
+    return hasClientHeader;
   } catch {
     return false;
   }
@@ -175,8 +219,8 @@ function wrapNodeResponse(res                )                  {
 export function registerWslSandboxWebApi(ctx                  , deps            )                 {
   const disposers                 = [];
   const table               = [];
-  const httpRouter = getOptionalService(ctx, 'http');
-  const webServer = getOptionalService(ctx, 'webServer');
+  const httpRouter = deps.skipHttpRouter ? undefined : getOptionalService(ctx, 'http');
+  const webServer = deps.skipWebServer ? undefined : getOptionalService(ctx, 'webServer');
 
   const add = (
     method                                   ,
@@ -208,9 +252,114 @@ export function registerWslSandboxWebApi(ctx                  , deps            
       binding: binding ?? null,
       config: deps.configStore.get(),
       nodeRuntime: deps.sessionManager.getNodeRuntimeSummary(),
+      bootstrap: deps.sessionManager.getBootstrapChannelState(),
       pendingApprovals: deps.approvalBridge.listPending().length,
       sessionRules: deps.approvalBridge.getSessionRules(),
     });
+  });
+
+  // 仅读取静态引导脚本与校验 SHA-256，绝不触发任何宿主子进程或 WSL 启动
+  add('GET', '/wsl-sandbox/api/bootstrap-preview', (req, res) => {
+    const pluginRoot = findPluginPackageRoot();
+    const bootstrap = deps.sessionManager.getBootstrapChannelState();
+    const cfg = deps.configStore.get();
+    const targetDistro = (req.query.distro ?? bootstrap.targetDistro ?? cfg.distro ?? '<YourDistro>').trim();
+    const profile = (req.query.profile ?? cfg.environmentProfile ?? 'standard').trim();
+    const mirror = req.query.mirror === 'cn' || (req.query.mirror === undefined && cfg.mirrorCn) ? 'cn' : 'global';
+
+    const specs = [
+      { id: 'install-ps1', relPath: 'packages/bootstrap/install-dsh-plugin.ps1', title: 'Windows 安装与探测向导 (PowerShell 7)' },
+      { id: 'stage-mjs', relPath: 'scripts/stage-wsl-runner.mjs', title: 'WSL 原生 ext4 Runner 分发器 (Node ESM)' },
+      { id: 'provision-sh', relPath: 'packages/bootstrap/provision-wsl.sh', title: 'WSL 2 多发行版幂等置备脚本 (Bash)' },
+    ]         ;
+
+    const scripts = specs.map((s) => {
+      const absPath = pluginRoot ? path.join(pluginRoot, s.relPath) : s.relPath;
+      if (!pluginRoot || !fs.existsSync(absPath)) {
+        return {
+          id: s.id,
+          title: s.title,
+          relPath: s.relPath,
+          fullPath: absPath,
+          exists: false,
+          sha256: null,
+          bytes: 0,
+          lines: 0,
+          content: '(script file not found)',
+        };
+      }
+      const rawBuf = fs.readFileSync(absPath);
+      const text = rawBuf.toString('utf8');
+      return {
+        id: s.id,
+        title: s.title,
+        relPath: s.relPath,
+        fullPath: absPath,
+        exists: true,
+        sha256: createHash('sha256').update(rawBuf).digest('hex'),
+        bytes: rawBuf.length,
+        lines: text.split(/\r?\n/).length,
+        content: text,
+      };
+    });
+
+    const qDistro = targetDistro.includes(' ') ? `"${targetDistro}"` : targetDistro;
+    const dryRunCommand = `.\\packages\\bootstrap\\install-dsh-plugin.ps1 -NonInteractive -Distro ${qDistro} -Profile ${profile} -Mirror ${mirror} -Provision -DryRun`;
+    const installCommand = `.\\packages\\bootstrap\\install-dsh-plugin.ps1 -NonInteractive -Distro ${qDistro} -Profile ${profile} -Mirror ${mirror} -Provision`;
+    const recommendedSessionPrompt = [
+      `请按照 dsh-wsl-env-setup 四步安全协议协助完成目标 WSL 2 发行版「${targetDistro}」的环境初始化：`,
+      '1. 先只读探测并向我确认目标发行版、环境档位（core/standard/universal）与国内镜像源；',
+      '2. 先独立执行带 -DryRun 的预览命令，并将《安装脚本与变更预览卡片》按固定格式发给我确认；',
+      '3. 在我明确确认后再申请真实安装单次审批；',
+      '4. 安装完成后运行 dsh-wsl-doctor --strict-wsl2 --json 验收闭环。',
+    ].join('\n');
+
+    res.status(200).json({
+      ok: true,
+      bootstrap,
+      targetDistro,
+      profile,
+      mirror,
+      dryRunCommand,
+      installCommand,
+      recommendedSessionPrompt,
+      networkingNote:
+        '常规测试与手机/USB 硬件联调推荐保持 WSL 2 默认 NAT 网络模式（无需强制改为 mirrored）；如仅需 WSL 内通过 127.0.0.1 直连宿主机代理且运行在 Win11 22H2+ / WSL >= 2.4，才按需切换 mirrored。',
+      scripts,
+    });
+  });
+
+  add('GET', '/wsl-sandbox/api/bootstrap-session', (_req, res) => {
+    res.status(200).json({
+      ok: true,
+      bootstrap: deps.sessionManager.getBootstrapChannelState(),
+    });
+  });
+
+  add('POST', '/wsl-sandbox/api/bootstrap-session', (req, res) => {
+    const body = (req.body ?? {})     
+                                           
+                       
+                            
+                     
+     ;
+    if (body.action === 'reload') {
+      const reloaded = deps.configStore.reloadFromDisk();
+      res.status(200).json({
+        ok: true,
+        config: reloaded,
+        bootstrap: deps.sessionManager.getBootstrapChannelState(),
+      });
+      return;
+    }
+    const desiredActive =
+      body.action === 'close' ? false : body.action === 'open' ? true : Boolean(body.active);
+    const bootstrap = deps.sessionManager.setBootstrapChannel({
+      active: desiredActive,
+      targetDistro: body.targetDistro,
+      ttlMs: body.ttlMs,
+    });
+    res.status(200).json({ ok: true, bootstrap });
   });
 
   add('GET', '/wsl-sandbox/api/config', (_req, res) => {
@@ -370,10 +519,10 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     });
   });
 
-  add('GET', '/wsl-sandbox/api/distros', (req, res) => {
-    const discovery = discoverWslDistros();
+  add('GET', '/wsl-sandbox/api/distros', async (req, res) => {
+    const discovery = await discoverWslDistrosAsync();
     const probeDistro = req.query.probeDistro?.trim();
-    const probedUser = probeDistro ? probeWslDistroUser(probeDistro) : null;
+    const probedUser = probeDistro ? await probeWslDistroUserAsync(probeDistro) : null;
     res.status(200).json({
       ok: true,
       ...discovery,
@@ -394,7 +543,7 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     const body = (req.body ?? {})                          ;
     const resolvedBackupDir = resolveEffectiveBackupDir(body.backupDir);
     if (process.platform === 'win32') {
-      const discovery = discoverWslDistros();
+      const discovery = await discoverWslDistrosAsync();
       const hitDistro = isInsideLxssBasePath(resolvedBackupDir, discovery.distros);
       if (hitDistro) {
         failSandbox(
@@ -673,8 +822,8 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     });
   });
 
-  add('POST', '/wsl-sandbox/api/wsl-config/pick-dir', (_req, res) => {
-    if (process.platform !== 'win32' || process.env.DSH_WSL_NO_HOST_SPAWN === '1') {
+  add('POST', '/wsl-sandbox/api/wsl-config/pick-dir', async (_req, res) => {
+    if (process.platform !== 'win32' || isHostSpawnDisabled()) {
       res.status(200).json({
         ok: true,
         supported: false,
@@ -690,12 +839,39 @@ export function registerWslSandboxWebApi(ctx                  , deps            
       '$dlg.ShowNewFolderButton = $true;',
       'if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Write-Output $dlg.SelectedPath }',
     ].join(' ');
-    const proc = spawnSync('powershell.exe', ['-NoProfile', '-Sta', '-Command', psScript], {
-      encoding: 'utf8',
-      timeout: 120_000,
-      windowsHide: false,
+    const chosen = await new Promise        ((resolve) => {
+      let child;
+      try {
+        child = spawn('powershell.exe', ['-NoProfile', '-Sta', '-Command', psScript], {
+          stdio: ['ignore', 'pipe', 'ignore'],
+          shell: false,
+          windowsHide: false,
+        });
+      } catch {
+        resolve('');
+        return;
+      }
+      const chunks           = [];
+      let settled = false;
+      const timer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        if (!settled) { settled = true; resolve(''); }
+      }, 120_000);
+      timer.unref();
+      child.stdout?.on('data', (c        ) => chunks.push(c));
+      child.once('error', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve('');
+      });
+      child.once('close', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(Buffer.concat(chunks).toString('utf8').trim());
+      });
     });
-    const chosen = (proc.stdout ?? '').trim();
     if (chosen) {
       const updated = deps.configStore.updateBasic({ backupDir: chosen });
       res.status(200).json({ ok: true, supported: true, selectedDir: updated.backupDir, config: updated });
@@ -779,13 +955,59 @@ export function registerWslSandboxWebApi(ctx                  , deps            
         25_000,
       );
       res.status(200).json({ ok: true, report });
-    } catch {
-      const { runDoctor } = await import('../../bootstrap/src/doctor.js');
-      const report = await runDoctor({
-        upstreamProxy: cfg.upstreamProxy || undefined,
-        profile: cfg.environmentProfile,
+    } catch (err) {
+      if (process.platform === 'linux') {
+        const { runDoctor } = await import('../../bootstrap/src/doctor.js');
+        const report = await runDoctor({
+          upstreamProxy: cfg.upstreamProxy || undefined,
+          profile: cfg.environmentProfile,
+        });
+        res.status(200).json({ ok: true, report });
+        return;
+      }
+      const errMsg = err instanceof Error ? err.message : String(err);
+      res.status(200).json({
+        ok: true,
+        report: {
+          timestamp: new Date().toISOString(),
+          verdict: 'blocked',
+          selectedProfile: cfg.environmentProfile,
+          os: {
+            platform: process.platform,
+            arch: process.arch,
+            kernel: os.release(),
+            isWsl2: false,
+            drvfsAutomountActive: false,
+          },
+          user: {
+            uid: -1,
+            username: cfg.username ?? 'unknown',
+            nonRoot: Boolean(cfg.username && cfg.username !== 'root'),
+          },
+          sandbox: {
+            bwrapPath: null,
+            bwrapVersion: null,
+            unprivilegedUserns: false,
+            disableUsernsFlag: false,
+            seccompIoUringBlocked: null,
+            seccompAfVsockBlocked: null,
+            escapeMaskSelfTest: false,
+            configMaskSelfTest: false,
+            configDirPermsOk: false,
+            details: [errMsg],
+          },
+          hardware: {
+            vhciHcdReady: false,
+            lsusbPresent: false,
+            usbBusNodesCount: 0,
+            serialAndHidNodes: [],
+            driverNote: '',
+          },
+          tools: [],
+          network: { upstreamProxy: cfg.upstreamProxy || undefined },
+          remediation: [errMsg],
+        },
       });
-      res.status(200).json({ ok: true, report });
     }
   });
 
@@ -887,25 +1109,93 @@ export function registerWslSandboxWebApi(ctx                  , deps            
     hardenPrivatePath(manifestPath, 'file');
   };
 
-  add('POST', '/wsl-sandbox/api/agents-md', (req, res) => {
+  const isMissingFileRpcError = (err         )          => {
+    const code = (err                      )?.code;
+    if (code === 'NOT_FOUND' || code === 'ENOENT') return true;
+    const msg = err instanceof Error ? err.message : String(err);
+    return isSandboxError(err) && err.code === 'POLICY_BLOCK' && /does not exist|not found/i.test(msg);
+  };
+
+  add('POST', '/wsl-sandbox/api/agents-md', async (req, res) => {
     const body = (req.body ?? {})                            ;
     const cfg = deps.configStore.get();
-    const targetDir = body.projectRoot?.trim() || cfg.workspaceRoot;
-    const result = upsertAgentsMdWslSection(targetDir, {
-      distro: cfg.distro,
-      workspaceRoot: cfg.workspaceRoot,
+    const explicitRoot = body.projectRoot?.trim();
+    if (explicitRoot || cfg.transportMode !== 'wsl') {
+      const targetDir = explicitRoot || cfg.workspaceRoot;
+      const result = upsertAgentsMdWslSection(targetDir, {
+        distro: cfg.distro,
+        workspaceRoot: cfg.workspaceRoot,
+      });
+      updateInstallManifestAgentsMd(result.filePath, 'add');
+      res.status(200).json({ ok: true, ...result });
+      return;
+    }
+
+    const binding = await deps.sessionManager.ensureBound();
+    let existing                = null;
+    try {
+      const readRes = (await deps.sessionManager.callRpc(
+        'fs.read',
+        { binding, path: 'AGENTS.md', offset: 1, limit: 10_000, maskEnvSecrets: false },
+        10_000,
+      ))                        ;
+      existing = typeof readRes?.content === 'string' ? readRes.content : '';
+    } catch (err) {
+      if (!isMissingFileRpcError(err)) throw err;
+      existing = null;
+    }
+    const computed = computeUpsertAgentsMdContent(existing, {
+      distro: binding.distribution,
+      workspaceRoot: binding.workspaceRoot,
     });
-    updateInstallManifestAgentsMd(result.filePath, 'add');
-    res.status(200).json({ ok: true, ...result });
+    await deps.sessionManager.callRpc(
+      'fs.write',
+      { binding, path: 'AGENTS.md', content: computed.content },
+      10_000,
+    );
+    const virtualPath = `wsl:${binding.distribution}:${path.posix.join(binding.workspaceRoot, 'AGENTS.md')}`;
+    updateInstallManifestAgentsMd(virtualPath, 'add');
+    res.status(200).json({ ok: true, filePath: virtualPath, action: computed.action });
   });
 
-  add('DELETE', '/wsl-sandbox/api/agents-md', (req, res) => {
+  add('DELETE', '/wsl-sandbox/api/agents-md', async (req, res) => {
     const body = (req.body ?? {})                            ;
     const cfg = deps.configStore.get();
-    const targetDir = body.projectRoot?.trim() || cfg.workspaceRoot;
-    const result = removeAgentsMdWslSection(targetDir);
-    updateInstallManifestAgentsMd(result.filePath, 'remove');
-    res.status(200).json({ ok: true, ...result });
+    const explicitRoot = body.projectRoot?.trim();
+    if (explicitRoot || cfg.transportMode !== 'wsl') {
+      const targetDir = explicitRoot || cfg.workspaceRoot;
+      const result = removeAgentsMdWslSection(targetDir);
+      updateInstallManifestAgentsMd(result.filePath, 'remove');
+      res.status(200).json({ ok: true, ...result });
+      return;
+    }
+
+    const binding = await deps.sessionManager.ensureBound();
+    let existing                = null;
+    try {
+      const readRes = (await deps.sessionManager.callRpc(
+        'fs.read',
+        { binding, path: 'AGENTS.md', offset: 1, limit: 10_000, maskEnvSecrets: false },
+        10_000,
+      ))                        ;
+      existing = typeof readRes?.content === 'string' ? readRes.content : '';
+    } catch (err) {
+      if (!isMissingFileRpcError(err)) throw err;
+      existing = null;
+    }
+    const computed = computeRemoveAgentsMdContent(existing);
+    if (computed.action === 'deleted-empty-file') {
+      await deps.sessionManager.callRpc('fs.delete', { binding, path: 'AGENTS.md' }, 10_000);
+    } else if (computed.action === 'removed-section' && computed.nextContent !== undefined) {
+      await deps.sessionManager.callRpc(
+        'fs.write',
+        { binding, path: 'AGENTS.md', content: computed.nextContent },
+        10_000,
+      );
+    }
+    const virtualPath = `wsl:${binding.distribution}:${path.posix.join(binding.workspaceRoot, 'AGENTS.md')}`;
+    updateInstallManifestAgentsMd(virtualPath, 'remove');
+    res.status(200).json({ ok: true, filePath: virtualPath, action: computed.action });
   });
 
   add('POST', '/wsl-sandbox/api/cache/purge', async (_req, res) => {
@@ -980,6 +1270,14 @@ export function registerWslSandboxWebApi(ctx                  , deps            
   // Real `@deepseek-ai/dsh-host-webserver` (`ctx.webServer`) carrier
   if (webServer && typeof webServer.register === 'function') {
     const dispatchRaw = async (req                 , res                )                => {
+      if (!isAllowedHostHeader(req)) {
+        wrapNodeResponse(res).status(403).json({
+          ok: false,
+          error: { code: 'FORBIDDEN_HOST', message: 'Non-loopback Host header rejected' },
+        });
+        return;
+      }
+
       const method = (req.method ?? 'GET').toUpperCase();
       const urlObj = new URL(req.url ?? '/', 'http://127.0.0.1');
       const pathname = urlObj.pathname.replace(/\/+$/, '') || '/';

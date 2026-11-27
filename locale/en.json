@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "WSL 2 Sandbox",
-    "description": "Codex-grade WSL 2 Linux kernel sandbox backend (bwrap + seccomp + UDS proxy) with single-shell dialect guard, zero-token human approval, and physical hardware single-shot lock.",
-    "detail": "README.md"
+    "description": "Codex-grade WSL 2 Linux kernel sandbox & execution backend for DeepSeek Harness (bwrap + seccomp-bpf + UDS proxy), featuring official PowerShell AST & 8-layer Bash guard, DIY distro auto-staging, zero-token human approval, and physical hardware single-shot lock.",
+    "detail": "README.en.md"
   }
 }

@@ -4,3 +4,4 @@ node_modules/
 .trellis/workspace/*/tmp/
 .cache/
 *.tgz
+*.bundle

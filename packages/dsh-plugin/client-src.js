@@ -15,6 +15,8 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
   var zh = {
     navTitle: "WSL 2 沙箱",
     panelTitle: "沙箱状态",
+    introTitle: "WSL 2 内核隔离执行后端 (v0.3.0)",
+    introSummary: "默认将 AI 代码读写、构建与命令执行隔离在 WSL 2 原生 Linux 命名空间内（bwrap + seccomp-bpf + UDS 白名单代理），自动遮蔽 Windows 全盘 (/mnt) 与宿主机敏感凭证 (~/.dsh / ~/.ssh)，并在宿主 PowerShell/CMD 层提供基于微软官方 AST 的单壳防呆守卫与物理硬件单次人工审批锁。",
     apply: "应用",
     reset: "还原",
     kill: "熔断强杀",
@@ -32,6 +34,8 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
   var en = {
     navTitle: "WSL 2 Sandbox",
     panelTitle: "Sandbox Status",
+    introTitle: "WSL 2 Kernel-Isolated Execution Backend (v0.3.0)",
+    introSummary: "Confines agent code edits, builds, and shell commands inside a WSL 2 Linux namespace (bwrap + seccomp-bpf + UDS allowlist proxy), masks Windows drives (/mnt) and sensitive host credentials (~/.dsh / ~/.ssh), and enforces official Microsoft PowerShell AST dialect guards plus single-shot hardware approval locks.",
     apply: "Apply",
     reset: "Reset",
     kill: "Emergency Kill",
@@ -100,13 +104,25 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
       },
       body: body !== undefined ? JSON.stringify(body) : undefined
     }).then(function (r) {
-      return r.json();
+      return r.text().then(function (text) {
+        var data;
+        try {
+          data = text ? JSON.parse(text) : {};
+        } catch (_err) {
+          data = { ok: false, error: { message: text || ("HTTP " + r.status) } };
+        }
+        if (!r.ok && data && data.ok !== false) {
+          return { ok: false, error: data.error || { message: "HTTP " + r.status } };
+        }
+        return data;
+      });
     });
   }
 
   function WslSandboxSection() {
     var _tab = useState("status"), tab = _tab[0], setTab = _tab[1];
     var _cfg = useState(null), cfg = _cfg[0], setCfg = _cfg[1];
+    var _cfgDirty = useState(false), cfgDirty = _cfgDirty[0], setCfgDirty = _cfgDirty[1];
     var _nodeRt = useState(null), nodeRt = _nodeRt[0], setNodeRt = _nodeRt[1];
     var _pending = useState([]), pending = _pending[0], setPending = _pending[1];
     var _rules = useState([]), rules = _rules[0], setRules = _rules[1];
@@ -125,6 +141,11 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
     var _bkDirty = useState(false), bkDirty = _bkDirty[0], setBkDirty = _bkDirty[1];
     var _bkItems = useState([]), bkItems = _bkItems[0], setBkItems = _bkItems[1];
     var _distros = useState([]), distros = _distros[0], setDistros = _distros[1];
+    var _introLang = useState("zh"), introLang = _introLang[0], setIntroLang = _introLang[1];
+    var _bsState = useState(null), bsState = _bsState[0], setBsState = _bsState[1];
+    var _bsDistro = useState(""), bsDistro = _bsDistro[0], setBsDistro = _bsDistro[1];
+    var _bsPreview = useState(null), bsPreview = _bsPreview[0], setBsPreview = _bsPreview[1];
+    var _bsScriptIdx = useState(0), bsScriptIdx = _bsScriptIdx[0], setBsScriptIdx = _bsScriptIdx[1];
 
     var loadBackups = useCallback(function () {
       apiFetch("GET", "/wsl-sandbox/api/wsl-config/backups")
@@ -149,7 +170,8 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         .catch(function () {});
     }, [logLvl, logQ]);
 
-    var reload = useCallback(function () {
+    var reload = useCallback(function (forceCfg) {
+      var shouldSyncCfg = forceCfg === true || !cfgDirty;
       Promise.all([
         apiFetch("GET", "/wsl-sandbox/api/status"),
         apiFetch("GET", "/wsl-sandbox/api/approvals"),
@@ -158,8 +180,13 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         .then(function (res) {
           if (res[0] && res[0].ok) {
             setUnavail(false);
-            setCfg(res[0].config);
+            if (shouldSyncCfg) {
+              setCfg(res[0].config);
+              if (forceCfg === true) setCfgDirty(false);
+            }
             setNodeRt(res[0].nodeRuntime || null);
+            setBsState(res[0].bootstrap || null);
+            if (!bsDistro && res[0].config && res[0].config.distro) setBsDistro(res[0].config.distro);
             setPending((res[1] && res[1].pending) || []);
             setRules((res[1] && res[1].sessionRules) || []);
             setAudit((res[2] && res[2].records) || []);
@@ -171,7 +198,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         .catch(function () {
           setUnavail(true);
         });
-    }, [bkDirty, bkDir]);
+    }, [bkDirty, bkDir, cfgDirty]);
 
     var loadDistros = useCallback(function (notify) {
       apiFetch("GET", "/wsl-sandbox/api/distros")
@@ -205,6 +232,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
 
     function updateField(k, v) {
       if (!cfg) return;
+      setCfgDirty(true);
       var next = Object.assign({}, cfg);
       next[k] = v;
       setCfg(next);
@@ -225,6 +253,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
                 workspaceRoot: r.probedUser.homeDir + "/workspace",
                 runnerPath: r.probedUser.homeDir + "/.local/share/dsh-wsl-sandbox/runner/dist/packages/wsl-runner/src/main.js"
               });
+              setCfgDirty(true);
               setCfg(next);
               setNotice("已自动探测 " + name + " 非 root 用户: " + r.probedUser.username + "（点击「应用」生效）。");
             }
@@ -256,9 +285,14 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         unmaskedEnvWorkspaces: cfg.unmaskedEnvWorkspaces || [],
         backupDir: bkDir || cfg.backupDir
       }).then(function (r) {
-        setBkDirty(false);
-        setNotice(r && r.ok ? "配置已原子保存并生效。" : "保存失败: " + ((r && r.error && r.error.message) || ""));
-        reload();
+        if (r && r.ok) {
+          setBkDirty(false);
+          setCfgDirty(false);
+          setNotice("配置已原子保存并生效。");
+          reload(true);
+        } else {
+          setNotice("保存失败: " + ((r && r.error && r.error.message) || ""));
+        }
       });
     }
 
@@ -356,24 +390,109 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
       });
     }
 
+    function fetchBootstrapPreview(notify) {
+      var qs = bsDistro ? ("?distro=" + encodeURIComponent(bsDistro)) : "";
+      return apiFetch("GET", "/wsl-sandbox/api/bootstrap-preview" + qs).then(function (r) {
+        if (r && r.ok) {
+          setBsPreview(r);
+          if (notify) setNotice("已加载安装脚本源码与 SHA-256 哈希（零子进程调用）。");
+        }
+        return r;
+      });
+    }
+
+    function toggleBootstrapChannel(open) {
+      apiFetch("POST", "/wsl-sandbox/api/bootstrap-session", {
+        action: open ? "open" : "close",
+        targetDistro: bsDistro || undefined
+      }).then(function (r) {
+        if (r && r.ok) {
+          setBsState(r.bootstrap || null);
+          if (open) {
+            fetchBootstrapPreview(false).then(function (prev) {
+              var promptText = prev && prev.recommendedSessionPrompt;
+              if (promptText && typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+                try { navigator.clipboard.writeText(promptText); } catch (_e) {}
+              }
+            });
+            setNotice("已开启 20 分钟受控初始化引导通道并复制标准四步会话指令。");
+          } else {
+            setNotice("已关闭受控 AI 初始化引导通道。");
+          }
+          reload();
+        } else {
+          setNotice("引导通道操作失败: " + ((r && r.error && r.error.message) || ""));
+        }
+      });
+    }
+
+    function renderIntroCard() {
+      var dict = introLang === "en" ? en : zh;
+      return h(
+        "div",
+        {
+          className: "dsh-wsl-native-card",
+          style: {
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "flex-start",
+            gap: "12px",
+            marginBottom: "12px"
+          }
+        },
+        h(
+          "div",
+          { style: { flex: 1, minWidth: 0 } },
+          h("div", { style: { fontWeight: 600, fontSize: "13px", marginBottom: "4px" } }, dict.introTitle),
+          h("div", { style: { color: "#9498a3", fontSize: "12px", lineHeight: 1.55 } }, dict.introSummary)
+        ),
+        h(
+          "div",
+          { style: { display: "flex", gap: "6px", flexShrink: 0 } },
+          h(
+            "button",
+            {
+              className: "dsh-wsl-native-btn" + (introLang === "zh" ? " dsh-wsl-native-btn-pri" : ""),
+              style: { padding: "4px 9px", fontSize: "11.5px" },
+              onClick: function () { setIntroLang("zh"); }
+            },
+            "中文"
+          ),
+          h(
+            "button",
+            {
+              className: "dsh-wsl-native-btn" + (introLang === "en" ? " dsh-wsl-native-btn-pri" : ""),
+              style: { padding: "4px 9px", fontSize: "11.5px" },
+              onClick: function () { setIntroLang("en"); }
+            },
+            "EN"
+          )
+        )
+      );
+    }
+
     if (unavail || !cfg) {
+      var offlineDict = introLang === "en" ? en : zh;
       return h(
         "div",
         { className: "dsh-wsl-native" },
+        renderIntroCard(),
         h(
           "div",
           { className: "dsh-wsl-native-panel" },
           h("div", { style: { fontWeight: 600, fontSize: "15px", marginBottom: "8px" } }, "WSL 2 沙箱 (dsh-wsl-sandbox)"),
-          h("div", { style: { color: "#9498a3" } }, zh.offlineHint)
+          h("div", { style: { color: "#9498a3" } }, offlineDict.offlineHint)
         )
       );
     }
 
     var layers = cfg.enabled ? (cfg.enablePwshGuard ? 6 : 5) : 0;
+    var activeDict = introLang === "en" ? en : zh;
 
     return h(
       "div",
       { className: "dsh-wsl-native" },
+      renderIntroCard(),
       h(
         "div",
         { className: "dsh-wsl-native-tabs" },
@@ -404,7 +523,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
         h("span", null, "工作区 ", h("b", { className: "dsh-wsl-native-mono" }, cfg.workspaceRoot)),
         h("span", null, "共用 Node ", h("b", { className: "dsh-wsl-native-mono" }, "Host " + ((nodeRt && nodeRt.hostNodeVersion) || "-") + ((nodeRt && nodeRt.wslNodeVersion) ? (" / WSL " + nodeRt.wslNodeVersion) : " (DSH 进程共用)"))),
         h("span", null, "隔离层级 ", h("b", null, cfg.enabled ? "bwrap + seccomp + 单壳防呆" : "已停用")),
-        h("span", null, "配置状态 ", h("b", null, "已生效"))
+        h("span", null, "配置状态 ", h("b", null, cfgDirty ? "待点击应用" : (cfg.enabled ? "已生效" : "已停用")))
       ),
       notice
         ? h(
@@ -424,7 +543,7 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
             "div",
             { style: { display: "flex", gap: "8px", flexWrap: "wrap" } },
             h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-pri", onClick: saveConfig }, "应用"),
-            h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-out-red", onClick: reload }, "还原"),
+            h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-out-red", onClick: function () { setCfgDirty(false); setBkDirty(false); reload(true); } }, "还原"),
             h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-red", onClick: killAll }, "熔断强杀"),
             h(
               "a",
@@ -575,6 +694,86 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
                         h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-out-red", style: { padding: "3px 10px" }, onClick: function () { revokeShare(s.id); } }, "取消挂载")
                       );
                     })
+              ),
+              h(
+                "div",
+                { className: "dsh-wsl-native-card", style: { marginTop: "2px", borderColor: "rgba(255,255,255,0.12)" } },
+                h(
+                  "div",
+                  { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "8px", flexWrap: "wrap", marginBottom: "6px" } },
+                  h(
+                    "div",
+                    null,
+                    h("b", null, introLang === "en" ? "Controlled AI Bootstrap Channel & Script Preview · " : "受控 AI 初始化引导与安装脚本预览 · "),
+                    h(
+                      "span",
+                      { style: { color: (bsState && bsState.active) ? "#22c55e" : "#9498a3", fontSize: "12px" } },
+                      (bsState && bsState.active)
+                        ? ("已开启 [" + bsState.phase + (bsState.targetDistro ? (" · " + bsState.targetDistro) : "") + "]")
+                        : "常态 L0 锁定关闭"
+                    )
+                  ),
+                  h(
+                    "div",
+                    { style: { display: "flex", gap: "6px", flexWrap: "wrap" } },
+                    h("button", { className: "dsh-wsl-native-btn", onClick: function () { fetchBootstrapPreview(true); } }, introLang === "en" ? "Preview Scripts & SHA-256" : "预览安装脚本"),
+                    h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-pri", onClick: function () { toggleBootstrapChannel(true); } }, introLang === "en" ? "Open Channel & Copy Prompt" : "开启引导通道"),
+                    (bsState && bsState.active)
+                      ? h("button", { className: "dsh-wsl-native-btn dsh-wsl-native-btn-out-red", onClick: function () { toggleBootstrapChannel(false); } }, introLang === "en" ? "Close" : "关闭")
+                      : null
+                  )
+                ),
+                h(
+                  "div",
+                  { style: { color: "#9498a3", fontSize: "11.5px", marginBottom: "8px" } },
+                  introLang === "en"
+                    ? "Default L0 blocks autonomous installer execution. Opening the 20m bootstrap channel enforces: 1) Probe -> 2) -DryRun Preview Card -> 3) Single-Shot Install Approval -> 4) dsh-wsl-doctor. Recommended network mode: default WSL NAT."
+                    : "默认常态 L0 禁止 AI 私自运行安装脚本；开启 20 分钟引导通道后强制按「1 只读探测 -> 2 -DryRun 预览卡片确认 -> 3 单次审批安装 -> 4 doctor 闭环自动关闸」推进，常规测试推荐保持 WSL 默认 NAT 网络。"
+                ),
+                h(
+                  "div",
+                  { style: { display: "flex", gap: "8px", flexWrap: "wrap", alignItems: "center", marginBottom: "6px" } },
+                  h("input", {
+                    className: "dsh-wsl-native-in dsh-wsl-native-mono",
+                    style: { maxWidth: "240px" },
+                    placeholder: "锁定目标发行版（如 Ubuntu-26.04）",
+                    value: bsDistro,
+                    onChange: function (e) { setBsDistro(e.target.value); }
+                  })
+                ),
+                (bsPreview && bsPreview.scripts && bsPreview.scripts.length > 0)
+                  ? h(
+                      "div",
+                      { style: { marginTop: "8px", borderTop: "1px solid rgba(255,255,255,0.08)", paddingTop: "8px" } },
+                      h(
+                        "div",
+                        { style: { display: "flex", gap: "6px", flexWrap: "wrap", marginBottom: "6px" } },
+                        bsPreview.scripts.map(function (sc, idx) {
+                          return h(
+                            "button",
+                            {
+                              key: sc.id,
+                              className: "dsh-wsl-native-btn" + (bsScriptIdx === idx ? " dsh-wsl-native-btn-pri" : ""),
+                              style: { padding: "3px 9px", fontSize: "11.5px" },
+                              onClick: function () { setBsScriptIdx(idx); }
+                            },
+                            sc.relPath
+                          );
+                        })
+                      ),
+                      (function () {
+                        var curSc = bsPreview.scripts[bsScriptIdx] || bsPreview.scripts[0];
+                        return curSc
+                          ? h(
+                              "div",
+                              null,
+                              h("div", { className: "dsh-wsl-native-mono", style: { fontSize: "11px", color: "#9498a3", marginBottom: "4px" } }, curSc.title + " · SHA-256: " + (curSc.sha256 || "-") + " · " + curSc.lines + " 行"),
+                              h("pre", { className: "dsh-wsl-native-in dsh-wsl-native-mono", style: { maxHeight: "200px", overflow: "auto", whiteSpace: "pre" } }, curSc.content || "")
+                            )
+                          : null;
+                      })()
+                    )
+                  : null
               )
             )
           : null,
@@ -799,13 +998,18 @@ window.__ModuleLoader__.load({ id: "dsh-wsl-sandbox", factory: (require) => {
           },
           WslSandboxSection
         );
-        var d2 = ctx.slots.register(
-          {
-            name: "settings.section.icon",
-            id: "dsh-wsl-sandbox"
-          },
-          SectionIcon
-        );
+        var d2 = null;
+        try {
+          d2 = ctx.slots.register(
+            {
+              name: "settings.section.icon",
+              id: "dsh-wsl-sandbox"
+            },
+            SectionIcon
+          );
+        } catch (_err) {
+          d2 = null;
+        }
         return function () {
           if (typeof d1 === "function") d1();
           if (typeof d2 === "function") d2();

@@ -69,6 +69,7 @@ import {
  */
 export class ApprovalBridge {
                    controller                    ;
+                   configStore              ;
                    getPolicyMode                          ;
           hostApproval                     ;
                    logger                   ;
@@ -77,9 +78,10 @@ export class ApprovalBridge {
                    onPendingResolved                                                                          ;
 
                    queue = new Map                         ();
-                   requestMeta = new Map                              ();
+                   requestMeta = new WeakMap                                      ();
 
   constructor(options                       ) {
+    this.configStore = options.configStore;
     this.getPolicyMode =
       options.getPolicyMode ??
       (options.configStore ? () => options.configStore .get().approvalPolicyMode : () => 'balanced');
@@ -130,6 +132,14 @@ export class ApprovalBridge {
 
   setBinding(binding                )       {
     this.controller.bind(binding);
+  }
+
+  getBinding()                             {
+    return this.controller.getBinding();
+  }
+
+  getConfigStore()                          {
+    return this.configStore;
   }
 
   invalidate(reason         )         {
@@ -217,8 +227,7 @@ export class ApprovalBridge {
       this.controller.bind(binding);
     }
 
-    const metaKey = `${binding.generation}:${action.kind}:${action.summary}:${action.command ?? ''}`;
-    this.requestMeta.set(metaKey, {
+    this.requestMeta.set(action, {
       requireIndependentFallback: isHighRiskBypassProtected,
       eligibleForTrustWorkspace: opts?.eligibleForTrustWorkspace,
       agent: opts?.agent,
@@ -229,14 +238,13 @@ export class ApprovalBridge {
     try {
       return await this.controller.authorize(action, opts?.callerSignal);
     } finally {
-      this.requestMeta.delete(metaKey);
+      this.requestMeta.delete(action);
     }
   }
 
           async reviewEnvelope(envelope                         )                                    {
     const mode = this.getPolicyMode();
-    const metaKey = `${envelope.binding.generation}:${envelope.action.kind}:${envelope.action.summary}:${envelope.action.command ?? ''}`;
-    const meta = this.requestMeta.get(metaKey);
+    const meta = this.requestMeta.get(envelope.action);
     const requiresFallback = Boolean(
       meta?.requireIndependentFallback ||
         envelope.action.touchesPhysicalDevice ||
@@ -273,22 +281,36 @@ export class ApprovalBridge {
 
       // Real `@deepseek-ai/dsh-user-approval` returns string outcomes
       if (typeof hostResRaw === 'string') {
-        if (hostResRaw === 'unavailable') {
+        const rawNorm = hostResRaw.trim().toLowerCase();
+        if (rawNorm === 'unavailable') {
           return this.enqueueIndependent(envelope, true);
         }
-        const decisionFromStr                       =
-          hostResRaw === 'allowed-once' ? 'allow-once' : 'deny';
-        if (
-          decisionFromStr === 'allow-once' &&
-          elapsedMs < this.bypassInstantThresholdMs &&
-          requiresFallback
-        ) {
-          return this.enqueueIndependent(envelope, true);
+        const isOnce =
+          rawNorm === 'allowed-once' ||
+          rawNorm === 'allow-once' ||
+          rawNorm === 'allowed' ||
+          rawNorm === 'allow';
+        const isSession =
+          rawNorm === 'allowed-always' ||
+          rawNorm === 'allowed-session' ||
+          rawNorm === 'allow-session-rule';
+        if (isOnce || isSession) {
+          if (elapsedMs < this.bypassInstantThresholdMs && requiresFallback) {
+            return this.enqueueIndependent(envelope, true);
+          }
+          const allowSession =
+            isSession && !envelope.action.touchesPhysicalDevice && envelope.allowSessionRuleOption;
+          return {
+            requestId: envelope.requestId,
+            actionHash: envelope.actionHash,
+            decision: allowSession ? 'allow-session-rule' : 'allow-once',
+            sessionPrefix: allowSession ? envelope.action.suggestedPrefix : undefined,
+          };
         }
         return {
           requestId: envelope.requestId,
           actionHash: envelope.actionHash,
-          decision: decisionFromStr,
+          decision: 'deny',
         };
       }
 
@@ -305,7 +327,8 @@ export class ApprovalBridge {
       }
 
       const normalizedDecision                       =
-        envelope.action.touchesPhysicalDevice && hostRes.decision === 'allow-session-rule'
+        (envelope.action.touchesPhysicalDevice || !envelope.allowSessionRuleOption) &&
+        hostRes.decision === 'allow-session-rule'
           ? 'allow-once'
           : hostRes.decision;
 

@@ -5,7 +5,7 @@ import {
   buildHostNodeChildEnv,
   buildWslNodeSpawnArgs,
   failSandbox,
-  isValidIdentifier,
+  isValidDistroName,
                 
   MAX_RPC_FRAME_BYTES,
   parseRunnerWireLog,
@@ -70,7 +70,7 @@ export class WslTransport {
           disposed = false;
 
   constructor(options                     ) {
-    if (options.mode === 'wsl' && !isValidIdentifier(options.distro)) {
+    if (options.mode === 'wsl' && !isValidDistroName(options.distro)) {
       failSandbox('INVALID_SETUP', `Invalid WSL distribution name: ${options.distro}`);
     }
     this.options = options;
@@ -158,8 +158,18 @@ export class WslTransport {
       windowsHide: true,
       env,
     });
+    child.stdin.on('error', () => {});
 
     this.child = child;
+    let gotValidRpcResponse = false;
+    const earlyLines           = [];
+    const pushEarlyLine = (channel                     , text        )       => {
+      if (gotValidRpcResponse || !text) return;
+      if (earlyLines.length < 8) {
+        earlyLines.push(`${channel}: ${text}`);
+      }
+    };
+
     this.options.logger?.log('info', {
       component: 'transport',
       event: 'transport.spawn',
@@ -195,6 +205,7 @@ export class WslTransport {
         this.options.logger?.ingestExternal(wireEntry);
         return;
       }
+      pushEarlyLine('stderr', trimmed);
       this.options.logger?.log('warn', {
         component: 'transport',
         event: 'runner.stderr',
@@ -204,10 +215,11 @@ export class WslTransport {
     });
 
     const rejectAll = (reason        )       => {
+      const fullReason = earlyLines.length > 0 ? `${reason} (${earlyLines.join(' | ')})` : reason;
       this.clearHeartbeatAndExitHook();
       for (const [id, call] of this.inFlight) {
         clearTimeout(call.timer);
-        call.reject(new SandboxError('BACKEND_UNAVAILABLE', reason));
+        call.reject(new SandboxError('BACKEND_UNAVAILABLE', fullReason));
         this.inFlight.delete(id);
       }
       this.closeReadlines();
@@ -243,14 +255,42 @@ export class WslTransport {
 
     stdoutRl.on('line', (line) => {
       if (!line.trim()) return;
-      if (Buffer.byteLength(line, 'utf8') > MAX_RPC_FRAME_BYTES) return;
+      const lineBytes = Buffer.byteLength(line, 'utf8');
+      if (lineBytes > MAX_RPC_FRAME_BYTES) {
+        this.options.logger?.log('error', {
+          component: 'transport',
+          event: 'transport.frameOversize',
+          message: `WSL runner RPC response frame (${lineBytes} bytes) exceeds ${MAX_RPC_FRAME_BYTES} byte limit`,
+          data: { lineBytes, maxBytes: MAX_RPC_FRAME_BYTES },
+        });
+        const idMatch = line.match(/^\{[^{}]{0,200}?"id"\s*:\s*"([^"]+)"/);
+        const id = idMatch?.[1];
+        if (id) {
+          const pending = this.inFlight.get(id);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.inFlight.delete(id);
+            pending.reject(
+              new SandboxError(
+                'OUTPUT_LIMIT',
+                `WSL runner RPC response frame (${lineBytes} bytes) exceeds ${MAX_RPC_FRAME_BYTES} byte limit`,
+              ),
+            );
+          }
+        }
+        return;
+      }
 
       let parsed                         ;
       try {
         parsed = JSON.parse(line)                           ;
       } catch {
+        const clean = line.replace(/\0/g, '').trim();
+        if (clean) pushEarlyLine('stdout', clean);
         return;
       }
+
+      gotValidRpcResponse = true;
 
       if (parsed.kind === 'callback') {
         void this.handleRunnerCallback(parsed                                 );
